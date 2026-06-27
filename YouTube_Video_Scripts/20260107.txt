@@ -1,0 +1,13 @@
+ADIF EXPORT
+<eoh>
+<call:5>K7TCH <gridsquare:0> <mode:3>FT8<qso_date:8>20260107 <time_on:6>203100 <freq:6>14.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:1>-99 <rst_rcvd:2>-6 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:6>KJ7WLL <gridsquare:4>CN85 <mode:3>FT8<qso_date:8>20260107 <time_on:6>203400 <freq:6>14.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:1>0 <rst_rcvd:1>0 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:4>K6SH <gridsquare:4>CM87 <mode:3>FT8<qso_date:8>20260107 <time_on:6>203900 <freq:6>14.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:1>0 <rst_rcvd:2>-6 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:4>K0TX <gridsquare:4>DM59 <mode:3>FT8<qso_date:8>20260107 <time_on:6>204030 <freq:6>14.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:1>0 <rst_rcvd:3>-12 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:4>WM8Q <gridsquare:4>DN61 <mode:3>FT8<qso_date:8>20260107 <time_on:6>204330 <freq:6>14.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:2>-8 <rst_rcvd:3>-12 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:5>N7LAN <gridsquare:0> <mode:3>FT8<qso_date:8>20260107 <time_on:6>205100 <freq:6>14.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:1>-99 <rst_rcvd:2>-9 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:4>N7KB <gridsquare:4>DM43 <mode:3>FT8<qso_date:8>20260107 <time_on:6>205230 <freq:6>14.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:2>20 <rst_rcvd:3>-12 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:5>KC7YE <gridsquare:0> <mode:3>FT8<qso_date:8>20260107 <time_on:6>205500 <freq:6>14.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:1>-99 <rst_rcvd:2>-6 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:3>N9W <gridsquare:0> <mode:3>FT8<qso_date:8>20260107 <time_on:6>210030 <freq:6>28.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:2>-4 <rst_rcvd:2>-5 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:6>KC9JUV <gridsquare:4>EM58 <mode:3>FT8<qso_date:8>20260107 <time_on:6>210130 <freq:6>28.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:1>0 <rst_rcvd:3>-21 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>
+<call:5>KG8DH <gridsquare:4>EM89 <mode:3>FT8<qso_date:8>20260107 <time_on:6>211130 <freq:6>28.074 <station_callsign:5>AG6AQ <my_gridsquare:4>CM97 <rst_sent:2>-6 <rst_rcvd:3>-15 <comment:27>MiniFT8 QMX EFHW 2W US-4571 <eor>

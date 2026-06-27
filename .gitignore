@@ -1,0 +1,60 @@
+# Build artifacts
+.cache
+/build/
+*.bin
+*.elf
+*.map
+idf_py_*
+main/*.o
+
+# ESP-IDF managed components (auto-fetched by idf.py build)
+/managed_components/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+!release/*.bin
+
+# macOS
+.DS_Store
+
+
+# Test build outputs (Windows MSVC / CMake)
+tests/tx_e2e/build/
+tests/tx_e2e/build_vs/
+tests/tx_e2e/build_new/
+tests/tx_e2e/build_host/
+tests/tx_e2e/build_mingw/
+tests/tx_e2e/*.exe
+tests/tx_e2e/*.ilk
+tests/tx_e2e/*.pdb
+tests/tx_e2e/*.lib
+tests/tx_e2e/Makefile
+tests/tx_e2e/cmake_install.cmake
+tests/tx_e2e/CTestTestfile.cmake
+tests/tx_e2e/Testing/
+Testing/
+
+# Scratch diff/patch files
+*.diff
+*.patch
+
+# Claude tooling + local backups
+.claude/
+sdkconfig.bak
+sdkconfig.old
+*.bak
+
+# Compiled host-test binaries
+*.exe
+host_mock/host_test

@@ -1,0 +1,86 @@
+{
+  "config": {
+    "MY_CALLSIGN": "AG6AQ",
+    "MY_GRID": "CM97",
+    "DX_CALLSIGN": "W6ABC",
+    "DX_GRID": "CM88",
+    "TX_ON_EVEN": true,
+    "CQ_TYPE": "FD",
+    "FREE_TEXT": "1A SCV"
+  },
+  "periods": [
+    {
+      "comment": "Period 0 (even): idle",
+      "messages": []
+    },
+    {
+      "comment": "Period 1 (odd): DX sends CQ FD — we touch to reply",
+      "messages": [
+        {
+          "call_to": "CQ FD",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "${DX_GRID}",
+          "snr": -8,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ],
+      "touch_event": {
+        "time_offset": 14.0,
+        "message_index": 0
+      }
+    },
+    {
+      "comment": "Period 2 (even): we send TX1 (grid) to DX",
+      "messages": []
+    },
+    {
+      "comment": "Period 3 (odd): DX sends FD exchange (TX2)",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "2A ORG",
+          "snr": -6,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "comment": "Period 4 (even): we send R + our FD exchange (TX3)",
+      "messages": []
+    },
+    {
+      "comment": "Period 5 (odd): DX sends RR73 (TX4) — transition to SIGNOFF, log QSO",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "RR73",
+          "snr": 0,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "comment": "Period 6 (even): we send 73 (TX5), SIGNOFF -> tick -> IDLE",
+      "messages": []
+    },
+    {
+      "comment": "Period 7 (odd): DX sends RR73 again (didn't get our 73) — should NOT re-log",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "RR73",
+          "snr": 0,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "comment": "Period 8 (even): verify no double log",
+      "messages": []
+    }
+  ]
+}

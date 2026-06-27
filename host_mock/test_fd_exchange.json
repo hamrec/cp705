@@ -1,0 +1,61 @@
+{
+  "config": {
+    "MY_CALLSIGN": "AG6AQ",
+    "MY_GRID": "CM97",
+    "DX_CALLSIGN": "N6HAN",
+    "DX_GRID": "CM87",
+    "TX_ON_EVEN": true,
+    "CQ_TYPE": "FD",
+    "FREE_TEXT": "1A SCV"
+  },
+  "periods": [
+    {
+      "comment": "Period 0 (even): beacon starts — we CQ FD on even slots",
+      "messages": [],
+      "beacon_change": {
+        "time_offset": 1.0,
+        "beacon_on": 1
+      }
+    },
+    {
+      "comment": "Period 1 (odd): nothing — CQ FD sent in period 0",
+      "messages": []
+    },
+    {
+      "comment": "Period 2 (even): no reply yet, beacon sends another CQ FD",
+      "messages": []
+    },
+    {
+      "comment": "Period 3 (odd): DX replies with FD exchange (their TX2: '1B SCV')",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "1B SCV",
+          "snr": -5,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "comment": "Period 4 (even): we respond with R + our FD exchange (TX3) — state ROGER_REPORT",
+      "messages": []
+    },
+    {
+      "comment": "Period 5 (odd): DX sends RR73 (TX4) — acknowledging our R+exchange",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "RR73",
+          "snr": -3,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "comment": "Period 6 (even): we send 73 (TX5) — QSO complete",
+      "messages": []
+    }
+  ]
+}

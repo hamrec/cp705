@@ -1,0 +1,13 @@
+# (PSRAM intentionally NOT enabled: M5Stack Cardputer ADV uses ESP32-S3FN8
+#  with 8MB flash and NO PSRAM — confirmed via efuse PSRAM_CAP=None and the
+#  official M5Stack docs. Do not re-enable SPIRAM; it just fails detection.)
+
+# NOTE: a custom 8MB partition table with a "fatfs" data partition was tried
+# (see partitions.csv) to enable internal-storage settings + the in-app QSO log
+# list + USB-MSC. It WORKS but the FATFS/wear-leveling/USB-MSC mount permanently
+# consumes ~15-20KB of heap, which this no-PSRAM board cannot spare — it pushed
+# operating heap negative and the device panic-rebooted constantly (lost CAT).
+# Reverted to the stock 2MB singleapp_large table. QSO logging still works
+# because it writes ADIF straight to the SD card (sdmmc), independent of the
+# internal partition. Re-enable the custom table on the LilyGo T-Deck Plus
+# (8MB PSRAM) where the mount cost is affordable.

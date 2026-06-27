@@ -1,0 +1,103 @@
+{
+  "config": {
+    "MY_CALLSIGN": "AG6AQ",
+    "MY_GRID": "CM97",
+    "DX_CALLSIGN": "N6HAN",
+    "DX_GRID": "CM87",
+    "TX_ON_EVEN": true,
+    "MAX_RETRY": 2
+  },
+  "comment": "Tests short-lived CQ behavior: (1) CQ is one-shot — queue is empty after tick, beacon re-enqueues on next cycle; (2) beacon off stops CQ immediately, no stale CQ accumulates; (3) beacon on resumes CQ; (4) active QSO preempts CQ — CQ sorts below QSO entries; (5) after QSO completes or exhausts, CQ resumes.",
+  "periods": [
+    {
+      "comment": "Period 0 (even): beacon on → first CQ. Queue should be empty after tick (one-shot).",
+      "messages": [],
+      "beacon_change": { "time_offset": 0.0, "beacon_on": 1 }
+    },
+    {
+      "comment": "Period 1 (odd): no TX (odd slot). Queue should be empty (CQ was popped by tick).",
+      "messages": []
+    },
+    {
+      "comment": "Period 2 (even): beacon still on → fresh CQ (proves first was popped, not retried).",
+      "messages": []
+    },
+    {
+      "comment": "Period 3 (odd): beacon OFF. No stale CQ should remain.",
+      "messages": [],
+      "beacon_change": { "time_offset": 0.0, "beacon_on": 0 }
+    },
+    {
+      "comment": "Period 4 (even): no CQ (beacon off). Queue empty.",
+      "messages": []
+    },
+    {
+      "comment": "Period 5 (odd): still off, still empty.",
+      "messages": []
+    },
+    {
+      "comment": "Period 6 (even): beacon ON again → CQ resumes.",
+      "messages": [],
+      "beacon_change": { "time_offset": 0.0, "beacon_on": 1 }
+    },
+    {
+      "comment": "Period 7 (odd): DX replies with TX1 (grid). CQ was popped by tick; DX creates a new QSO context via on_decode → override. Now active QSO should preempt any future CQ.",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "${DX_GRID}",
+          "snr": -5,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 8 (even): should TX to DX (TX2 report), NOT CQ. QSO preempts beacon.",
+      "messages": []
+    },
+    {
+      "comment": "Period 9 (odd): DX sends TX3 (R+report). QSO advances to ROGERS, logs ADIF.",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "R-12",
+          "snr": -12,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 10 (even): should TX RR73 to DX (ROGERS state), not CQ.",
+      "messages": []
+    },
+    {
+      "comment": "Period 11 (odd): DX sends TX5 (73). QSO complete → IDLE → pop. Queue empty.",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "73",
+          "snr": -12,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 12 (even): QSO done, beacon still on → CQ resumes.",
+      "messages": []
+    },
+    {
+      "comment": "Period 13 (odd): idle.",
+      "messages": []
+    },
+    {
+      "comment": "Period 14 (even): another CQ (beacon continues).",
+      "messages": []
+    }
+  ]
+}

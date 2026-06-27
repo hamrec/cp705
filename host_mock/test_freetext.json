@@ -1,0 +1,84 @@
+{
+  "config": {
+    "MY_CALLSIGN": "AG6AQ",
+    "MY_GRID": "CM97",
+    "DX_CALLSIGN": "N6HAN",
+    "DX_GRID": "CM87",
+    "TX_ON_EVEN": true
+  },
+  "comment": "Free Text injection through autoseq queue. FT is HIGHEST priority — guarantees the next TX is the FT, preempting any active QSO. After FT TX, the QSO ctx (preserved) resumes. Covers: (1) empty queue — FT fires in next slot via fallback parity; (2) active QSO — FT preempts and fires immediately, QSO resumes after; (3) one-shot semantics — FT ctx evicted after single TX.",
+  "periods": [
+    {
+      "comment": "Period 0 (even): empty queue, inject FT. Should fire in next TX slot.",
+      "messages": [],
+      "freetext_event": { "time_offset": 1.0, "text": "TNX 73" }
+    },
+    {
+      "comment": "Period 1 (odd): FT TX (with fallback parity 1).",
+      "messages": []
+    },
+    {
+      "comment": "Period 2 (even): FT was one-shot, queue empty.",
+      "messages": []
+    },
+    {
+      "comment": "Period 3 (odd): DX CQ arrives. Touch to start a QSO.",
+      "messages": [
+        {
+          "call_to": "CQ",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "${DX_GRID}",
+          "snr": -5,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ],
+      "touch_event": { "time_offset": 14.0, "message_index": 0 }
+    },
+    {
+      "comment": "Period 4 (even): we TX1 (grid) to DX. Queue parity = even.",
+      "messages": []
+    },
+    {
+      "comment": "Period 5 (odd): inject FT while QSO is in REPLYING. FT inherits queue parity (even), preempts at queue front. NEXT TX should be FT, not QSO retry.",
+      "messages": [],
+      "freetext_event": { "time_offset": 1.0, "text": "HELLO WORLD" }
+    },
+    {
+      "comment": "Period 6 (even): FT TX (preempts QSO retry). Queue: [FT first, then QSO]. After FT TX, FT is popped by tick.",
+      "messages": []
+    },
+    {
+      "comment": "Period 7 (odd): RX slot — DX may send us TX2 (report) since they got our TX1 from period 4.",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "-12",
+          "snr": -12,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "comment": "Period 8 (even): QSO resumes. We TX3 (R+report).",
+      "messages": []
+    },
+    {
+      "comment": "Period 9 (odd): DX sends 73 — terminal, QSO evicted.",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "73",
+          "snr": -12,
+          "slot": 1
+        }
+      ]
+    },
+    {
+      "comment": "Period 10 (even): queue empty, no TX.",
+      "messages": []
+    }
+  ]
+}

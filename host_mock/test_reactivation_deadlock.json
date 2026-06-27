@@ -1,0 +1,92 @@
+{
+  "config": {
+    "MY_CALLSIGN": "AG6AQ",
+    "MY_GRID": "CM97",
+    "DX_CALLSIGN": "KG4OJT",
+    "DX_GRID": "FM18",
+    "TX_ON_EVEN": true,
+    "MAX_RETRY": 2
+  },
+  "comment": "Reproduces Wei's KG4OJT deadlock from RT260411.TXT at 14:59:13. We beacon CQ, DX replies with TX1 (grid), we enter REPORT state. DX never copies our TX2, retries exhaust, context moves to inactive (next_tx clobbered to TX_UNDEF). Beacon CQs continue for many periods. Eventually DX retries their TX1 (grid) — finds inactive context, reactivates it. State machine: REPORT + TX1 falls to default, returns false WITHOUT refreshing next_tx. Context is now in active zone with state=REPORT, next_tx=TX_UNDEF, sorted to front (REPORT > CALLING), blocking the beacon CQ from ever transmitting. BEFORE FIX: TX stops entirely after reactivation. AFTER FIX: TX2 resumes to KG4OJT.",
+  "periods": [
+    {
+      "comment": "Period 0 (even): beacon on, we CQ",
+      "messages": [],
+      "beacon_change": { "time_offset": 0.0, "beacon_on": 1 }
+    },
+    {
+      "comment": "Period 1 (odd): DX replies with TX1 (grid). CALLING+TX1 -> REPORT, TX2",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "${DX_GRID}",
+          "snr": -5,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 2 (even): We send TX2 (report) — retry 1/2",
+      "messages": []
+    },
+    {
+      "comment": "Period 3 (odd): DX silent",
+      "messages": []
+    },
+    {
+      "comment": "Period 4 (even): TX2 retry 2/2",
+      "messages": []
+    },
+    {
+      "comment": "Period 5 (odd): DX silent",
+      "messages": []
+    },
+    {
+      "comment": "Period 6 (even): TX2 final retry, tick exhausts retries, move_to_inactive (REPORT > REPLYING = has_exchanged). next_tx clobbered to TX_UNDEF",
+      "messages": []
+    },
+    {
+      "comment": "Period 7 (odd): DX silent",
+      "messages": []
+    },
+    {
+      "comment": "Period 8 (even): beacon CQ",
+      "messages": []
+    },
+    {
+      "comment": "Period 9 (odd): silent",
+      "messages": []
+    },
+    {
+      "comment": "Period 10 (even): beacon CQ",
+      "messages": []
+    },
+    {
+      "comment": "Period 11 (odd): ★ DX finally retries TX1 (grid). on_decode finds ctx in inactive, reactivates. generate_response: REPORT + TX1 -> default -> return false WITHOUT refreshing next_tx. Context lands in active zone with state=REPORT, next_tx=TX_UNDEF, retry=0/2.",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "${DX_GRID}",
+          "snr": -5,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 12 (even): BEFORE FIX: no TX (KG4OJT blocks CQ at queue[0] with next_tx=TX_UNDEF). AFTER FIX: TX TX2 resumes to KG4OJT.",
+      "messages": []
+    },
+    {
+      "comment": "Period 13 (odd): silent",
+      "messages": []
+    },
+    {
+      "comment": "Period 14 (even): BEFORE FIX: still stuck. AFTER FIX: TX2 retry to KG4OJT.",
+      "messages": []
+    }
+  ]
+}

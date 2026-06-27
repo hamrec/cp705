@@ -1,0 +1,108 @@
+{
+  "config": {
+    "MY_CALLSIGN": "AG6AQ",
+    "MY_GRID": "CM97",
+    "DX_CALLSIGN": "W6ABC",
+    "DX_GRID": "CM88",
+    "TX_ON_EVEN": true
+  },
+  "comment": "Demonstrates ROGERS duplicate ADIF bug: full QSO completes (logged correctly at ROGERS entry), then retries of TX4 exhaust. DX retries TX3 after our context is popped, creating a reincarnated context that logs a DUPLICATE ADIF with snr_tx=-99. Unlike the REPORT case, the original correct entry exists.",
+  "periods": [
+    {
+      "comment": "Period 0 (even): beacon CQ",
+      "messages": [],
+      "beacon_change": { "time_offset": 0.0, "beacon_on": 1 }
+    },
+    {
+      "comment": "Period 1 (odd): DX replies with TX1 (grid)",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "${DX_GRID}",
+          "snr": -5,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 2 (even): We send TX2 (report: -5)",
+      "messages": []
+    },
+    {
+      "comment": "Period 3 (odd): DX sends TX3 (R-08) — acknowledges our report. REPORT+TX3 → ROGERS. QSO LOGGED here with rst_sent=-5, rst_rcvd=-8. CORRECT.",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "R-08",
+          "snr": -8,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 4 (even): We send TX4 (RR73). ROGERS state, retry 1/5.",
+      "messages": []
+    },
+    {
+      "comment": "Period 5 (odd): DX doesn't respond (didn't decode our RR73)",
+      "messages": []
+    },
+    {
+      "comment": "Period 6: TX4 retry 2/5",
+      "messages": []
+    },
+    {
+      "comment": "Period 7: no response",
+      "messages": []
+    },
+    {
+      "comment": "Period 8: TX4 retry 3/5",
+      "messages": []
+    },
+    {
+      "comment": "Period 9: no response",
+      "messages": []
+    },
+    {
+      "comment": "Period 10: TX4 retry 4/5",
+      "messages": []
+    },
+    {
+      "comment": "Period 11: no response",
+      "messages": []
+    },
+    {
+      "comment": "Period 12: TX4 retry 5/5",
+      "messages": []
+    },
+    {
+      "comment": "Period 13: no response",
+      "messages": []
+    },
+    {
+      "comment": "Period 14: TX4 final retry — tick exhausts retries, context POPPED.",
+      "messages": []
+    },
+    {
+      "comment": "Period 15 (odd): DX retries TX3 (R-08) — they never got our RR73. No matching ctx → reincarnated context. EXPECT BUG: DUPLICATE ADIF with rst_sent=-99.",
+      "messages": [
+        {
+          "call_to": "${MY_CALLSIGN}",
+          "call_from": "${DX_CALLSIGN}",
+          "locator": "R-08",
+          "snr": -8,
+          "slot": 1,
+          "freq_hz": 1200
+        }
+      ]
+    },
+    {
+      "comment": "Period 16 (even): Reincarnated context sends TX4. Second ADIF logged with wrong rst_sent.",
+      "messages": []
+    }
+  ]
+}
