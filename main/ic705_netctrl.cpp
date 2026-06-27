@@ -57,7 +57,6 @@
 #include "esp_wifi.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
-#include "ping/ping_sock.h"
 #include "esp_heap_caps.h"
 
 static const char* TAG = "IC705_NET";
@@ -691,8 +690,6 @@ static esp_err_t serial_send_civ_now(const uint8_t* frame, uint8_t len) {
 //   0x18+ payload — raw PCM
 // ---------------------------------------------------------------------------
 static uint16_t s_audio_send_seq_inner = 0;
-static volatile int s_dump_pkts = 0;
-void ic705_net_dump_audio_pkts(int n) { s_dump_pkts = n; }
 
 static esp_err_t audio_send_pcm_now(const uint8_t* pcm, uint16_t len) {
     if (len > AUDIO_TX_PCM_MAX) len = AUDIO_TX_PCM_MAX;
@@ -710,16 +707,6 @@ static esp_err_t audio_send_pcm_now(const uint8_t* pcm, uint16_t len) {
     s_audio_send_seq_inner++;
     put_be16(d + 22, len);
     memcpy(d + 24, pcm, len);
-    if (s_dump_pkts > 0) {  // dump the ACTUAL bytes leaving the device for wfview comparison
-        s_dump_pkts--;
-        ESP_LOGW(TAG, "TXPKT outerSeqNext=%u hdr+pcm0: "
-                 "%02x%02x %02x%02x %02x%02x %02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
-                 "%02x%02x %02x%02x %02x%02x %02x%02x | %02x%02x %02x%02x",
-                 (unsigned)s_audio.send_seq,
-                 d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],d[9],d[10],d[11],
-                 d[12],d[13],d[14],d[15],d[16],d[17],d[18],d[19],d[20],d[21],d[22],d[23],
-                 d[24],d[25],d[26],d[27]);
-    }
     return udp_send_tracked(&s_audio, d, total);
 }
 
@@ -781,84 +768,9 @@ int ic705_net_recv_audio_pcm(uint8_t* out, size_t max_len, int timeout_ms) {
 bool ic705_net_audio_is_ready(void) { return s_audio_ready; }
 
 // ---------------------------------------------------------------------------
-// Basic IP-layer sanity check — ICMP ping via lwIP's own ping_sock, entirely
-// independent of any of our own protocol code above. Confirms WiFi
-// association + IP reachability to the radio before anything else is tried.
-// ---------------------------------------------------------------------------
-struct ping_result_t {
-    int sent = 0;
-    int recv = 0;
-    uint32_t total_time_ms = 0;
-    SemaphoreHandle_t done_sem = nullptr;  // owned by this instance, not shared
-};
-
-static void on_ping_success_cb(esp_ping_handle_t hdl, void* args) {
-    auto* r = (ping_result_t*)args;
-    uint32_t elapsed_time = 0;
-    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed_time, sizeof(elapsed_time));
-    r->total_time_ms += elapsed_time;
-}
-
-static void on_ping_end_cb(esp_ping_handle_t hdl, void* args) {
-    auto* r = (ping_result_t*)args;
-    uint32_t transmitted = 0, received = 0;
-    esp_ping_get_profile(hdl, ESP_PING_PROF_REQUEST, &transmitted, sizeof(transmitted));
-    esp_ping_get_profile(hdl, ESP_PING_PROF_REPLY, &received, sizeof(received));
-    r->sent = (int)transmitted;
-    r->recv = (int)received;
-    xSemaphoreGive(r->done_sem);
-}
-
-static void do_ping_check(uint32_t ip_be) {
-    ping_result_t result;
-    // Fresh semaphore per call (not a shared/reused one) — a session
-    // overlapping the next call's wait window was satisfying the wrong
-    // wait with a stale signal, producing bogus "0/0" or truncated results.
-    result.done_sem = xSemaphoreCreateBinary();
-
-    esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
-    config.target_addr.type = IPADDR_TYPE_V4;
-    config.target_addr.u_addr.ip4.addr = ip_be;
-    config.count = 4;
-    config.interval_ms = 300;
-    config.timeout_ms = 1000;
-
-    esp_ping_callbacks_t cbs = {};
-    cbs.cb_args = &result;
-    cbs.on_ping_success = on_ping_success_cb;
-    cbs.on_ping_end = on_ping_end_cb;
-
-    esp_ping_handle_t hdl;
-    esp_err_t err = esp_ping_new_session(&config, &cbs, &hdl);
-    if (err != ESP_OK) {
-        set_status("PingErr %d", (int)err);
-        dbg_log("ping session create failed: %s", esp_err_to_name(err));
-        vSemaphoreDelete(result.done_sem);
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        return;
-    }
-    set_status("Pinging...");
-    esp_ping_start(hdl);
-    xSemaphoreTake(result.done_sem, pdMS_TO_TICKS(8000));
-    esp_ping_delete_session(hdl);
-    vSemaphoreDelete(result.done_sem);
-
-    unsigned avg_ms = result.recv ? (unsigned)(result.total_time_ms / result.recv) : 0;
-    set_status("Ping %d/%d %ums", result.recv, result.sent, avg_ms);
-    dbg_log("ping result: sent=%d recv=%d avg_ms=%u", result.sent, result.recv, avg_ms);
-    vTaskDelay(pdMS_TO_TICKS(1500));  // hold the result on screen for a moment
-}
-
-// ---------------------------------------------------------------------------
 // Connect sequence (runs once at the start of the background task)
 // ---------------------------------------------------------------------------
 static esp_err_t do_connect(uint32_t ic705_ip) {
-    // Temporarily skipped: ruling out whether this diagnostic socket itself
-    // (opened right before every login attempt) could be read by the radio
-    // as a second client and contribute to login rejection. Login was
-    // already failing before this check existed, so it's not the original
-    // cause either way — but it's cheap to eliminate cleanly.
-    // do_ping_check(ic705_ip);
     set_status("SID1...");
     // PRIME-SUSPECT TEST: bind the control stream to a RANDOM EPHEMERAL local
     // port (remote stays 50001), matching wfview — which never uses

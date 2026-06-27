@@ -49,10 +49,6 @@ void ic705_net_reset_audio_tx_stats(void);
 // enough continuous RX has been measured. TX paces to this to avoid clock drift.
 double ic705_net_get_measured_rx_rate(void);
 
-// Dump the next N actual TX audio packets' header bytes over the log (for
-// byte-for-byte comparison against wfview's captured packets).
-void ic705_net_dump_audio_pkts(int n);
-
 // Pulls one received raw-PCM frame (already stripped of the 24-byte audio
 // header) into out, up to max_len bytes, waiting up to timeout_ms.
 // Returns the number of bytes copied, or 0 on timeout/no audio session.

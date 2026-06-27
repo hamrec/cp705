@@ -118,13 +118,6 @@ static void tx_writer_task(void* /*arg*/) {
     int      rd = 0, wr = 0, count = 0;          // look-ahead ring state (samples)
     int64_t  worst_render_us = 0, worst_gap_us = 0, prev_send_us = 0;
     int      frames = 0, underruns = 0;
-    // DIAGNOSTIC: envelope of the ACTUAL transmitted samples. Each frame's peak
-    // |sample| is bucketed into ~160ms slots; dumped at TX end. For constant-
-    // envelope GFSK this MUST be flat — if it pumps, the corruption is in OUR
-    // generated audio (not WiFi), which is what we're testing.
-    static uint16_t env[96];
-    int      env_n = 0;
-    uint16_t frame_pk = 0, pk_min = 0xFFFF, pk_max = 0;
 
     // Render one DDS block into the look-ahead ring.
     auto render_one = [&]() {
@@ -153,16 +146,6 @@ static void tx_writer_task(void* /*arg*/) {
                 ESP_LOGW(TAG, "TXDONE ok=%u fail=%u rexmit=%u | frames=%d underruns=%d worstGap=%lldus worstRender=%lldus",
                          (unsigned)ok, (unsigned)fail, (unsigned)rexmit,
                          frames, underruns, (long long)worst_gap_us, (long long)worst_render_us);
-                // Envelope of the actual transmitted samples (peak per ~160ms).
-                // FLAT = our audio is clean (splatter is external/WiFi/radio);
-                // VARYING = our generated audio itself pumps (NOT a WiFi problem).
-                ESP_LOGW(TAG, "TXENV pk_min=%u pk_max=%u (ratio=%.3f) n=%d",
-                         (unsigned)pk_min, (unsigned)pk_max,
-                         pk_max ? (double)pk_min / (double)pk_max : 0.0, env_n);
-                char line[320]; int p = 0;
-                for (int i = 0; i < env_n && p < (int)sizeof(line) - 6; ++i)
-                    p += snprintf(line + p, sizeof(line) - p, "%u ", (unsigned)env[i]);
-                ESP_LOGW(TAG, "TXENV[] %s", line);
             }
             was_running = false;
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -173,9 +156,7 @@ static void tx_writer_task(void* /*arg*/) {
             rd = wr = count = 0;
             worst_render_us = worst_gap_us = prev_send_us = 0;
             frames = underruns = 0;
-            env_n = 0; frame_pk = 0; pk_min = 0xFFFF; pk_max = 0;
             ic705_net_reset_audio_tx_stats();
-            ic705_net_dump_audio_pkts(2);  // dump first 2 real packets for wfview byte-compare
             // Prime the ~40ms cushion, then start the hardware pacing timer at a
             // period matched to the RADIO's measured sample clock (not our nominal
             // 48kHz) so 480 samples are delivered in exactly the time the radio
@@ -196,22 +177,11 @@ static void tx_writer_task(void* /*arg*/) {
         if (xSemaphoreTake(s_tx_tick_sem, pdMS_TO_TICKS(100)) != pdTRUE) continue;
 
         if (count >= TX_RENDER_BLK) {
-            uint16_t pk = 0;
             for (int i = 0; i < TX_RENDER_BLK; ++i) {
                 int16_t s = look[rd];
                 if (++rd >= TX_LOOK_N) rd = 0;
                 frame_buf[i * 2]     = (uint8_t)(s & 0xFF);
                 frame_buf[i * 2 + 1] = (uint8_t)((s >> 8) & 0xFF);
-                uint16_t a = (s < 0) ? (uint16_t)(-s) : (uint16_t)s;
-                if (a > pk) pk = a;
-            }
-            // envelope: peak per frame, bucketed ~160ms (16 frames)
-            if (pk < pk_min) pk_min = pk;
-            if (pk > pk_max) pk_max = pk;
-            if (pk > frame_pk) frame_pk = pk;
-            if ((frames % 16) == 15) {
-                if (env_n < (int)(sizeof(env)/sizeof(env[0]))) env[env_n++] = frame_pk;
-                frame_pk = 0;
             }
             count -= TX_RENDER_BLK;
             int64_t t0 = esp_timer_get_time();

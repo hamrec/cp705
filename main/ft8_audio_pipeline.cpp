@@ -213,21 +213,6 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
                            mon.wf.num_blocks >= g_protocol->total_symbols) {
                     ESP_LOGI(tag, "Triggering decode at slot %lld blocks=%d wf=%d",
                              (long long)slot_idx, slot_blocks, mon.wf.num_blocks);
-                    // TEMP DIAGNOSTIC: FT8 only decodes when the 15s accumulation
-                    // window is aligned to UTC (the TX starts at second 0 of each
-                    // 15s period). If the clock isn't GPS/UTC-synced, the window
-                    // is at a random phase and every decode returns 0. Log the
-                    // wall-clock UTC and the sub-slot phase so we can see at a
-                    // glance whether time sync is the cause of zero decodes.
-                    {
-                        int64_t epoch_ms = rtc_now_ms();
-                        time_t  t = (time_t)(epoch_ms / 1000);
-                        struct tm g; gmtime_r(&t, &g);
-                        long phase_ms = (long)(epoch_ms % slot_ms);
-                        ESP_LOGW(tag, "DECODE_TIME utc=%04d-%02d-%02d %02d:%02d:%02d phase_in_slot_ms=%ld (want ~12640)",
-                                 g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
-                                 g.tm_hour, g.tm_min, g.tm_sec, phase_ms);
-                    }
                     if (g_decode_enabled) {
                         g_decode_slot_idx = slot_idx;
                         g_decode_in_progress = true;
