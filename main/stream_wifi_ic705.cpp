@@ -88,7 +88,10 @@ static void tx_pace_cb(void*) { if (s_tx_tick_sem) xSemaphoreGive(s_tx_tick_sem)
 #define TX_RENDER_BLK        480     // DDS render granularity AND frame size (samples)
 #define TX_PACE_US           10000   // 480 samples @ 48kHz = 10ms hardware tick
 #define TX_LEAD_SAMPLES      (48000 * 40 / 1000)   // pre-render ~40ms cushion in the ring
-#define TX_LOOK_N            9600    // look-ahead ring capacity (samples) = 200ms
+#define TX_LOOK_N            2880    // look-ahead ring (60ms) — only needs to hold the
+                                     // 40ms lead + a render block; was 9600 (200ms),
+                                     // which wasted ~13KB of static RAM the decoder
+                                     // needs (no-PSRAM board was OOM-crashing in decode)
 #define TX_STEREO_BUF_BYTES  (TX_RENDER_BLK * 6)
 #define TX_MONO16_BUF_BYTES  (TX_RENDER_BLK * 2)
 

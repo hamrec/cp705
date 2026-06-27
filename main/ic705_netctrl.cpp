@@ -391,9 +391,9 @@ static QueueHandle_t s_audio_in_q  = nullptr;   // PCM frames received (RX)
 // payloads (per wfview's analysis), so the receive path must hold a full
 // 1364-byte chunk or it truncates and corrupts the stream → no decode.
 #define AUDIO_RX_PCM_MAX 1364
-// TX: the writer now mirrors wfview's native framing — alternating 682-sample
-// (1364-byte) and 278-sample frames. Cap must hold the 1364-byte big frame.
-#define AUDIO_TX_PCM_MAX 1364
+// TX: the writer sends uniform 480-sample (960-byte) frames. 1024 covers it with
+// headroom. (Was 1364 for an abandoned 682/278 framing — reverted to save RAM.)
+#define AUDIO_TX_PCM_MAX 1024
 
 // Audio queue depths.
 #define AUDIO_IN_Q_DEPTH  6
@@ -536,10 +536,11 @@ static void build_request_serial_audio_pkt(uint8_t out[144], uint16_t civ_local_
     out[122] = (uint8_t)(sample_rate >> 8); out[123] = (uint8_t)(sample_rate & 0xFF);
     out[126] = (uint8_t)(civ_local_port >> 8); out[127] = (uint8_t)(civ_local_port & 0xFF);
     out[130] = (uint8_t)(audio_local_port >> 8); out[131] = (uint8_t)(audio_local_port & 0xFF);
-    out[134] = 0x01; out[135] = 0x2c;  // txbuffer=300ms (kappanhang's value; the radio
-                                       // uses this as its RX buffer depth — more cushion
-                                       // to absorb our rougher MAC-level delivery jitter.
-                                       // >500-600ms breaks TX per kappanhang's note.)
+    out[134] = 0x00; out[135] = 0x96;  // buffer=150ms — wfview's proven value (rx+tx
+                                       // both 150). kappanhang's 300ms may have added
+                                       // RX latency and thrown off the decode-window
+                                       // re-anchor; the clean-TX fix is the pkt0-idle
+                                       // gating, not this, so 150 is the safe choice.
     out[136] = 0x01;
 }
 
@@ -737,6 +738,12 @@ void ic705_net_get_audio_tx_stats(uint32_t* ok, uint32_t* fail, uint32_t* rexmit
     if (fail) *fail = s_audio_tx_fail;
     if (rexmit) *rexmit = s_audio_rexmit;
 }
+// Timestamp of the last TX audio packet — used to tell RX (no TX) from active
+// TX so we keep the audio-stream pkt0 idle keepalive flowing during receive
+// (the IC-705 needs it for smooth RX audio) but suppress it while transmitting
+// (interleaving idle frames into the TX audio stream splatters the signal).
+static volatile int64_t s_last_audio_tx_us = 0;
+
 void ic705_net_reset_audio_tx_stats(void) {
     s_audio_tx_ok = 0;
     s_audio_tx_fail = 0;
@@ -755,6 +762,7 @@ esp_err_t ic705_net_send_audio_pcm(const uint8_t* pcm, size_t len) {
     // the net task's keepalives by udp_sess_t::seq_mux. lwIP socket send() is
     // thread-safe, so concurrent send (here, core 0) + recv (net task, core 1)
     // on s_audio is fine.
+    s_last_audio_tx_us = esp_timer_get_time();
     esp_err_t r = audio_send_pcm_now(pcm, (uint16_t)len);
     if (r == ESP_OK) s_audio_tx_ok++; else s_audio_tx_fail++;
     return r;
@@ -1120,6 +1128,7 @@ static void handle_serial_rx(const uint8_t* r, int n) {
 static volatile uint32_t s_audio_rx_pkts  = 0;   // real audio DATA packets received
 static volatile uint32_t s_audio_rx_bytes = 0;   // PCM bytes received
 static volatile uint32_t s_audio_rx_other = 0;   // non-data (ping/idle/other) on audio sock
+static volatile uint32_t s_audio_rx_drops = 0;   // RX audio packets dropped (in_q full)
 
 // Radio sample-clock measurement. The radio sends RX audio at ITS 48kHz crystal;
 // by counting samples received vs our esp_timer over CONTINUOUS RX flow (gaps >
@@ -1211,7 +1220,7 @@ static void handle_audio_rx(const uint8_t* r, int n) {
                 buf[0] = (uint8_t)(pcm_len & 0xFF);
                 buf[1] = (uint8_t)((pcm_len >> 8) & 0xFF);
                 memcpy(buf + 2, r + 24, pcm_len);
-                xQueueSend(s_audio_in_q, buf, 0);  // drop if full; never block the net task
+                if (xQueueSend(s_audio_in_q, buf, 0) != pdTRUE) s_audio_rx_drops++;  // queue full
             }
         }
     }
@@ -1293,10 +1302,17 @@ static void ic705_net_task(void*) {
         if (now - last_idle >= pdMS_TO_TICKS(100)) {
             send_pkt0_idle(&s_ctrl);
             send_pkt0_idle(&s_serial);
-            // NOTE: kappanhang (reference) explicitly does NOT send periodic pkt0
-            // idle on the AUDIO stream — only ctrl/serial. Interleaving idle frames
-            // into the audio stream during TX may disturb the radio's audio
-            // reconstruction. Matched: no pkt0 idle on s_audio.
+            // Audio-stream pkt0 idle keepalive: the IC-705 needs it to keep RX
+            // audio flowing SMOOTHLY (without it we were losing ~2% of RX audio →
+            // gappy decode window → candidates found but 0 decoded). BUT during
+            // TX, interleaving idle frames into the audio stream splatters the
+            // signal — so send it ONLY when we're NOT actively transmitting
+            // (no audio TX packet in the last 150ms). Best of both: smooth RX,
+            // clean TX. (kappanhang skips it entirely; the IC-705 differs.)
+            if (s_audio_ready &&
+                (esp_timer_get_time() - s_last_audio_tx_us) > 150000) {
+                send_pkt0_idle(&s_audio);
+            }
             last_idle = now;
         }
         if (now - last_ping >= pdMS_TO_TICKS(3000)) {
@@ -1310,6 +1326,16 @@ static void ic705_net_task(void*) {
             build_auth_pkt(auth05, 0x05);
             udp_send_tracked_x2(&s_ctrl, auth05, sizeof(auth05));
             last_reauth = now;
+        }
+        // DIAGNOSTIC: RX audio health every 5s — measured received rate (Hz; a
+        // clean stream reads ~48000), queue drops, and packet count. Tells us if
+        // we're losing RX audio (and where: <48000 rate or nonzero drops).
+        static TickType_t last_rxh = 0;
+        if (now - last_rxh >= pdMS_TO_TICKS(5000)) {
+            last_rxh = now;
+            ESP_LOGW(TAG, "RXHEALTH rate=%.1fHz pkts=%u drops=%u",
+                     ic705_net_get_measured_rx_rate(),
+                     (unsigned)s_audio_rx_pkts, (unsigned)s_audio_rx_drops);
         }
 
         // Pace the loop and yield CPU. The sockets above are non-blocking, so
