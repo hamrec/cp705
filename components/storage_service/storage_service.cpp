@@ -49,6 +49,12 @@ size_t s_open_streams;
 bool s_station_sync_attempted;
 sdmmc_card_t* s_sd_card;
 bool s_sd_mounted;
+// Once the SD log mount is established at boot (while DMA memory is plentiful),
+// keep it up for the rest of the session: a later remount reliably fails with
+// ESP_ERR_NO_MEM once WiFi/audio/decode have eaten DMA-capable heap. With this
+// set, unmount_sd_locked() becomes a no-op so a mid-session "copy to SD" can't
+// tear down the persistent logging mount.
+bool s_sd_keep_mounted;
 
 enum class MountTransitionResult : uint8_t {
     NONE,
@@ -234,6 +240,11 @@ esp_err_t mount_sd_locked() {
 }
 
 void unmount_sd_locked() {
+    // Preserve the persistent logging mount established by storage_sd_log_premount().
+    // Remounting later (DMA exhausted) would fail and silently kill all SD logging.
+    if (s_sd_keep_mounted) {
+        return;
+    }
     if (s_sd_mounted && s_sd_card) {
         esp_vfs_fat_sdcard_unmount(kSdBasePath, s_sd_card);
         s_sd_card = nullptr;
@@ -250,7 +261,11 @@ size_t g_storage_sd_log_dma_largest = 0;  // largest free DMA-capable block (byt
 esp_err_t storage_sd_log_premount() {
     StorageGuard guard;
     if (!guard.held()) return ESP_FAIL;
-    return mount_sd_locked();
+    esp_err_t err = mount_sd_locked();
+    if (err == ESP_OK) {
+        s_sd_keep_mounted = true;  // pin the mount for the rest of the session
+    }
+    return err;
 }
 
 bool storage_sd_log_append(const std::string& name, const std::string& content) {
@@ -268,6 +283,9 @@ bool storage_sd_log_append(const std::string& name, const std::string& content) 
     FILE* f = fopen(path.c_str(), "a");
     if (!f) { g_storage_sd_log_last_code = -1 - errno; return false; }
     const size_t written = fwrite(content.data(), 1, content.size(), f);
+    // Force the data AND the FAT/directory update to the physical card now, so
+    // the record survives the card being pulled without a clean unmount.
+    sync_file(f);
     fclose(f);
     if (written != content.size()) { g_storage_sd_log_last_code = -2; return false; }
     g_storage_sd_log_last_code = 0;
@@ -297,6 +315,8 @@ bool storage_sd_append_with_header(const std::string& name,
     if (ok) {
         ok = (fwrite(content.data(), 1, content.size(), f) == content.size());
     }
+    // Flush data + FAT/directory entry to the card so a pulled card keeps the QSO.
+    sync_file(f);
     fclose(f);
     g_storage_sd_log_last_code = ok ? 0 : -2;
     return ok;

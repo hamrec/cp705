@@ -699,6 +699,12 @@ static void qso_draw_page();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
 static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
+// ADIF-to-SD result published by log_adif_entry() (may run on the core1 decode
+// task) and consumed/displayed by the core0 UI loop. Plain ints only — see the
+// poll in app_task_core0(). g_adif_sd_seq increments on every QSO write.
+static volatile uint32_t g_adif_sd_seq  = 0;
+static volatile bool     g_adif_sd_ok   = false;
+static volatile int      g_adif_sd_code = 0;
 static bool storage_append_text_locked_path(const std::string& path,
                                             const std::string& line,
                                             const std::string& header_if_new,
@@ -1166,6 +1172,12 @@ static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   // (autoseq retries on false).
   bool ok = storage_sd_append_with_header(path, line, kAdifHeader);
   if (!ok) ESP_LOGW(TAG, "ADIF SD write failed (%s): code=%d", path, g_storage_sd_log_last_code);
+  // Hand the result to the core0 UI loop for on-device display. This callback can
+  // run on the core1 decode task, so DON'T touch the (unlocked) debug-line vector
+  // here — just publish plain ints; core0 polls g_adif_sd_seq and logs the change.
+  g_adif_sd_ok   = ok;
+  g_adif_sd_code = g_storage_sd_log_last_code;
+  g_adif_sd_seq++;
   // (2) SECONDARY (best-effort): also write to internal flash so the in-app QSO
   // list, USB-MSC drive, and "Copy Files to SD" menu all see the same log. Now
   // that the custom partition table includes the "fatfs" partition this works;
@@ -4821,7 +4833,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // and the SD-over-SPI driver requires DMA, so mounting later reliably
   // fails with ESP_ERR_NO_MEM. All peripheral/display init is already done
   // at this point, so this doesn't risk the earlier SPI-ordering crash.
-  storage_sd_log_premount();
+  esp_err_t sd_premount_err = storage_sd_log_premount();
+  {
+    // Surface the SD mount result on-device (DEBUG view) — no serial available.
+    char buf[64];
+    if (sd_premount_err == ESP_OK) {
+      snprintf(buf, sizeof(buf), "SD mounted (log ready)");
+    } else {
+      snprintf(buf, sizeof(buf), "SD mount FAIL %s", esp_err_to_name(sd_premount_err));
+    }
+    debug_log_line(buf);
+  }
 
   // --- Crash diagnostics (no-serial device: read these back off the SD) ---
   // Log the reason for the LAST boot — if audio crashed the device, this is
@@ -5039,6 +5061,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   menu_flash_tick();
   rx_flash_tick();
   apply_pending_sync();
+
+  // Surface the latest ADIF-to-SD write result in the DEBUG view (no serial).
+  // log_adif_entry() publishes plain ints from whatever task runs the callback;
+  // we render here on core0, where debug_log_line()'s vector is only touched.
+  {
+    static uint32_t s_adif_sd_seen = 0;
+    uint32_t seq = g_adif_sd_seq;
+    if (seq != s_adif_sd_seen) {
+      s_adif_sd_seen = seq;
+      char buf[64];
+      if (g_adif_sd_ok) snprintf(buf, sizeof(buf), "QSO->SD ok (#%u)", (unsigned)seq);
+      else              snprintf(buf, sizeof(buf), "QSO->SD FAIL code=%d", g_adif_sd_code);
+      debug_log_line(buf);
+    }
+  }
 
   // NOTE: TX scheduling now follows reference architecture:
   // 1. decode_monitor_results() sets g_qso_xmit flag after processing
