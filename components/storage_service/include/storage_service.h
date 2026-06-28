@@ -75,6 +75,15 @@ bool storage_sd_append_with_header(const std::string& name,
                                    const std::string& content,
                                    const std::string& header_if_new);
 
+// Reads an entire file from the SD card (mount point /sdcard) into out, mounting
+// the card on demand. Independent of the internal-flash FATFS owner state, so it
+// works even when that FATFS is unavailable. Returns false if absent/unreadable.
+bool storage_sd_read_file(const std::string& name, std::string& out);
+
+// Overwrites a file on the SD card with content (creating it if needed) and
+// fsyncs it to the card. Independent of the internal-flash FATFS owner state.
+bool storage_sd_write_file(const std::string& name, const std::string& content);
+
 // Mounts the SD card now, while heap is most plentiful (call early at boot).
 // storage_sd_log_append()'s later calls become a fast already-mounted no-op
 // instead of paying the mount's allocation cost once WiFi/audio/decode are

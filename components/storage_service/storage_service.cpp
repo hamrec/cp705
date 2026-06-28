@@ -322,6 +322,42 @@ bool storage_sd_append_with_header(const std::string& name,
     return ok;
 }
 
+bool storage_sd_read_file(const std::string& name, std::string& out) {
+    out.clear();
+    StorageGuard guard;
+    if (!guard.held()) return false;
+    if (mount_sd_locked() != ESP_OK) return false;
+    const std::string path = std::string(kSdBasePath) + "/" + name;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    const bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
+}
+
+bool storage_sd_write_file(const std::string& name, const std::string& content) {
+    StorageGuard guard;
+    if (!guard.held()) { g_storage_sd_log_last_code = 1; return false; }
+    const esp_err_t mount_err = mount_sd_locked();
+    if (mount_err != ESP_OK) {
+        g_storage_sd_log_last_code = 2 + (int)mount_err;
+        g_storage_sd_log_dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+        return false;
+    }
+    const std::string path = std::string(kSdBasePath) + "/" + name;
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { g_storage_sd_log_last_code = -1 - errno; return false; }
+    const bool ok = content.empty() ||
+                    fwrite(content.data(), 1, content.size(), f) == content.size();
+    sync_file(f);  // flush data + FAT/dir entry so it survives a card pull
+    fclose(f);
+    g_storage_sd_log_last_code = ok ? 0 : -2;
+    return ok;
+}
+
 namespace {
 
 esp_err_t copy_file_locked(const std::string& source, const std::string& destination) {

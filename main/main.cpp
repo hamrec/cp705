@@ -4259,19 +4259,49 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
   }
 }
 
-static RadioType load_station_radio_type_only() {
-  StorageStream* stream = storage_stream_open(STATION_FILE, StorageOpenMode::READ);
-  if (!stream) return canonical_radio_type(g_radio);
-
-  char line[128];
-  RadioType radio = canonical_radio_type(g_radio);
-  while (storage_stream_read_line(stream, line, sizeof(line))) {
-    if (strncmp(line, "radio=", 6) == 0) {
-      radio = parse_radio_config_value(line + 6);
-      break;
+// Reads Station.txt as a list of lines, preferring the SD card (reliable on this
+// board) and falling back to the internal flash FATFS. Trailing CR/LF is
+// stripped and blank lines dropped. Returns false if neither source has it.
+static bool read_station_lines(std::vector<std::string>& lines) {
+  lines.clear();
+  std::string content;
+  if (storage_sd_read_file(STATION_FILE, content) && !content.empty()) {
+    size_t start = 0;
+    while (start <= content.size()) {
+      size_t nl = content.find('\n', start);
+      std::string s = (nl == std::string::npos) ? content.substr(start)
+                                                 : content.substr(start, nl - start);
+      while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+      if (!s.empty()) lines.push_back(s);
+      if (nl == std::string::npos) break;
+      start = nl + 1;
     }
+    return !lines.empty();
+  }
+  // Fallback: internal flash.
+  StorageStream* stream = storage_stream_open(STATION_FILE, StorageOpenMode::READ);
+  if (!stream) return false;
+  char buf[256];
+  while (storage_stream_read_line(stream, buf, sizeof(buf))) {
+    std::string s(buf);
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    if (!s.empty()) lines.push_back(s);
   }
   storage_stream_close(stream);
+  return !lines.empty();
+}
+
+static RadioType load_station_radio_type_only() {
+  std::vector<std::string> lines;
+  RadioType radio = canonical_radio_type(g_radio);
+  if (read_station_lines(lines)) {
+    for (const std::string& s : lines) {
+      if (strncmp(s.c_str(), "radio=", 6) == 0) {
+        radio = parse_radio_config_value(s.c_str() + 6);
+        break;
+      }
+    }
+  }
   return canonical_radio_type(radio);
 }
 
@@ -4288,8 +4318,8 @@ static void load_station_data() {
   g_grid_gps_display8.clear();
 
   {
-    StorageStream* stream = storage_stream_open(STATION_FILE, StorageOpenMode::READ);
-    if (!stream) {
+    std::vector<std::string> cfg_lines;
+    if (!read_station_lines(cfg_lines)) {
       autoseq_set_max_retry(g_autoseq_max_retry);
       return;
     }
@@ -4300,8 +4330,8 @@ static void load_station_data() {
     // protocol_mode in Station.txt, so a single-pass parse would load FT8
     // frequencies and never correct them when switching to FT4.
     {
-      char line1[128];
-      while (storage_stream_read_line(stream, line1, sizeof(line1))) {
+      for (const std::string& cl : cfg_lines) {
+        const char* line1 = cl.c_str();
         if (strncmp(line1, "protocol_mode=", 14) == 0) {
           char mode[8] = {};
           sscanf(line1 + 14, "%7s", mode);
@@ -4320,13 +4350,14 @@ static void load_station_data() {
           break;
         }
       }
-      storage_stream_seek(stream, 0, SEEK_SET);
     }
 #endif  // ENABLE_FT4
 
     // Pass 2 (or only pass when ENABLE_FT4=0): full field parse.
-    char line[128];
-    while (storage_stream_read_line(stream, line, sizeof(line))) {
+    for (const std::string& cl : cfg_lines) {
+      char line[256];
+      strncpy(line, cl.c_str(), sizeof(line) - 1);
+      line[sizeof(line) - 1] = '\0';
       int idx = -1;
       int val = 0;
       float fval = 0.0f;
@@ -4413,7 +4444,6 @@ static void load_station_data() {
       }
     }
     }
-    storage_stream_close(stream);
   }
   autoseq_set_max_retry(g_autoseq_max_retry);
   // Prefer an external DS3231 when present, then ESP RTC/deep-sleep
@@ -4431,14 +4461,6 @@ static void load_station_data() {
 }
 
 void save_station_data() {
-  if (!storage_service_firmware_available()) {
-    static bool warned_once = false;
-    if (!warned_once) {
-      warned_once = true;
-      ESP_LOGW(TAG, "Firmware does not own storage; station data save skipped");
-    }
-    return;
-  }
   std::ostringstream out;
 #if ENABLE_FT4
   // Per-protocol band keys keep FT8 and FT4 frequencies independent so that
@@ -4489,9 +4511,17 @@ void save_station_data() {
     out << "protocol_mode=FT4\n";
   }
 #endif
-  if (!storage_file_write_atomic(STATION_FILE, out.str())) {
-    ESP_LOGE(TAG, "Failed to write %s", STATION_FILE);
-    return;
+  const std::string content = out.str();
+  // PRIMARY: SD card — reliable even when the internal FATFS won't mount, and
+  // the source of truth for load (see read_station_lines).
+  const bool sd_ok = storage_sd_write_file(STATION_FILE, content);
+  // SECONDARY (best-effort): internal flash, for the in-app file list / USB drive.
+  bool flash_ok = false;
+  if (storage_service_firmware_available()) {
+    flash_ok = storage_file_write_atomic(STATION_FILE, content);
+  }
+  if (!sd_ok && !flash_ok) {
+    ESP_LOGE(TAG, "Failed to persist %s to SD or flash", STATION_FILE);
   }
   // Every config mutation in the Cardputer UI funnels through here, so this
   // is the canonical place to notify core_api consumers.
