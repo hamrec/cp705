@@ -5675,7 +5675,11 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   if (ch < '0' || ch > '9') break;
                   if (menu_edit_buf.size() >= 10) break;
                 }
-                if (menu_edit_idx % 6 == 3 || menu_edit_idx % 6 == 4 || menu_edit_idx % 6 == 5) {
+                // Force uppercase only where it's correct: callsign (3), grid (4),
+                // and the CI-V hex address (22). Credentials (WiFi SSID/pass, net
+                // user/pass = indices 18-21) are case-sensitive and must NOT be
+                // uppercased. (The old `idx % 6` test wrongly caught Net Pass=21.)
+                if (menu_edit_idx == 3 || menu_edit_idx == 4 || menu_edit_idx == 22) {
                   ch = toupper((unsigned char)ch);
                 }
                 menu_edit_buf.push_back(ch);
