@@ -1,3 +1,68 @@
+# QC705 — A Self-Contained IC-705 WiFi FT8 Client
+
+QC705 is a fork of Wei (AG6AQ)'s **Mini-FT8**, and it stands entirely on the
+shoulders of that work — Karlis Goba's [ft8_lib](https://github.com/kgoba/ft8_lib),
+the audio/DSP and autoseq foundation from Zhenxing (N6HAN), and the inspiration
+of the DX-FT8 team. **All credit for the original application belongs to them.**
+
+Where Mini-FT8 drives QMX/QDX/KH1 radios over a serial/USB-audio path, **QC705
+has a completely different aim**: it turns the Cardputer ADV into a *standalone
+wireless FT8 station for the Icom IC-705* — CAT control, receive-audio decode,
+and transmit, all over WiFi, with **no PC, no soundcard, and no audio cables**.
+The IC-705's own WLAN server is the only link. In doing so it pushes the
+ESP32-S3 Cardputer ADV (which has **no PSRAM**) well past what the platform was
+expected to do.
+
+## Challenges overcome to make FT8 work with the IC-705 over WiFi
+
+- **Implementing the Icom WLAN remote protocol on a microcontroller** — the same
+  control / CI-V-serial / audio UDP streams used by RS-BA1, wfview, and
+  kappanhang: SID handshakes, login + authentication, tracked sequence numbers,
+  and pkt7 keepalives, all on a tiny embedded stack.
+- **The login token window** — a few hundred milliseconds of delay before the
+  login packet silently poisoned the radio's token and broke the handshake; the
+  connect sequence had to be made delay-free.
+- **No PSRAM (~512 KB SRAM total)** — fitting the entire FT8 decode pipeline
+  *plus* the WiFi stack *plus* live audio streaming into internal RAM, including
+  trimming decode oversampling and converting buffers to static allocation.
+- **Smooth receive audio over WiFi** — a dynamically-allocated audio queue was
+  silently failing to allocate and dropping every sample; moving to a static
+  queue, plus a watchdog-safe yield, restored continuous RX.
+- **Keeping the 15-second FT8 window aligned without a PC** — locking timing to
+  GPS UTC and re-anchoring the decode window after each synchronous decode so
+  decodes stopped drifting out of the slot.
+- **Clean, constant-envelope transmit over WiFi** — pacing TX with a hardware
+  timer matched to the radio's *measured* sample clock to eliminate buffer
+  drift, and gating the protocol's idle keepalive (kept flowing during RX for
+  smooth audio, suppressed during TX) to stop the carrier from pumping and
+  splattering.
+- **Transmit under memory pressure** — WiFi `send()` buffer exhaustion on the
+  no-PSRAM board was dropping TX audio; static TX buffers and disabling A-MPDU
+  TX aggregation got delivery clean.
+- **CI-V quirks** — fixing an unintended filter clobber and adding handshake
+  retries so CAT control comes up reliably.
+- **Durable logging with no serial console** — QSO records are fsync'd straight
+  to the SD card and the mount is pinned for the session, so a pulled card keeps
+  every contact; storage health is reported on the device's own screen.
+
+## New features and menu changes (vs. Mini-FT8)
+
+- **IC-705 over WiFi** as a first-class radio target — CAT, RX decode, and TX
+  all run over the radio's WLAN connection instead of a serial/USB-audio path.
+- **No external audio hardware** — the soundcard/USB-C-audio-adapter and audio
+  cabling that other radios require are gone; the WiFi audio stream replaces them.
+- **On-device SD-logging status** surfaced in the QSO (`Q`) view — mount state
+  and per-QSO write results, since the board has no serial console.
+- **On-device RX-health / TX diagnostics** for tuning link quality in the field.
+- **Streamlined to the IC-705 target** — the KH1-specific CAT/diagnostic keys
+  were removed to keep the build focused on the wireless IC-705 use case.
+
+> QC705 is an experimental, boundary-pushing build. Huge thanks again to the
+> Mini-FT8 authors — this project exists only because of the foundation they
+> shared with the community.
+
+---
+
 Subscribe to [https://freelists.org/list/qrp-portable](https://freelists.org/list/qrp-portable) for announcements, discussions, and updates about my Mini-series apps for the Cardputer ADV.
 
 Also see [PaperFT8](https://github.com/wcheng95/PaperFT8)
