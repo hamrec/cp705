@@ -581,8 +581,8 @@ bool g_skip_tx1 = false;                      // visible to core_api.cpp
 int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;  // visible to core_api.cpp
 static std::string g_free_text = "TNX 73";
 std::string g_call = "";   // visible to core_api.cpp; set via MENU P1 / Station.txt
-std::string g_grid = "EM66";    // visible to core_api.cpp; hardcoded for now
-static std::string g_grid_saved_manual = "EM66";
+std::string g_grid = "";    // visible to core_api.cpp; set via MENU P1 / Station.txt
+static std::string g_grid_saved_manual = "";
 static bool g_grid_from_gps = false;
 static bool g_time_synced_from_gps = false;
 static std::string g_grid_gps_display8;
