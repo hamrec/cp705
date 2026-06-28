@@ -4841,6 +4841,12 @@ static void app_task_core0(void* /*param*/) {
   board_power_init();
   g_radio = load_station_radio_type_only();
   ui_init(radio_type_uses_display_only(g_radio));
+  // Mount + pin the SD card now — AFTER display init (SPI-ordering safe) but
+  // BEFORE load_station_data() reads Station.txt from it, and before WiFi/audio
+  // exhaust DMA. Without this the config load did its own on-demand mount, which
+  // could fail (leaving config blank) while the later log-premount succeeded.
+  // mount_sd_locked() is idempotent, so the later log-premount call is a no-op.
+  g_sd_premount_code = (int)storage_sd_log_premount();
   hashtable_init();
 
   // Q15 NCO LUT for UAC OUT FT8 audio synthesis. One-time table fill,
@@ -4938,8 +4944,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // and the SD-over-SPI driver requires DMA, so mounting later reliably
   // fails with ESP_ERR_NO_MEM. All peripheral/display init is already done
   // at this point, so this doesn't risk the earlier SPI-ordering crash.
-  esp_err_t sd_premount_err = storage_sd_log_premount();
-  g_sd_premount_code = (int)sd_premount_err;
+  // SD was already mounted+pinned right after display init (see above); reuse the
+  // captured result. This call would be a no-op anyway.
+  esp_err_t sd_premount_err = (esp_err_t)g_sd_premount_code;
   {
     // Surface the SD mount result on-device (DEBUG view) — no serial available.
     char buf[64];
