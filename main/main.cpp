@@ -917,20 +917,19 @@ static const char* qso_storage_list_failure_text(StorageOwner owner) {
   return "List failed";
 }
 
-// SD-card logging status string for display. The SD card is the operator's
-// primary log target (the QSO file entries are internal flash); this shows the
-// boot mount result and the most recent QSO->SD write outcome.
+// Config-save diagnostics (set in save_station_data): how many SD config writes
+// were attempted and the result code of the last one (g_storage_sd_log_last_code
+// semantics: 0=ok, 1=no mutex, 2+esp_err=mount fail, -1-errno=fopen, -2=short).
+static volatile uint32_t g_cfg_save_seq  = 0;
+static volatile int      g_cfg_save_code = 999;
+
+// SD-card status string for display. Shows boot mount result, config-save count
+// and last save code — this is the on-device diagnostic for config persistence.
 static std::string sd_log_status_line() {
   char sd[40];
-  if (g_sd_premount_code != ESP_OK && g_sd_premount_code != 0x7fffffff) {
-    snprintf(sd, sizeof(sd), "SD mnt fail %d", g_sd_premount_code);
-  } else if (g_adif_sd_seq == 0) {
-    snprintf(sd, sizeof(sd), "SD ready (0)");
-  } else if (g_adif_sd_ok) {
-    snprintf(sd, sizeof(sd), "SD ok (%u)", (unsigned)g_adif_sd_seq);
-  } else {
-    snprintf(sd, sizeof(sd), "SD wr fail %d", g_adif_sd_code);
-  }
+  int mnt = (g_sd_premount_code == 0x7fffffff) ? 999 : g_sd_premount_code;
+  snprintf(sd, sizeof(sd), "mnt%d sv%u:%d q%u",
+           mnt, (unsigned)g_cfg_save_seq, g_cfg_save_code, (unsigned)g_adif_sd_seq);
   return sd;
 }
 
@@ -4524,6 +4523,8 @@ void save_station_data() {
   // PRIMARY: SD card — reliable even when the internal FATFS won't mount, and
   // the source of truth for load (see read_station_lines).
   const bool sd_ok = storage_sd_write_file(STATION_FILE, content);
+  g_cfg_save_seq++;
+  g_cfg_save_code = g_storage_sd_log_last_code;  // raw result of the SD write
   // SECONDARY (best-effort): internal flash, for the in-app file list / USB drive.
   bool flash_ok = false;
   if (storage_service_firmware_available()) {
