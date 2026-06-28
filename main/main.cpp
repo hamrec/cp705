@@ -3506,15 +3506,16 @@ static void draw_menu_view() {
     lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
   }
 
-  // Page 3 content (index 18+) — IC-705 WiFi settings
-  // Items 18-21 correspond to menu_edit_idx values 18-21.
+  // Page 3 content (absolute indices 18-23) — IC-705 WiFi/network settings.
+  // Keys 1-6 on this page map to: 1 SSID, 2 WiFi Pass, 3 Net User, 4 Net Pass,
+  // 5 CI-V Addr, 6 Re-resolve. The edit index equals the row's absolute index.
   {
     std::string ssid_disp = g_ic705_wifi_ssid.empty() ? "(not set)" : g_ic705_wifi_ssid;
     if (menu_edit_idx == 18) ssid_disp = menu_edit_buf;
     lines.push_back(std::string("WiFi SSID:") + head_trim(ssid_disp, 10));
   }
   {
-    // Show password as asterisks when not editing for basic privacy
+    // Mask secrets as asterisks unless actively editing.
     std::string pass_disp;
     if (menu_edit_idx == 19) {
       pass_disp = menu_edit_buf;
@@ -3524,16 +3525,29 @@ static void draw_menu_view() {
     lines.push_back(std::string("WiFi Pass:") + head_trim(pass_disp, 10));
   }
   {
-    char civ_str[8];
+    std::string user_disp = g_ic705_net_user.empty() ? "(not set)" : g_ic705_net_user;
+    if (menu_edit_idx == 20) user_disp = menu_edit_buf;
+    lines.push_back(std::string("Net User:") + head_trim(user_disp, 10));
+  }
+  {
+    std::string npass_disp;
     if (menu_edit_idx == 21) {
+      npass_disp = menu_edit_buf;
+    } else {
+      npass_disp = g_ic705_net_pass.empty() ? "(not set)" : std::string(g_ic705_net_pass.size(), '*');
+    }
+    lines.push_back(std::string("Net Pass:") + head_trim(npass_disp, 10));
+  }
+  {
+    char civ_str[8];
+    if (menu_edit_idx == 22) {
       snprintf(civ_str, sizeof(civ_str), "%s", menu_edit_buf.c_str());
     } else {
       snprintf(civ_str, sizeof(civ_str), "0x%02X", (unsigned)g_ic705_civ_addr);
     }
     lines.push_back(std::string("CI-V Addr:") + civ_str);
   }
-  lines.push_back(wifi_mgr_status_string());   // live WiFi status
-  lines.push_back("WiFi: Connect S->2");       // reminder
+  lines.push_back(std::string("Reslv/Conn:") + wifi_mgr_status_string());  // key 6 = re-resolve; shows live status
 
   int highlight_abs = -1;
   if (menu_edit_idx >= 0) {
@@ -4352,6 +4366,20 @@ static void load_station_data() {
       if (!h.empty()) g_ic705_hostname = h;
     } else if (sscanf(line, "ic705_civ_addr=%d", &val) == 1) {
       if (val >= 0x00 && val <= 0xFF) g_ic705_civ_addr = val;
+    } else if (strncmp(line, "call=", 5) == 0) {
+      g_call = trim_upper_copy(line + 5);
+    } else if (strncmp(line, "grid=", 5) == 0) {
+      std::string g = trim_upper_copy(line + 5);
+      if (!g.empty()) { g_grid = g; g_grid_saved_manual = g; }
+    } else if (strncmp(line, "ic705_wifi_ssid=", 16) == 0) {
+      // Credentials are case-sensitive: trim only surrounding whitespace/newline.
+      g_ic705_wifi_ssid = trim_copy(line + 16);
+    } else if (strncmp(line, "ic705_wifi_pass=", 16) == 0) {
+      g_ic705_wifi_pass = trim_copy(line + 16);
+    } else if (strncmp(line, "ic705_net_user=", 15) == 0) {
+      g_ic705_net_user = trim_copy(line + 15);
+    } else if (strncmp(line, "ic705_net_pass=", 15) == 0) {
+      g_ic705_net_pass = trim_copy(line + 15);
     } else if (sscanf(line, "gps_baud=%d", &val) == 1) {
       g_gps_baud = normalize_gps_baud_value(val);
     } else if (strncmp(line, "cq_ft=", 6) == 0) {
@@ -4441,6 +4469,8 @@ void save_station_data() {
   out << "radio=" << (int)canonical_radio_type(g_radio) << "\n";
   out << "ic705_wifi_ssid=" << g_ic705_wifi_ssid << "\n";
   out << "ic705_wifi_pass=" << g_ic705_wifi_pass << "\n";
+  out << "ic705_net_user=" << g_ic705_net_user << "\n";
+  out << "ic705_net_pass=" << g_ic705_net_pass << "\n";
   out << "ic705_host=" << g_ic705_hostname << "\n";
   out << "ic705_civ_addr=" << g_ic705_civ_addr << "\n";
   out << "gps_baud=" << normalize_gps_baud_value(g_gps_baud) << "\n";
@@ -5578,7 +5608,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   g_ic705_wifi_ssid = menu_edit_buf;
                 } else if (menu_edit_idx == 19) {
                   g_ic705_wifi_pass = menu_edit_buf;
+                } else if (menu_edit_idx == 20) {
+                  g_ic705_net_user = menu_edit_buf;
+                  ic705_net_set_credentials(g_ic705_net_user.c_str(), g_ic705_net_pass.c_str());
                 } else if (menu_edit_idx == 21) {
+                  g_ic705_net_pass = menu_edit_buf;
+                  ic705_net_set_credentials(g_ic705_net_user.c_str(), g_ic705_net_pass.c_str());
+                } else if (menu_edit_idx == 22) {
                   // Accept decimal or "0xNN" hex
                   char* end = nullptr;
                   long v = std::strtol(menu_edit_buf.c_str(), &end, 0);
@@ -5832,7 +5868,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 draw_menu_view();
               }
             } else if (menu_page == 3) {
-              // Page 3: IC-705 WiFi settings (items 18-23)
+              // Page 3: IC-705 WiFi/network settings (absolute indices 18-23)
               if (c == '1') {
                 // Edit WiFi SSID
                 menu_edit_idx = 18;
@@ -5844,13 +5880,23 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 menu_edit_buf = g_ic705_wifi_pass;
                 draw_menu_view();
               } else if (c == '3') {
-                // Edit CI-V address
+                // Edit network-login user
+                menu_edit_idx = 20;
+                menu_edit_buf = g_ic705_net_user;
+                draw_menu_view();
+              } else if (c == '4') {
+                // Edit network-login password
                 menu_edit_idx = 21;
+                menu_edit_buf = g_ic705_net_pass;
+                draw_menu_view();
+              } else if (c == '5') {
+                // Edit CI-V address
+                menu_edit_idx = 22;
                 char civ_str[8];
                 snprintf(civ_str, sizeof(civ_str), "0x%02X", (unsigned)g_ic705_civ_addr);
                 menu_edit_buf = civ_str;
                 draw_menu_view();
-              } else if (c == '4') {
+              } else if (c == '6') {
                 // Re-resolve IC-705 target IP
                 wifi_mgr_resolve_now();
                 draw_menu_view();

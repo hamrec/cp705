@@ -120,26 +120,28 @@ transmit audio over three UDP ports.
 
 ## Step 2 — Configure QC705
 
-WiFi and CI-V settings live on a **fourth MENU page**: press **`O`** (MENU P3),
-then **`▼`** to page down to the IC-705 WiFi page.
+All connection settings live on a **fourth MENU page**: press **`O`** (MENU P3),
+then **`▼`** to page down to the IC-705 WiFi/network page.
 
 | Key | Setting | Notes |
 |---|---|---|
 | `1` | WiFi SSID | Must match the radio's Access-Point SSID from Step 1. |
 | `2` | WiFi Password | The radio's Access-Point password. |
-| `3` | CI-V Address | The IC-705 default is `0xA4`. |
-| `4` | Re-resolve IC-705 | Re-points QC705 at `192.168.59.1` (use after a reconnect). |
+| `3` | Net User | Must match the radio's `Network User1` **ID**. |
+| `4` | Net Password | Must match the radio's `Network User1` **password**. |
+| `5` | CI-V Address | The IC-705 default is `0xA4`. |
+| `6` | Re-resolve / Connect status | Re-points QC705 at `192.168.59.1`; the row shows live WiFi status. |
 
-The page also shows the live WiFi status and a `WiFi: Connect S->2` reminder.
+Each field is an in-place edit: type the value and press **Enter** to save
+(`` ` `` cancels). Passwords are masked with `*` when not being edited.
 
-> **Network login (user/password):** the radio **Network User1 ID/Password** you
-> set in Step 1 must match the values QC705 logs in with. These currently come
-> from the build's compile-time defaults (or `Station.txt`) and are **not yet
-> editable on-device** — set them to your own before building, or edit
-> `Station.txt`. **Do not ship real credentials in source.**
+> **Network login must match the radio:** `Net User` / `Net Password` here have to
+> equal the **Network User1 ID/Password** you set on the radio in Step 1, and that
+> user must be an **Administrator**.
 
-Settings are saved to `Station.txt` on the internal flash, so they persist across
-reboots. You can also pre-load `Station.txt` from the SD card.
+All settings are written to `Station.txt` on the internal flash the moment you
+save them, so they persist across reboots — enter your callsign, grid, WiFi, and
+network login once. You can also pre-load `Station.txt` from the SD card.
 
 ## Step 3 — Connect and operate
 
