@@ -4292,21 +4292,30 @@ static bool read_station_lines(std::vector<std::string>& lines) {
 }
 
 static RadioType load_station_radio_type_only() {
-  std::vector<std::string> lines;
+  // Runs before the display is initialised, so it must NOT touch the SD card:
+  // SD shares the display's SPI bus and mounting it pre-display risks an SPI
+  // init-ordering crash. Flash-only here (cheap); the full config, including the
+  // radio, is loaded from the SD card later in load_station_data() once the
+  // display is up. (QC705 is IC-705 only, so this default rarely matters.)
+  StorageStream* stream = storage_stream_open(STATION_FILE, StorageOpenMode::READ);
+  if (!stream) return canonical_radio_type(g_radio);
+  char line[128];
   RadioType radio = canonical_radio_type(g_radio);
-  if (read_station_lines(lines)) {
-    for (const std::string& s : lines) {
-      if (strncmp(s.c_str(), "radio=", 6) == 0) {
-        radio = parse_radio_config_value(s.c_str() + 6);
-        break;
-      }
+  while (storage_stream_read_line(stream, line, sizeof(line))) {
+    if (strncmp(line, "radio=", 6) == 0) {
+      radio = parse_radio_config_value(line + 6);
+      break;
     }
   }
+  storage_stream_close(stream);
   return canonical_radio_type(radio);
 }
 
 static void load_station_data() {
-  storage_sync_station_from_sd();
+  // NOTE: do NOT call storage_sync_station_from_sd() here. It mounts the SD then
+  // unmounts it (frees the SPI bus) before the SD log-mount is pinned, and the
+  // immediate remount in read_station_lines() could fail and strand the load on
+  // the (unavailable) flash. Config is read straight from the SD card below.
 
   // Load-time defaults for runtime settings.
   g_rtc_comp = kRtcCompFixed;
