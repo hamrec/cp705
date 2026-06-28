@@ -45,6 +45,7 @@ extern "C" {
 #include "esp_system.h"
 #include "esp_random.h"
 #include "nvs_flash.h"
+#include "nvs.h"   // config persistence (Station.txt blob in NVS)
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
@@ -924,6 +925,9 @@ static const char* qso_storage_list_failure_text(StorageOwner owner) {
 static volatile uint32_t g_cfg_save_seq  = 0;
 static volatile int      g_cfg_save_code = 999;
 
+static bool nvs_save_station(const std::string& content);  // defined below
+static bool nvs_load_station(std::string& out);            // defined below
+
 // SD self-test results (filled once at boot by run_sd_selftest), shown in the
 // QSO view so the card can be verified without serial access.
 static std::vector<std::string> g_sdtest_lines;
@@ -974,6 +978,28 @@ static void run_sd_selftest() {
   snprintf(b, sizeof(b), "rd ok=%d n=%u m=%d",
            (int)rok, (unsigned)rd.size(), (int)(rd == msg));
   g_sdtest_lines.push_back(b);
+
+  // Exercise the REAL config path (nvs_save_station/nvs_load_station), then
+  // restore whatever was there so this test never corrupts the user's config.
+  std::string prev;
+  bool had = nvs_load_station(prev);
+  bool sv = nvs_save_station("call=NVSPERSIST\ngrid=AB12\n");
+  std::string back;
+  bool ld = nvs_load_station(back);
+  bool match = back.find("NVSPERSIST") != std::string::npos;
+  if (had) {
+    nvs_save_station(prev);                 // restore real config
+  } else {
+    nvs_handle_t h;                          // first boot: remove the test blob
+    if (nvs_open("qc705", NVS_READWRITE, &h) == ESP_OK) {
+      nvs_erase_key(h, "station");
+      nvs_commit(h);
+      nvs_close(h);
+    }
+  }
+  snprintf(b, sizeof(b), "nvscfg sv=%d ld=%d m=%d", (int)sv, (int)ld, (int)match);
+  g_sdtest_lines.push_back(b);
+  ESP_LOGW(TAG, "SDTEST/NVS: %s", g_sdtest_lines.back().c_str());
 }
 
 // SD-card status string for display. Shows boot mount result, config-save count
@@ -4312,23 +4338,61 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
   }
 }
 
-// Reads Station.txt as a list of lines, preferring the SD card (reliable on this
-// board) and falling back to the internal flash FATFS. Trailing CR/LF is
-// stripped and blank lines dropped. Returns false if neither source has it.
+// --- Config persistence in NVS ---------------------------------------------
+// The internal FATFS partition doesn't exist on this board and the SD card's
+// writes fail at the driver level, so the whole Station.txt content is stored as
+// one blob in NVS (the standard ESP key/value store, always available). SD/flash
+// are kept only as best-effort secondaries.
+static const char* kNvsNamespace = "qc705";
+static const char* kNvsStationKey = "station";
+
+static bool nvs_save_station(const std::string& content) {
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return false;
+  esp_err_t e = nvs_set_blob(h, kNvsStationKey, content.data(), content.size());
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  return e == ESP_OK;
+}
+
+static bool nvs_load_station(std::string& out) {
+  out.clear();
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t len = 0;
+  esp_err_t e = nvs_get_blob(h, kNvsStationKey, nullptr, &len);
+  if (e != ESP_OK || len == 0) { nvs_close(h); return false; }
+  out.resize(len);
+  e = nvs_get_blob(h, kNvsStationKey, &out[0], &len);
+  nvs_close(h);
+  return e == ESP_OK;
+}
+
+static void split_into_lines(const std::string& content, std::vector<std::string>& lines) {
+  size_t start = 0;
+  while (start <= content.size()) {
+    size_t nl = content.find('\n', start);
+    std::string s = (nl == std::string::npos) ? content.substr(start)
+                                               : content.substr(start, nl - start);
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    if (!s.empty()) lines.push_back(s);
+    if (nl == std::string::npos) break;
+    start = nl + 1;
+  }
+}
+
+// Reads Station.txt as a list of lines, preferring NVS (reliable), then the SD
+// card, then the internal flash FATFS. Trailing CR/LF stripped, blank lines
+// dropped. Returns false if no source has it.
 static bool read_station_lines(std::vector<std::string>& lines) {
   lines.clear();
   std::string content;
+  if (nvs_load_station(content) && !content.empty()) {
+    split_into_lines(content, lines);
+    if (!lines.empty()) return true;
+  }
   if (storage_sd_read_file(STATION_FILE, content) && !content.empty()) {
-    size_t start = 0;
-    while (start <= content.size()) {
-      size_t nl = content.find('\n', start);
-      std::string s = (nl == std::string::npos) ? content.substr(start)
-                                                 : content.substr(start, nl - start);
-      while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
-      if (!s.empty()) lines.push_back(s);
-      if (nl == std::string::npos) break;
-      start = nl + 1;
-    }
+    split_into_lines(content, lines);
     return !lines.empty();
   }
   // Fallback: internal flash.
@@ -4574,18 +4638,19 @@ void save_station_data() {
   }
 #endif
   const std::string content = out.str();
-  // PRIMARY: SD card — reliable even when the internal FATFS won't mount, and
-  // the source of truth for load (see read_station_lines).
-  const bool sd_ok = storage_sd_write_file(STATION_FILE, content);
+  // PRIMARY: NVS (always available; SD writes fail and the FATFS partition is
+  // absent on this board). This is also the source of truth for load().
+  const bool nvs_ok = nvs_save_station(content);
   g_cfg_save_seq++;
-  g_cfg_save_code = g_storage_sd_log_last_code;  // raw result of the SD write
-  // SECONDARY (best-effort): internal flash, for the in-app file list / USB drive.
+  g_cfg_save_code = nvs_ok ? 0 : -100;  // -100 = NVS write failed
+  // SECONDARY (best-effort): SD card, then internal flash, when they work.
+  const bool sd_ok = storage_sd_write_file(STATION_FILE, content);
   bool flash_ok = false;
   if (storage_service_firmware_available()) {
     flash_ok = storage_file_write_atomic(STATION_FILE, content);
   }
-  if (!sd_ok && !flash_ok) {
-    ESP_LOGE(TAG, "Failed to persist %s to SD or flash", STATION_FILE);
+  if (!nvs_ok && !sd_ok && !flash_ok) {
+    ESP_LOGE(TAG, "Failed to persist %s to NVS/SD/flash", STATION_FILE);
   }
   // Every config mutation in the Cardputer UI funnels through here, so this
   // is the canonical place to notify core_api consumers.
@@ -4932,6 +4997,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
+  ESP_LOGW(TAG, "CONFIG loaded: call=[%s] grid=[%s]", g_call.c_str(), g_grid.c_str());
   apply_debug_uart_pin_policy();
   apply_radio_profile_binding();
   update_autoseq_cq_type();
