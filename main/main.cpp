@@ -705,6 +705,11 @@ static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
 static volatile uint32_t g_adif_sd_seq  = 0;
 static volatile bool     g_adif_sd_ok   = false;
 static volatile int      g_adif_sd_code = 0;
+// SD mount result from boot (storage_sd_log_premount). 0x7fffffff = not run yet.
+static volatile int      g_sd_premount_code = 0x7fffffff;
+// Internal-flash FATFS init result from boot (storage_service_init), captured so
+// the failure reason is visible on-device (no serial console). 0x7fffffff = n/a.
+static volatile int      g_storage_init_code = 0x7fffffff;
 static bool storage_append_text_locked_path(const std::string& path,
                                             const std::string& line,
                                             const std::string& header_if_new,
@@ -911,6 +916,23 @@ static const char* qso_storage_list_failure_text(StorageOwner owner) {
   return "List failed";
 }
 
+// SD-card logging status string for display. The SD card is the operator's
+// primary log target (the QSO file entries are internal flash); this shows the
+// boot mount result and the most recent QSO->SD write outcome.
+static std::string sd_log_status_line() {
+  char sd[40];
+  if (g_sd_premount_code != ESP_OK && g_sd_premount_code != 0x7fffffff) {
+    snprintf(sd, sizeof(sd), "SD: MOUNT FAIL %d", g_sd_premount_code);
+  } else if (g_adif_sd_seq == 0) {
+    snprintf(sd, sizeof(sd), "SD: ready, no QSO yet");
+  } else if (g_adif_sd_ok) {
+    snprintf(sd, sizeof(sd), "SD: %u QSO(s) written", (unsigned)g_adif_sd_seq);
+  } else {
+    snprintf(sd, sizeof(sd), "SD: WRITE FAIL code=%d", g_adif_sd_code);
+  }
+  return sd;
+}
+
 static void qso_load_file_list() {
   g_q_files.clear();
   g_q_entries.clear();
@@ -922,7 +944,14 @@ static void qso_load_file_list() {
     const char* reason = qso_storage_list_failure_text(owner);
     ESP_LOGW(TAG, "QSO file list failed: owner=%s reason=%s",
              storage_owner_label(owner), reason);
-    g_q_lines.push_back(reason);
+    // Append the flash-init error name so the cause is visible without serial.
+    std::string line = reason;
+    if (owner == StorageOwner::UNAVAILABLE && g_storage_init_code != 0x7fffffff &&
+        g_storage_init_code != ESP_OK) {
+      line += std::string(" (") + esp_err_to_name((esp_err_t)g_storage_init_code) + ")";
+    }
+    g_q_lines.push_back(line);
+    g_q_lines.push_back(sd_log_status_line());
     return;
   }
   for (const auto& name : files) {
@@ -938,11 +967,16 @@ static void qso_load_file_list() {
            static_cast<unsigned>(g_q_files.size()));
   if (g_q_files.empty()) {
     g_q_lines.push_back("No YYYYMMDD.txt");
+    g_q_lines.push_back(sd_log_status_line());
     return;
   }
+  // File rows first so g_q_lines[i] stays aligned with g_q_files[i] for numbered
+  // selection; the SD status goes last (its row index >= g_q_files.size(), so the
+  // selection handler safely ignores a press on it).
   for (size_t i = 0; i < g_q_files.size(); ++i) {
     g_q_lines.push_back(g_q_files[i]);
   }
+  g_q_lines.push_back(sd_log_status_line());
 }
 
 static void load_storage_regular_files(std::vector<std::string>& files) {
@@ -4724,10 +4758,11 @@ static void begin_usb_host_mode() {
 
 static void app_task_core0(void* /*param*/) {
   esp_err_t storage_err = storage_service_init();
+  g_storage_init_code = (int)storage_err;
   if (storage_err != ESP_OK) {
     ESP_LOGE(TAG, "Storage service init failed: %s; continuing without log/config storage",
              esp_err_to_name(storage_err));
-    debug_log_line("Storage init fail");
+    debug_log_line(std::string("Storage init fail: ") + esp_err_to_name(storage_err));
   }
 
   if (storage_service_firmware_available()) {
@@ -4834,6 +4869,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // fails with ESP_ERR_NO_MEM. All peripheral/display init is already done
   // at this point, so this doesn't risk the earlier SPI-ordering crash.
   esp_err_t sd_premount_err = storage_sd_log_premount();
+  g_sd_premount_code = (int)sd_premount_err;
   {
     // Surface the SD mount result on-device (DEBUG view) — no serial available.
     char buf[64];
