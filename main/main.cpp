@@ -580,7 +580,7 @@ std::string g_cq_freetext = "FreeText";       // visible to core_api.cpp
 bool g_skip_tx1 = false;                      // visible to core_api.cpp
 int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;  // visible to core_api.cpp
 static std::string g_free_text = "TNX 73";
-std::string g_call = "KD3AN";   // visible to core_api.cpp; hardcoded for now
+std::string g_call = "";   // visible to core_api.cpp; set via MENU P1 / Station.txt
 std::string g_grid = "EM66";    // visible to core_api.cpp; hardcoded for now
 static std::string g_grid_saved_manual = "EM66";
 static bool g_grid_from_gps = false;
@@ -598,14 +598,15 @@ RadioType g_radio = RadioType::IC705;         // visible to core_api.cpp
 
 // IC-705 WiFi settings (loaded from Station.txt)
 static std::string g_ic705_wifi_ssid = "IC-705";
-static std::string g_ic705_wifi_pass = "cuddlebug";
+static std::string g_ic705_wifi_pass = "";     // set via MENU (IC-705 WiFi page) / Station.txt
 static std::string g_ic705_hostname = "ic-705.local";
 static int         g_ic705_civ_addr = 0xA4;   // default IC-705 CI-V address
 
 // IC-705 network-control login (Settings > WLAN Set > Network Control on the
-// radio). Hardcoded for now, same as the WiFi SSID/password above.
-static std::string g_ic705_net_user = "kd3an";
-static std::string g_ic705_net_pass = "GLutj3b9H";
+// radio). Empty by default — supply your own via Station.txt; never commit real
+// credentials to source.
+static std::string g_ic705_net_user = "";
+static std::string g_ic705_net_pass = "";
 
 static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
