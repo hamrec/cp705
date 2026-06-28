@@ -63,34 +63,6 @@ expected to do.
 
 ---
 
-Subscribe to [https://freelists.org/list/qrp-portable](https://freelists.org/list/qrp-portable) for announcements, discussions, and updates about my Mini-series apps for the Cardputer ADV.
-
-Also see [PaperFT8](https://github.com/wcheng95/PaperFT8)
-
-# First POTA activation (v1.0 2025-12-31)
-![First POTA Activation](IMG_6087.jpeg)
-
-## Mini-FT8 Release Notice
-Mini-FT8 is built on Karlis Goba’s ft8_lib. It’s also a joint adventure between Zhenxing (N6HAN) and Wei (AG6AQ), with inspiration from DXFT8 by Barb (WB2CBA) and Charley (W5BAA). It has been a great learning platform for me, and I hope you find it just as fun to use. It supports FT8 and FT4 with QMX, QDX, and KH1.
-
-### Thanks
-
-- The [DX FT8](https://github.com/WB2CBA/DX-FT8-FT8-MULTIBAND-TABLET-TRANSCEIVER) team — Barb (WB2CBA), Charley (W5BAA), and Paul (G8KIG) — for the inspiration.
-- Zhenxing (N6HAN) — for helping build the audio/DSP path (UAC) and autoseq. This project would not have been possible without his help.
-- Karlis Goba — for [ft8_lib](https://github.com/kgoba/ft8_lib). Thanks also to Shawn Rutledge for non-standard callsign support.
-- OpenAI and Anthropic — for their incredible coding assistance.
-  
-### Hardware
-(I have no affiliation with the vendors.)
-  - Must order: https://shop.m5stack.com/products/m5stack-cardputer-adv-version-esp32-s3 or from digikey: https://www.digikey.com/en/products/detail/m5stack-technology-co-ltd/K132-ADV/27685158
-  - Optional: [https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668](https://shop.m5stack.com/products/gps-bds-unit-v1-1-at6668) (PORTA GPS for Date/Time/Grid; other UART NMEA GPS modules work too)
-  - Optional: M5Stack LoRa-1262 cap GNSS (set `GNSS_LoRa:ON`; only the GNSS is used)
-  - Optional: DS3231 RTC module on I2C `G8/G9` (for retained UTC date/time without GPS)
-  - For KH1 TX: https://shop.m5stack.com/products/4pin-buckled-grove-cable, for a custom serial cable
-  - For KH1-USBC RX: [USB-C microphone adapter](https://www.amazon.com/dp/B0FWC9ZFC4?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1). Other adapters may also work, but this one is confirmed. KH1-MIC uses the Cardputer built-in microphone, so the USB-C adapter is optional.
-
-73, Wei AG6AQ
-
 # Mini-FT8 Operation Manual
 
 ## Quick Mode Map
