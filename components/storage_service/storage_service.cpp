@@ -222,7 +222,10 @@ esp_err_t mount_sd_locked() {
     mount_config.allocation_unit_size = 16 * 1024;
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.max_freq_khz = 5000;
+    // Writes were failing with EIO (FR_DISK_ERR) while reads worked at 5 MHz.
+    // Drop to a conservative clock so directory/data writes are reliable; tiny
+    // config/log writes don't need speed. Raise later if proven solid.
+    host.max_freq_khz = 400;
     for (int attempt = 0; attempt < 4; ++attempt) {
         err = esp_vfs_fat_sdspi_mount(kSdBasePath, &host, &slot_config, &mount_config, &s_sd_card);
         if (err == ESP_OK) break;
