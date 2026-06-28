@@ -923,13 +923,13 @@ static const char* qso_storage_list_failure_text(StorageOwner owner) {
 static std::string sd_log_status_line() {
   char sd[40];
   if (g_sd_premount_code != ESP_OK && g_sd_premount_code != 0x7fffffff) {
-    snprintf(sd, sizeof(sd), "SD: MOUNT FAIL %d", g_sd_premount_code);
+    snprintf(sd, sizeof(sd), "SD mnt fail %d", g_sd_premount_code);
   } else if (g_adif_sd_seq == 0) {
-    snprintf(sd, sizeof(sd), "SD: ready, no QSO yet");
+    snprintf(sd, sizeof(sd), "SD ready (0)");
   } else if (g_adif_sd_ok) {
-    snprintf(sd, sizeof(sd), "SD: %u QSO(s) written", (unsigned)g_adif_sd_seq);
+    snprintf(sd, sizeof(sd), "SD ok (%u)", (unsigned)g_adif_sd_seq);
   } else {
-    snprintf(sd, sizeof(sd), "SD: WRITE FAIL code=%d", g_adif_sd_code);
+    snprintf(sd, sizeof(sd), "SD wr fail %d", g_adif_sd_code);
   }
   return sd;
 }

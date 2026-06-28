@@ -431,6 +431,9 @@ void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight
     DispGuard guard;
     M5.Display.startWrite();
     M5.Display.setTextSize(2);
+    // Clip long rows at the screen edge; without this M5GFX wraps the overflow
+    // onto the next row and the text visibly stacks.
+    M5.Display.setTextWrap(false);
     for (int i = 0; i < RX_LINES; ++i) {
         int idx = page * RX_LINES + i;
         int y = start_y + i * line_h;
@@ -445,6 +448,7 @@ void ui_draw_list(const std::vector<std::string>& lines, int page, int highlight
             g_visible_rows[i].clear();
         }
     }
+    M5.Display.setTextWrap(true);
     M5.Display.endWrite();
 }
 
@@ -454,6 +458,7 @@ void ui_draw_debug(const std::vector<std::string>& lines, int page) {
     DispGuard guard;
     M5.Display.startWrite();
     M5.Display.setTextSize(2);
+    M5.Display.setTextWrap(false);  // clip long rows; don't wrap/stack onto next line
     for (int i = 0; i < RX_LINES; ++i) {
         int idx = page * RX_LINES + i;
         int y = start_y + i * line_h;
@@ -467,6 +472,7 @@ void ui_draw_debug(const std::vector<std::string>& lines, int page) {
             g_visible_rows[i].clear();
         }
     }
+    M5.Display.setTextWrap(true);
     M5.Display.endWrite();
 }
 
