@@ -325,6 +325,17 @@ bool storage_sd_append_with_header(const std::string& name,
     return ok;
 }
 
+bool storage_sd_space(uint64_t* total_bytes, uint64_t* free_bytes) {
+    StorageGuard guard;
+    if (!guard.held()) return false;
+    if (mount_sd_locked() != ESP_OK) return false;
+    uint64_t total = 0, freeb = 0;
+    if (esp_vfs_fat_info(kSdBasePath, &total, &freeb) != ESP_OK) return false;
+    if (total_bytes) *total_bytes = total;
+    if (free_bytes) *free_bytes = freeb;
+    return true;
+}
+
 bool storage_sd_read_file(const std::string& name, std::string& out) {
     out.clear();
     StorageGuard guard;

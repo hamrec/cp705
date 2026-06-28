@@ -62,6 +62,7 @@ extern "C" {
 #include "external_rtc.h"
 
 #include "storage_service.h"
+#include <dirent.h>        // opendir/readdir (SD self-test)
 
 static const char* STATION_FILE = "Station.txt";
 
@@ -923,6 +924,44 @@ static const char* qso_storage_list_failure_text(StorageOwner owner) {
 static volatile uint32_t g_cfg_save_seq  = 0;
 static volatile int      g_cfg_save_code = 999;
 
+// SD self-test results (filled once at boot by run_sd_selftest), shown in the
+// QSO view so the card can be verified without serial access.
+static std::vector<std::string> g_sdtest_lines;
+
+// Exercise the SD card directly: free/total space, directory read, a real
+// write + read-back. Stores short result lines for on-screen display.
+static void run_sd_selftest() {
+  g_sdtest_lines.clear();
+  char b[64];
+
+  uint64_t total = 0, freeb = 0;
+  bool sok = storage_sd_space(&total, &freeb);
+  snprintf(b, sizeof(b), "space ok=%d t%lluM f%lluM", (int)sok,
+           (unsigned long long)(total >> 20), (unsigned long long)(freeb >> 20));
+  g_sdtest_lines.push_back(b);
+
+  int n = 0;
+  if (DIR* d = opendir("/sdcard")) {
+    while (readdir(d)) n++;
+    closedir(d);
+    snprintf(b, sizeof(b), "dir read OK n=%d", n);
+  } else {
+    snprintf(b, sizeof(b), "dir read FAIL e=%d", errno);
+  }
+  g_sdtest_lines.push_back(b);
+
+  const std::string msg = "QC705 SD selftest 0123456789\n";
+  bool wok = storage_sd_write_file("QC705TEST.txt", msg);
+  snprintf(b, sizeof(b), "write ok=%d code=%d", (int)wok, g_storage_sd_log_last_code);
+  g_sdtest_lines.push_back(b);
+
+  std::string rd;
+  bool rok = storage_sd_read_file("QC705TEST.txt", rd);
+  snprintf(b, sizeof(b), "read ok=%d n=%u match=%d",
+           (int)rok, (unsigned)rd.size(), (int)(rd == msg));
+  g_sdtest_lines.push_back(b);
+}
+
 // SD-card status string for display. Shows boot mount result, config-save count
 // and last save code — this is the on-device diagnostic for config persistence.
 static std::string sd_log_status_line() {
@@ -952,6 +991,7 @@ static void qso_load_file_list() {
     }
     g_q_lines.push_back(line);
     g_q_lines.push_back(sd_log_status_line());
+    for (const std::string& s : g_sdtest_lines) g_q_lines.push_back(s);
     return;
   }
   for (const auto& name : files) {
@@ -4848,6 +4888,7 @@ static void app_task_core0(void* /*param*/) {
   // could fail (leaving config blank) while the later log-premount succeeded.
   // mount_sd_locked() is idempotent, so the later log-premount call is a no-op.
   g_sd_premount_code = (int)storage_sd_log_premount();
+  run_sd_selftest();   // exercise the card; results shown in the QSO view
   hashtable_init();
 
   // Q15 NCO LUT for UAC OUT FT8 audio synthesis. One-time table fill,

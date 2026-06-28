@@ -84,6 +84,10 @@ bool storage_sd_read_file(const std::string& name, std::string& out);
 // fsyncs it to the card. Independent of the internal-flash FATFS owner state.
 bool storage_sd_write_file(const std::string& name, const std::string& content);
 
+// Reports total/free bytes on the SD card (mounts on demand). Returns false if
+// the card isn't available. Either pointer may be null.
+bool storage_sd_space(uint64_t* total_bytes, uint64_t* free_bytes);
+
 // Mounts the SD card now, while heap is most plentiful (call early at boot).
 // storage_sd_log_append()'s later calls become a fast already-mounted no-op
 // instead of paying the mount's allocation cost once WiFi/audio/decode are
