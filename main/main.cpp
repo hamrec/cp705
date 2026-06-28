@@ -951,13 +951,27 @@ static void run_sd_selftest() {
   g_sdtest_lines.push_back(b);
 
   const std::string msg = "QC705 SD selftest 0123456789\n";
-  bool wok = storage_sd_write_file("QC705TEST.txt", msg);
-  snprintf(b, sizeof(b), "write ok=%d code=%d", (int)wok, g_storage_sd_log_last_code);
-  g_sdtest_lines.push_back(b);
+  errno = 0;
+  FILE* f = fopen("/sdcard/QC705TEST.txt", "wb");
+  if (!f) {
+    snprintf(b, sizeof(b), "wopen FAIL e=%d", errno);
+    g_sdtest_lines.push_back(b);
+  } else {
+    errno = 0;
+    size_t w = fwrite(msg.data(), 1, msg.size(), f);
+    int we = errno;
+    errno = 0;
+    int fs = fsync(fileno(f));
+    int fse = errno;
+    fclose(f);
+    snprintf(b, sizeof(b), "w%u/%u we%d fs%d fse%d",
+             (unsigned)w, (unsigned)msg.size(), we, fs, fse);
+    g_sdtest_lines.push_back(b);
+  }
 
   std::string rd;
   bool rok = storage_sd_read_file("QC705TEST.txt", rd);
-  snprintf(b, sizeof(b), "read ok=%d n=%u match=%d",
+  snprintf(b, sizeof(b), "rd ok=%d n=%u m=%d",
            (int)rok, (unsigned)rd.size(), (int)(rd == msg));
   g_sdtest_lines.push_back(b);
 }

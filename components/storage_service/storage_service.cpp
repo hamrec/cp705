@@ -194,7 +194,7 @@ esp_err_t mount_sd_locked() {
     bus_config.sclk_io_num = kSdClock;
     bus_config.quadwp_io_num = -1;
     bus_config.quadhd_io_num = -1;
-    bus_config.max_transfer_sz = 1024;
+    bus_config.max_transfer_sz = 4096;  // was 1024; too small can truncate SD writes
 
     // The SD-over-SPI host driver requires DMA (SPI_DMA_DISABLED returns
     // ESP_ERR_INVALID_ARG from esp_vfs_fat_sdspi_mount) — DMA-capable memory
