@@ -3,7 +3,7 @@
 // ============================================================================
 // core_api.h
 //
-// Functional-core API for qc705. UI-agnostic — consumed by both the
+// Functional-core API for cp705. UI-agnostic — consumed by both the
 // Cardputer local UI and other control surfaces. No screen-rendering or terminal
 // concepts leak through this boundary.
 //

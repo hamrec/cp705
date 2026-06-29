@@ -5,7 +5,7 @@
 #include "feature_flags.h"
 
 // ---------------------------------------------------------------------------
-// Runtime protocol configuration for qc705.
+// Runtime protocol configuration for cp705.
 //
 // g_protocol points to the active protocol's ProtocolConfig.  It is set once
 // at boot by load_station_data() based on the protocol_mode field in

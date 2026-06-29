@@ -6,7 +6,7 @@
 
 static const char* TAG = "RADIO_CTRL";
 
-// qc705 is IC-705 only — there is a single radio control backend.
+// cp705 is IC-705 only — there is a single radio control backend.
 static const radio_control_ops_t* current_ops(void) {
     return radio_control_ic705_get_ops();
 }

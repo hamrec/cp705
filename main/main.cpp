@@ -467,7 +467,7 @@ static bool g_rx_dirty = false;
 
 
 static std::vector<std::string> g_msc_lines = {
-    "QC705 USB drive",
+    "CP705 USB drive",
     "now mounted on PC.",
     "",
     "Safely eject on PC,",
@@ -476,7 +476,7 @@ static std::vector<std::string> g_msc_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** QC705 V2.1b **",
+    "** CP705 V2.1b **",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",
@@ -535,7 +535,7 @@ static std::vector<std::string> g_d_lines;
 static std::vector<std::string> g_d_files;
 static int d_page = 0;
 static std::string host_input;
-static const char* HOST_PROMPT = "QC705> ";
+static const char* HOST_PROMPT = "CP705> ";
 static bool usb_ready = false;
 static QueueHandle_t s_key_inject_queue = nullptr;
 static bool host_bin_active = false;
@@ -614,7 +614,7 @@ static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
 static bool g_gnss_lora_enabled = false;
 static constexpr size_t kIgnorePrefixTextMaxLen = 64;
-std::string g_comment1 = "QC705 /Radio";      // visible to core_api.cpp
+std::string g_comment1 = "CP705 /Radio";      // visible to core_api.cpp
 static std::string g_ignore_prefix_text;
 std::vector<std::string> g_ignore_prefixes;     // visible to core_api.cpp
 static bool g_rxtx_log = true;
@@ -1181,7 +1181,7 @@ static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
            rst_sent_buf, rst_rcvd_buf,
            comment_expanded.size(), comment_expanded.c_str());
   static const char* const kAdifHeader =
-      "QC705 ADIF export\n<adif_ver:5>3.1.4\n<programid:5>QC705\n<eoh>\n";
+      "CP705 ADIF export\n<adif_ver:5>3.1.4\n<programid:5>CP705\n<eoh>\n";
   // (1) PRIMARY: NVS — always available on this board (SD writes fail at the
   // driver level and there's no FATFS partition). The day's ADIF log is kept as
   // a bounded blob; this is the copy that reliably survives.
@@ -1636,7 +1636,7 @@ void apply_radio_profile_binding() {
   auto start_gps = [&]() {
     gps_start(gps_pins_for_current_source());
   };
-  // qc705 is IC-705 only — always run GPS, no KH1 CAT.
+  // cp705 is IC-705 only — always run GPS, no KH1 CAT.
   g_kh1_connected = false;
   start_gps();
 
@@ -1724,7 +1724,7 @@ static bool start_rx_audio_for_current_radio(const char* reason, bool notify_cat
   return true;
 }
 
-// qc705 is IC-705 only; the KH1 CAT diagnostic keys (u/i/j/k/l) were removed.
+// cp705 is IC-705 only; the KH1 CAT diagnostic keys (u/i/j/k/l) were removed.
 static bool handle_kh1_diag_key(char /*c*/) {
   return false;
 }
@@ -4239,7 +4239,7 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
 // writes fail at the driver level, so the whole Station.txt content is stored as
 // one blob in NVS (the standard ESP key/value store, always available). SD/flash
 // are kept only as best-effort secondaries.
-static const char* kNvsNamespace = "qc705";
+static const char* kNvsNamespace = "cp705";
 static const char* kNvsStationKey = "station";
 
 static bool nvs_save_station(const std::string& content) {
@@ -4368,7 +4368,7 @@ static RadioType load_station_radio_type_only() {
   // SD shares the display's SPI bus and mounting it pre-display risks an SPI
   // init-ordering crash. Flash-only here (cheap); the full config, including the
   // radio, is loaded from the SD card later in load_station_data() once the
-  // display is up. (QC705 is IC-705 only, so this default rarely matters.)
+  // display is up. (CP705 is IC-705 only, so this default rarely matters.)
   StorageStream* stream = storage_stream_open(STATION_FILE, StorageOpenMode::READ);
   if (!stream) return canonical_radio_type(g_radio);
   char line[128];
@@ -4723,7 +4723,7 @@ static void enter_msc_mode(const char* reason) {
     return;
   }
 
-  ESP_LOGI(TAG, "MSC ready: PC will see QC705 as a USB drive");
+  ESP_LOGI(TAG, "MSC ready: PC will see CP705 as a USB drive");
   enter_mode(UIMode::MSC);
 }
 

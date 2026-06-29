@@ -1,6 +1,6 @@
 #pragma once
 
-// Build-time protocol features for qc705.
+// Build-time protocol features for cp705.
 //
 // Override at CMake time:
 //   idf.py build -DENABLE_FT4=OFF

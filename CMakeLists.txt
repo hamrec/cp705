@@ -23,11 +23,11 @@ else()
 endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(QC705)
+project(CP705)
 # This release requires the full merged image because it installs the FATFS-only
 # partition table. First boot formats the new 3 MB FATFS when needed.
 add_custom_command(TARGET app POST_BUILD
-    COMMAND ${PYTHON} -m esptool --chip esp32s3 merge_bin -o "QC705_Merged_Auto.bin" @flash_args
+    COMMAND ${PYTHON} -m esptool --chip esp32s3 merge_bin -o "CP705_Merged_Auto.bin" @flash_args
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Auto-generating merged binary QC705_Merged_Auto.bin for release..."
+    COMMENT "Auto-generating merged binary CP705_Merged_Auto.bin for release..."
 )

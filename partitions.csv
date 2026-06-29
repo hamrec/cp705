@@ -1,4 +1,4 @@
-# qc705 custom partition table for the ESP32-S3FN8 (8MB flash).
+# cp705 custom partition table for the ESP32-S3FN8 (8MB flash).
 # Adds a "fatfs" data partition that the storage service mounts at /storage for
 # settings (Station.txt) and the daily ADIF QSO logs, exposed over USB-MSC. The
 # stock singleapp_large table had no such partition, so storage never mounted

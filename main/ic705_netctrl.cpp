@@ -471,7 +471,7 @@ static void build_login_pkt(uint8_t out[128]) {
     // login, after verifying everything else (passcode encoding included)
     // byte-for-byte matches.
     // Device/app name shown on the radio's connected-client list (cosmetic).
-    memcpy(out + 96, "QC705", 5);
+    memcpy(out + 96, "CP705", 5);
 }
 
 static void build_auth_pkt(uint8_t out[64], uint8_t magic) {

@@ -3,7 +3,7 @@
 // ============================================================================
 // station_types.h
 //
-// Enums and plain types describing qc705 station state. Shared between
+// Enums and plain types describing cp705 station state. Shared between
 // main.cpp (owner of the runtime globals) and core_api.cpp (exposing the
 // functional-core API). Kept separate so core_api.cpp can access the
 // underlying globals directly without main.cpp having to expose its

@@ -1,4 +1,4 @@
-// audio_source.cpp — qc705 is IC-705-over-WiFi only. This used to dispatch
+// audio_source.cpp — cp705 is IC-705-over-WiFi only. This used to dispatch
 // between the IC-705 WiFi stream and a KH1 USB-mic stream; the mic backend has
 // been removed, so this is now a thin pass-through to stream_wifi_ic705.
 

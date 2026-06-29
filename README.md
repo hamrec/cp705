@@ -1,14 +1,14 @@
-# QC705 — A Self-Contained IC-705 WiFi FT8 Client
+# CP705 — A Self-Contained IC-705 WiFi FT8 Client
 
 > Built on **[Mini-FT8 by Wei, AG6AQ](https://github.com/wcheng95/Mini-FT8)** — with
 > deep gratitude. Please visit and star the original project.
 
-QC705 is a fork of Wei (AG6AQ)'s **[Mini-FT8](https://github.com/wcheng95/Mini-FT8)**,
+CP705 is a fork of Wei (AG6AQ)'s **[Mini-FT8](https://github.com/wcheng95/Mini-FT8)**,
 and it stands entirely on the shoulders of that work — Karlis Goba's [ft8_lib](https://github.com/kgoba/ft8_lib),
 the audio/DSP and autoseq foundation from Zhenxing (N6HAN), and the inspiration
 of the DX-FT8 team. **All credit for the original application belongs to them.**
 
-Where Mini-FT8 drives QMX/QDX/KH1 radios over a serial/USB-audio path, **QC705
+Where Mini-FT8 drives QMX/QDX/KH1 radios over a serial/USB-audio path, **CP705
 has a completely different aim**: it turns the Cardputer ADV into a *standalone
 wireless FT8 station for the Icom IC-705* — CAT control, receive-audio decode,
 and transmit, all over WiFi, with **no PC, no soundcard, and no audio cables**.
@@ -67,13 +67,13 @@ expected to do.
 - **Streamlined to the IC-705 target** — the KH1-specific CAT/diagnostic keys
   were removed to keep the build focused on the wireless IC-705 use case.
 
-> QC705 is an experimental, boundary-pushing build. Huge thanks again to the
+> CP705 is an experimental, boundary-pushing build. Huge thanks again to the
 > Mini-FT8 authors — this project exists only because of the foundation they
 > shared with the community.
 
 # IC-705 Setup
 
-QC705 talks to the radio entirely over the IC-705's built-in WLAN remote-control
+CP705 talks to the radio entirely over the IC-705's built-in WLAN remote-control
 server — the same protocol RS-BA1, wfview, and kappanhang use. There is **no
 cable, no soundcard, and no PC**. The Cardputer joins the radio's WiFi, logs in
 with a registered network user, and then carries CAT, receive audio, and
@@ -84,7 +84,7 @@ transmit audio over three UDP ports.
 ```text
 ┌─────────────────────┐   WiFi (IC-705 is the Access Point)   ┌──────────────────┐
 │ IC-705              │  SSID broadcast, radio = 192.168.59.1 │ Cardputer ADV    │
-│  WLAN AP + remote   │<─────────────────────────────────────>│  QC705 (client)  │
+│  WLAN AP + remote   │<─────────────────────────────────────>│  CP705 (client)  │
 │  server             │   UDP 50001 control  (login/CI-V auth) │                  │
 │                     │   UDP 50002 serial   (CI-V frames)     │                  │
 │                     │   UDP 50003 audio    (RX + TX PCM)     │                  │
@@ -93,7 +93,7 @@ transmit audio over three UDP ports.
 
 - The **radio runs as the WiFi Access Point** (Connection Type = Access Point).
   In that mode the IC-705 is reachable at the fixed address **`192.168.59.1`**,
-  which QC705 targets directly (no mDNS lookup needed).
+  which CP705 targets directly (no mDNS lookup needed).
 - The Cardputer joins as a normal WiFi client and is handed an address by the
   radio's DHCP server.
 
@@ -106,18 +106,18 @@ transmit audio over three UDP ports.
 **MENU → SET → WLAN Set**
 - `WLAN`: **ON**
 - `Connection Type`: **Access Point**
-- `SSID`: choose a name (this is what you'll enter in QC705)
+- `SSID`: choose a name (this is what you'll enter in CP705)
 - `Password`: choose a WPA2 password (8–63 chars)
 - `DHCP Server`: **ON** (radio becomes `192.168.59.1` and assigns the Cardputer an IP)
 
 **MENU → SET → Network**
 - `Network Control`: **ON**
 - `Network User1`: set an **ID** and **Password**, and `Administrator`: **YES**
-  (QC705 logs in as this user — the names must match what you put in QC705)
+  (CP705 logs in as this user — the names must match what you put in CP705)
 - `Control Port (UDP)`: **50001**
 - `Serial Port (UDP)`: **50002**
 - `Audio Port (UDP)`: **50003**
-- (Leave these at the IC-705 defaults — QC705 expects exactly these ports.)
+- (Leave these at the IC-705 defaults — CP705 expects exactly these ports.)
 
 **MENU → SET → Connectors**
 - `MOD Input` → `DATA MOD`: **WLAN** (so network audio drives transmit in data modes)
@@ -125,10 +125,10 @@ transmit audio over three UDP ports.
 
 **Operating mode**
 - Use a **data mode** for FT8/FT4 — i.e. **USB-D** (the radio's "DATA" sub-mode).
-  QC705 sets frequency/mode over CAT, but the radio must be in a data mode for
+  CP705 sets frequency/mode over CAT, but the radio must be in a data mode for
   the WLAN modulation path to key the transmitter cleanly.
 
-## Step 2 — Configure QC705
+## Step 2 — Configure CP705
 
 All connection settings live on a **fourth MENU page**: press **`O`** (MENU P3),
 then **`▼`** to page down to the IC-705 WiFi/network page.
@@ -140,7 +140,7 @@ then **`▼`** to page down to the IC-705 WiFi/network page.
 | `3` | Net User | Must match the radio's `Network User1` **ID**. |
 | `4` | Net Password | Must match the radio's `Network User1` **password**. |
 | `5` | CI-V Address | The IC-705 default is `0xA4`. |
-| `6` | Re-resolve / Connect status | Re-points QC705 at `192.168.59.1`; the row shows live WiFi status. |
+| `6` | Re-resolve / Connect status | Re-points CP705 at `192.168.59.1`; the row shows live WiFi status. |
 
 Each field is an in-place edit: type the value and press **Enter** to save
 (`` ` `` cancels). Passwords are masked with `*` when not being edited.
@@ -156,7 +156,7 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 ## Step 3 — Connect and operate
 
 1. Power up the radio with WLAN on; confirm it is broadcasting its AP SSID.
-2. On QC705, press **`S`** (STATUS) then **`2`** to connect. The Cardputer joins
+2. On CP705, press **`S`** (STATUS) then **`2`** to connect. The Cardputer joins
    the WiFi, logs in, opens the CI-V and audio streams, and starts decoding.
    Watch the WiFi status line on the IC-705 WiFi MENU page for progress.
 3. Pick a band from **`S` → `3`** (steps through your active bands) and let the
@@ -183,13 +183,13 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 
 ## Troubleshooting
 
-- **WiFi won't connect:** confirm the SSID/password in QC705 match the radio's
+- **WiFi won't connect:** confirm the SSID/password in CP705 match the radio's
   Access-Point SSID/password exactly, and that `WLAN` + `DHCP Server` are ON.
 - **WiFi connects but no decodes / no CAT:** check `Network Control` is ON, the
   `Network User1` is an **Administrator**, and the three UDP ports are at their
   defaults (50001/50002/50003). Re-resolve with MENU page 4 → `4`, or reconnect
   with `S → 2`.
-- **Login rejected:** the QC705 network user/password must match `Network User1`
+- **Login rejected:** the CP705 network user/password must match `Network User1`
   on the radio. Only one client can use the radio's remote server at a time, so
   make sure wfview/RS-BA1/SDR-Control isn't already connected.
 - **Transmits but no RF / no modulation:** set `MOD Input → DATA MOD = WLAN` and
@@ -199,7 +199,7 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 
 ---
 
-# QC705 Operation Manual
+# CP705 Operation Manual
 
 > This manual is inherited from Mini-FT8 and describes the shared on-device UI.
 
@@ -217,7 +217,7 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 | `Q` | QSO | View the session QSO count / logging status (full log is in NVS — export with `O`→`5`). |
 | `D` | Delete Files | Browse/delete internal-FATFS files (inert on boards without a FATFS partition). |
 | `B` | BAND | Edit per-band frequencies. |
-| `C` | USB Drive | Toggle internal FATFS ownership between QC705 and the PC (needs a FATFS partition; inert on this board). |
+| `C` | USB Drive | Toggle internal FATFS ownership between CP705 and the PC (needs a FATFS partition; inert on this board). |
 | `P` | Performance | View A Simple Performance Monitor. (added in V2.0.4)|
 
 ## Global Keys and Navigation
@@ -256,7 +256,7 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 |  | `6` | Enter Sleep. Shows battery info. |
 | `N` (MENU P2) | `1` | Select offset source: Random / RX / Fixed. Random values are within 500-2500 Hz. |
 |  | `2` | Edit fixed cursor offset (in place). Enter directly or use `▲` `▼` `◀` `▶`. |
-|  | `3` | Select radio. QC705 drives the IC-705 over WiFi only; the legacy `KH1-MIC` toggle is inert. |
+|  | `3` | Select radio. CP705 drives the IC-705 over WiFi only; the legacy `KH1-MIC` toggle is inert. |
 |  | `4` | Edit ignore list (Long Edit). Prefixes are separated by spaces; maximum 64 characters. |
 |  | `5` | Edit comment (Long Edit). Used for ADIF logging. Supports `/Radio` and `/Grid` macro expansion. |
 |  | `6` | Select FT8 / FT4 protocol. Reboot to apply the change. |
@@ -291,9 +291,9 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 
 ## GPS Connections
 
-QC705 supports two GPS sources selected from MENU P3 (`O -> 4`):
+CP705 supports two GPS sources selected from MENU P3 (`O -> 4`):
 
-- `GNSS_LoRa:OFF` uses the PORTA GPS wiring below. Both 9600 and 115200 baud GPS modules are supported and auto-detected. **Make sure the micro switch is on the left.** Once QC705 gets its time/grid, the GPS can be removed.
+- `GNSS_LoRa:OFF` uses the PORTA GPS wiring below. Both 9600 and 115200 baud GPS modules are supported and auto-detected. **Make sure the micro switch is on the left.** Once CP705 gets its time/grid, the GPS can be removed.
 - `GNSS_LoRa:ON` uses the M5Stack LoRa-1262 cap GNSS on UART2 (`RX=G15`, `TX=G13`) at 115200 baud. The LoRa/SX1262 radio side is not used.
 
 When `GNSS_LoRa` is `ON`, the physical G4/G5 debug UART path is disabled and the pins are left as floating inputs to avoid conflicts. USB Serial/JTAG host commands still work.
@@ -314,7 +314,7 @@ The GPS view shows the active source on its first line.
 
 ## DS3231 RTC Connections
 
-QC705 can use an optional DS3231 module as an external UTC clock. Connect it
+CP705 can use an optional DS3231 module as an external UTC clock. Connect it
 to the Cardputer Adv shared I2C bus: `SDA=G8`, `SCL=G9`, plus module power and
 ground. On boot, a valid DS3231 time is used before the ESP RTC or saved
 `Station.txt` time. Status `S -> 6` appends `R` when the active time came from

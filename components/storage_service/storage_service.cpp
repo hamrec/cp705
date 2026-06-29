@@ -437,7 +437,7 @@ bool cabrillo_ensure_header_locked(const std::string& path,
         return false;
     }
     bool ok = fprintf(file, "START-OF-LOG: 3.0\n") >= 0;
-    ok = ok && fprintf(file, "CREATED-BY: QC705\n") >= 0;
+    ok = ok && fprintf(file, "CREATED-BY: CP705\n") >= 0;
     ok = ok && fprintf(file, "CONTEST: ARRL-FIELD-DAY\n") >= 0;
     ok = ok && fprintf(file, "CALLSIGN: %s\n", mycall.c_str()) >= 0;
     ok = ok && fprintf(file, "CATEGORY-OPERATOR: SINGLE-OP\n") >= 0;
