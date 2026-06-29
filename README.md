@@ -16,6 +16,26 @@ The IC-705's own WLAN server is the only link. In doing so it pushes the
 ESP32-S3 Cardputer ADV (which has **no PSRAM**) well past what the platform was
 expected to do.
 
+## Install
+
+**One-click (recommended):** open the web flasher in **Chrome or Edge** on a
+desktop, plug in the Cardputer ADV via USB, and click Install — no toolchain
+required:
+
+> ### → [Install CP705 in your browser](https://hamrec.github.io/cp705/)
+
+**Manual:** download `CP705_Merged_Auto.bin` from the
+[latest release](https://github.com/hamrec/cp705/releases/latest) and flash it at
+offset `0x0`:
+
+```sh
+python -m esptool --chip esp32s3 write_flash 0x0 CP705_Merged_Auto.bin
+```
+
+After flashing, set up your station on the device — call/grid (`M`→`4`/`5`) and the
+IC-705 WiFi/network settings (`O`, then page down). Settings persist in NVS. See
+**IC-705 Setup** below for the full radio-side configuration.
+
 ## Challenges overcome to make FT8 work with the IC-705 over WiFi
 
 - **Implementing the Icom WLAN remote protocol on a microcontroller** — the same
