@@ -3473,7 +3473,7 @@ static void draw_menu_view() {
   if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
     lines.push_back(menu_copy_feedback_text);
   } else {
-    lines.push_back("Copy Files to SD");
+    lines.push_back("Export Log to SD");
   }
   if (menu_edit_idx == 17) {
     lines.push_back(std::string("Max Retry:") + menu_edit_buf);
@@ -4295,6 +4295,32 @@ static void nvs_append_adif(const std::string& record, const char* header) {
     nvs_commit(h);
   }
   nvs_close(h);
+}
+
+static bool nvs_load_adiflog(std::string& out) {
+  out.clear();
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t len = 0;
+  if (nvs_get_blob(h, "adiflog", nullptr, &len) != ESP_OK || len == 0) { nvs_close(h); return false; }
+  out.resize(len);
+  esp_err_t e = nvs_get_blob(h, "adiflog", &out[0], &len);
+  nvs_close(h);
+  return e == ESP_OK;
+}
+
+// Writes the accumulated NVS ADIF log to the SD card as YYYYMMDD.adi (today) in
+// one shot. Run this while idle (not decoding) — that's when the flaky SD writes
+// reliably succeed. Returns a short status string for on-screen feedback.
+static std::string export_adiflog_to_sd() {
+  std::string log;
+  if (!nvs_load_adiflog(log) || log.empty()) return "No log yet";
+  time_t now = (time_t)(rtc_now_ms() / 1000);
+  struct tm t; localtime_r(&now, &t);
+  char path[40];
+  snprintf(path, sizeof(path), "%04d%02d%02d.adi",
+           (t.tm_year + 1900) % 10000, (t.tm_mon + 1) % 100, t.tm_mday % 100);
+  return storage_sd_write_file(path, log) ? "Exported to SD" : "SD write failed";
 }
 
 static void split_into_lines(const std::string& content, std::vector<std::string>& lines) {
@@ -5901,29 +5927,16 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 apply_radio_profile_binding();
                 draw_menu_view();
               } else if (c == '5') {
-                CopyLogsResult copy_res = copy_logs_to_sd_overwrite();
+                // Export the accumulated NVS ADIF log to the SD card (YYYYMMDD.adi)
+                // in one shot. Best done while idle — that's when SD writes work.
+                menu_copy_feedback_text = export_adiflog_to_sd();
                 menu_flash_idx = 16; // abs index of page 2 line 5
                 menu_flash_deadline = rtc_now_ms() + 500;
-                if (copy_res.missed_count <= 0) {
-                  menu_copy_feedback_text = "Copied OK";
-                } else {
-                  char fb[20];
-                  snprintf(fb, sizeof(fb), "Missed %d", copy_res.missed_count);
-                  menu_copy_feedback_text = fb;
-                }
                 if (menu_copy_feedback_text.size() > 19) {
                   menu_copy_feedback_text.resize(19);
                 }
                 menu_copy_feedback_deadline = rtc_now_ms() + kMenuCopyFeedbackMs;
-
-                char log_msg[64];
-                snprintf(log_msg, sizeof(log_msg), "Copy SD C%d M%d",
-                         copy_res.copied_count, copy_res.missed_count);
-                debug_log_line(log_msg);
-                if (copy_res.err == ESP_OK) {
-                  debug_log_line("Copied storage files to SD");
-                }
-
+                debug_log_line(std::string("Export log: ") + menu_copy_feedback_text);
                 draw_menu_view();
               } else if (c == '6') {
                 menu_edit_idx = 17; // Max Retry line
