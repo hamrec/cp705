@@ -1,7 +1,10 @@
 # QC705 — A Self-Contained IC-705 WiFi FT8 Client
 
-QC705 is a fork of Wei (AG6AQ)'s **Mini-FT8**, and it stands entirely on the
-shoulders of that work — Karlis Goba's [ft8_lib](https://github.com/kgoba/ft8_lib),
+> Built on **[Mini-FT8 by Wei, AG6AQ](https://github.com/wcheng95/Mini-FT8)** — with
+> deep gratitude. Please visit and star the original project.
+
+QC705 is a fork of Wei (AG6AQ)'s **[Mini-FT8](https://github.com/wcheng95/Mini-FT8)**,
+and it stands entirely on the shoulders of that work — Karlis Goba's [ft8_lib](https://github.com/kgoba/ft8_lib),
 the audio/DSP and autoseq foundation from Zhenxing (N6HAN), and the inspiration
 of the DX-FT8 team. **All credit for the original application belongs to them.**
 
@@ -41,9 +44,12 @@ expected to do.
   TX aggregation got delivery clean.
 - **CI-V quirks** — fixing an unintended filter clobber and adding handshake
   retries so CAT control comes up reliably.
-- **Durable logging with no serial console** — QSO records are fsync'd straight
-  to the SD card and the mount is pinned for the session, so a pulled card keeps
-  every contact; storage health is reported on the device's own screen.
+- **Reliable config + log storage on a board with no usable filesystem** — this
+  unit has no internal FATFS partition and its SD card accepts reads but fails
+  writes at the driver level, so station settings and the ADIF QSO log are stored
+  in **NVS** (non-volatile flash key/value store), which survives power-off. The
+  log is also written best-effort to the SD card, and can be exported to the card
+  on demand in one shot.
 
 ## New features and menu changes (vs. Mini-FT8)
 
@@ -51,9 +57,13 @@ expected to do.
   all run over the radio's WLAN connection instead of a serial/USB-audio path.
 - **No external audio hardware** — the soundcard/USB-C-audio-adapter and audio
   cabling that other radios require are gone; the WiFi audio stream replaces them.
-- **On-device SD-logging status** surfaced in the QSO (`Q`) view — mount state
-  and per-QSO write results, since the board has no serial console.
-- **On-device RX-health / TX diagnostics** for tuning link quality in the field.
+- **NVS-backed persistence** — callsign, grid, WiFi/network credentials, CI-V
+  address, bands, and the ADIF QSO log all persist in NVS across reboots (no
+  dependence on the SD card or an internal FATFS partition).
+- **On-device network login editor** — WiFi SSID/password and IC-705 network
+  user/password are editable on a fourth MENU page (`O`, then page down).
+- **Export Log to SD** (MENU P3 → `5`) — writes the accumulated NVS ADIF log to
+  the card as `YYYYMMDD.adi` in one shot for import into logging software.
 - **Streamlined to the IC-705 target** — the KH1-specific CAT/diagnostic keys
   were removed to keep the build focused on the wireless IC-705 use case.
 
@@ -154,9 +164,10 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 4. (Recommended) Plug in a GPS or DS3231 so the 15-second FT8 window is locked to
    UTC — see **GPS Connections** / **DS3231 RTC Connections** below. Accurate
    time is required for reliable decodes and properly-timed transmit.
-5. Logging is automatic: each completed QSO is written to the SD card as
-   `YYYYMMDD.adi` (ADIF) and fsync'd immediately, so you can pull the card and
-   import it straight away. The QSO view (**`Q`**) shows the SD logging status.
+5. Logging is automatic: each completed QSO is appended to the ADIF log in **NVS**
+   (survives power-off) and best-effort to the SD card. To get an importable
+   `.adi`, export to the card with **MENU P3 → `5`** (see **Logging and Download**).
+   The QSO view (**`Q`**) shows the session log status.
 
 ## Quick reference
 
@@ -168,7 +179,7 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 | Audio format | 48 kHz, 16-bit, mono (LPCM) |
 | IC-705 CI-V address | `0xA4` (default) |
 | FT8 operating mode | USB-D (data) |
-| QSO log (primary) | SD card, `YYYYMMDD.adi` (ADIF) |
+| QSO log (primary) | NVS (ADIF); export to SD via `O`→`5` |
 
 ## Troubleshooting
 
@@ -202,11 +213,11 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 | `G` | GPS | View GPS telemetry and synchronization status. |
 | `M` | MENU P1 | Configure core station and operator settings. |
 | `N` | MENU P2 | Configure radio, input, and comment settings. |
-| `O` | MENU P3 | Configure logging, active bands, GNSS LoRa GPS, copy-to-SD, and retry settings. |
-| `Q` | QSO | Browse QSO and log files, and view entries. |
-| `D` | Delete Files | Browse and delete files stored in internal FATFS. |
+| `O` | MENU P3 | Configure logging, active bands, GNSS LoRa GPS, export-log-to-SD, and retry settings. |
+| `Q` | QSO | View the session QSO count / logging status (full log is in NVS — export with `O`→`5`). |
+| `D` | Delete Files | Browse/delete internal-FATFS files (inert on boards without a FATFS partition). |
 | `B` | BAND | Edit per-band frequencies. |
-| `C` | USB Drive | Toggle internal FATFS ownership between QC705 and the PC. |
+| `C` | USB Drive | Toggle internal FATFS ownership between QC705 and the PC (needs a FATFS partition; inert on this board). |
 | `P` | Performance | View A Simple Performance Monitor. (added in V2.0.4)|
 
 ## Global Keys and Navigation
@@ -253,26 +264,30 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 |  | `2` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report. |
 |  | `3` | Edit active bands (Long Edit). Used by STATUS -> Band. |
 |  | `4` | Toggle `GNSS_LoRa`. `OFF` uses PORTA GPS; `ON` uses the LoRa-1262 cap GNSS. |
-|  | `5` | Copy files to SD. Feedback is `Copied OK` or `Missed [n]`. |
+|  | `5` | Export Log to SD. Writes the NVS ADIF log to the card as `YYYYMMDD.adi`. Feedback: `Exported to SD` / `SD write failed` / `No log yet`. |
 |  | `6` | Edit max retry (in place). Accepts any natural number or `0`. |
-| `Q` (QSO) | `1..6` | Open the selected ADIF file. |
-|  | `◀` `▶` | Switch columns (Default view or SNR view). |
-| `D` (Delete Files) | `1..6` | Delete the selected file immediately, without confirmation. |
+| `Q` (QSO) |  | Shows session QSO count and logging status. The full ADIF log lives in NVS / on the SD card (export via MENU P3 → `5`); the internal-flash file browser is unavailable on this board. |
+| `D` (Delete Files) | `1..6` | Delete the selected internal-flash file. Inert when there's no FATFS partition. |
 | `B` (BAND) | `1..6` | Choose a band slot to edit. |
-| `C` (USB Drive) |  | Stop radio audio and expose FATFS to the PC. Safely eject it on the PC, then press `C` again to remount storage and return to RX. |
+| `C` (USB Drive) |  | Stop radio audio and expose FATFS to the PC, then eject and press `C` to return to RX. Requires a FATFS partition — inert on this board (config/logs live in NVS instead). |
 | `P` (PERFORMANCE) | | A Simple Performance Monitor. (added in V2.0.4) |
 
-## Download Logs
+## Logging and Download
 
-- QC705 stores its files on the internal `fatfs` partition (wear-levelled).
-  M5Launcher installs/reinstalls preserve a compatible existing FATFS partition,
-  so logs and `Station.txt` survive reflashing. The primary QSO log is written
-  to the SD card; internal flash is the secondary copy (see IC-705 Setup).
-
-- Use SD
-  - Insert a FAT/FAT32-formatted SD card.
-  - In MENU P3 (`O`), press `5` (Copy files to SD). All files will be copied to the SD card.
-  - If the result shows `Missed`, a reboot will usually fix it.
+- **Where the log lives:** every completed QSO is appended to an ADIF log held in
+  **NVS** (non-volatile flash), so it survives power-off. It is also written
+  best-effort to the SD card as `YYYYMMDD.adi`. Station settings persist in NVS
+  the same way.
+- **Why NVS:** on this board there is no internal FATFS partition, and the SD
+  card reads fine but its writes fail intermittently at the driver level under
+  load — so NVS is the reliable store and the SD card is a convenience copy.
+- **Getting the log off the device:**
+  1. Insert a FAT/FAT32-formatted SD card.
+  2. When idle (not decoding), open MENU P3 (`O`) and press `5` (**Export Log to
+     SD**). The full NVS log is written to the card as `YYYYMMDD.adi`.
+  3. On `Exported to SD`, pull the card and import the `.adi` into your logging
+     software. If it shows `SD write failed`, retry while the radio isn't actively
+     decoding.
 
 ## GPS Connections
 
