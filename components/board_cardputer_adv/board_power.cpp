@@ -107,12 +107,24 @@ esp_err_t board_power_read(board_power_status_t* out_status)
 
     ESP_RETURN_ON_ERROR(board_power_init(), TAG, "board_power_init failed");
 
-    int raw = 0;
-    ESP_RETURN_ON_ERROR(
-        adc_oneshot_read(g_adc, kBatAdcChannel, &raw),
-        TAG,
-        "adc_oneshot_read failed"
-    );
+    // Average several samples: the cell voltage jitters and sags transiently
+    // under load (WiFi/TX current), so a single read can be ~300 mV low and
+    // report a wildly wrong %. Averaging gives a stable reading.
+    constexpr int kSamples = 16;
+    int64_t raw_sum = 0;
+    int raw_count = 0;
+    for (int i = 0; i < kSamples; ++i) {
+        int r = 0;
+        if (adc_oneshot_read(g_adc, kBatAdcChannel, &r) == ESP_OK) {
+            raw_sum += r;
+            ++raw_count;
+        }
+    }
+    if (raw_count == 0) {
+        ESP_LOGW(TAG, "adc_oneshot_read failed");
+        return ESP_FAIL;
+    }
+    int raw = (int)(raw_sum / raw_count);
 
     int adc_mv = raw;
 
