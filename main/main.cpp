@@ -476,7 +476,7 @@ static std::vector<std::string> g_msc_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** CP705 V2.1c **",
+    "** CP705 V2.1d **",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",
