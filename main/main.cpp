@@ -702,17 +702,9 @@ static void qso_draw_page();
 
 static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
 static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
-// ADIF-to-SD result published by log_adif_entry() (may run on the core1 decode
-// task) and consumed/displayed by the core0 UI loop. Plain ints only — see the
-// poll in app_task_core0(). g_adif_sd_seq increments on every QSO write.
+// Count of QSO records logged this session (shown in the QSO view). Incremented
+// by log_adif_entry(), which may run on the core1 decode task — plain int only.
 static volatile uint32_t g_adif_sd_seq  = 0;
-static volatile bool     g_adif_sd_ok   = false;
-static volatile int      g_adif_sd_code = 0;
-// SD mount result from boot (storage_sd_log_premount). 0x7fffffff = not run yet.
-static volatile int      g_sd_premount_code = 0x7fffffff;
-// Internal-flash FATFS init result from boot (storage_service_init), captured so
-// the failure reason is visible on-device (no serial console). 0x7fffffff = n/a.
-static volatile int      g_storage_init_code = 0x7fffffff;
 static bool storage_append_text_locked_path(const std::string& path,
                                             const std::string& line,
                                             const std::string& header_if_new,
@@ -919,96 +911,15 @@ static const char* qso_storage_list_failure_text(StorageOwner owner) {
   return "List failed";
 }
 
-// Config-save diagnostics (set in save_station_data): how many SD config writes
-// were attempted and the result code of the last one (g_storage_sd_log_last_code
-// semantics: 0=ok, 1=no mutex, 2+esp_err=mount fail, -1-errno=fopen, -2=short).
-static volatile uint32_t g_cfg_save_seq  = 0;
-static volatile int      g_cfg_save_code = 999;
-
 static bool nvs_save_station(const std::string& content);  // defined below
 static bool nvs_load_station(std::string& out);            // defined below
+static void nvs_append_adif(const std::string& record, const char* header);  // defined below
 
-// SD self-test results (filled once at boot by run_sd_selftest), shown in the
-// QSO view so the card can be verified without serial access.
-static std::vector<std::string> g_sdtest_lines;
-
-// Exercise the SD card directly: free/total space, directory read, a real
-// write + read-back. Stores short result lines for on-screen display.
-static void run_sd_selftest() {
-  g_sdtest_lines.clear();
-  char b[64];
-
-  uint64_t total = 0, freeb = 0;
-  bool sok = storage_sd_space(&total, &freeb);
-  snprintf(b, sizeof(b), "space ok=%d t%lluM f%lluM", (int)sok,
-           (unsigned long long)(total >> 20), (unsigned long long)(freeb >> 20));
-  g_sdtest_lines.push_back(b);
-
-  int n = 0;
-  if (DIR* d = opendir("/sdcard")) {
-    while (readdir(d)) n++;
-    closedir(d);
-    snprintf(b, sizeof(b), "dir read OK n=%d", n);
-  } else {
-    snprintf(b, sizeof(b), "dir read FAIL e=%d", errno);
-  }
-  g_sdtest_lines.push_back(b);
-
-  const std::string msg = "QC705 SD selftest 0123456789\n";
-  errno = 0;
-  FILE* f = fopen("/sdcard/QC705TEST.txt", "wb");
-  if (!f) {
-    snprintf(b, sizeof(b), "wopen FAIL e=%d", errno);
-    g_sdtest_lines.push_back(b);
-  } else {
-    errno = 0;
-    size_t w = fwrite(msg.data(), 1, msg.size(), f);
-    int we = errno;
-    errno = 0;
-    int fs = fsync(fileno(f));
-    int fse = errno;
-    fclose(f);
-    snprintf(b, sizeof(b), "w%u/%u we%d fs%d fse%d",
-             (unsigned)w, (unsigned)msg.size(), we, fs, fse);
-    g_sdtest_lines.push_back(b);
-  }
-
-  std::string rd;
-  bool rok = storage_sd_read_file("QC705TEST.txt", rd);
-  snprintf(b, sizeof(b), "rd ok=%d n=%u m=%d",
-           (int)rok, (unsigned)rd.size(), (int)(rd == msg));
-  g_sdtest_lines.push_back(b);
-
-  // Exercise the REAL config path (nvs_save_station/nvs_load_station), then
-  // restore whatever was there so this test never corrupts the user's config.
-  std::string prev;
-  bool had = nvs_load_station(prev);
-  bool sv = nvs_save_station("call=NVSPERSIST\ngrid=AB12\n");
-  std::string back;
-  bool ld = nvs_load_station(back);
-  bool match = back.find("NVSPERSIST") != std::string::npos;
-  if (had) {
-    nvs_save_station(prev);                 // restore real config
-  } else {
-    nvs_handle_t h;                          // first boot: remove the test blob
-    if (nvs_open("qc705", NVS_READWRITE, &h) == ESP_OK) {
-      nvs_erase_key(h, "station");
-      nvs_commit(h);
-      nvs_close(h);
-    }
-  }
-  snprintf(b, sizeof(b), "nvscfg sv=%d ld=%d m=%d", (int)sv, (int)ld, (int)match);
-  g_sdtest_lines.push_back(b);
-  ESP_LOGW(TAG, "SDTEST/NVS: %s", g_sdtest_lines.back().c_str());
-}
-
-// SD-card status string for display. Shows boot mount result, config-save count
-// and last save code — this is the on-device diagnostic for config persistence.
+// One-line log status for the QSO view: number of QSO records logged this
+// session (each is written to NVS and best-effort to the SD card).
 static std::string sd_log_status_line() {
   char sd[40];
-  int mnt = (g_sd_premount_code == 0x7fffffff) ? 999 : g_sd_premount_code;
-  snprintf(sd, sizeof(sd), "mnt%d sv%u:%d q%u",
-           mnt, (unsigned)g_cfg_save_seq, g_cfg_save_code, (unsigned)g_adif_sd_seq);
+  snprintf(sd, sizeof(sd), "Log NVS+SD  QSOs:%u", (unsigned)g_adif_sd_seq);
   return sd;
 }
 
@@ -1019,19 +930,11 @@ static void qso_load_file_list() {
   g_q_entries_have_next_page = false;
   std::vector<std::string> files;
   if (!storage_file_list(files)) {
-    const StorageOwner owner = storage_service_owner();
-    const char* reason = qso_storage_list_failure_text(owner);
-    ESP_LOGW(TAG, "QSO file list failed: owner=%s reason=%s",
-             storage_owner_label(owner), reason);
-    // Append the flash-init error name so the cause is visible without serial.
-    std::string line = reason;
-    if (owner == StorageOwner::UNAVAILABLE && g_storage_init_code != 0x7fffffff &&
-        g_storage_init_code != ESP_OK) {
-      line += std::string(" (") + esp_err_to_name((esp_err_t)g_storage_init_code) + ")";
-    }
-    g_q_lines.push_back(line);
+    // Internal flash has no FATFS partition on this board, so the in-app file
+    // list is unavailable. QSO logs live on the SD card (YYYYMMDD.adi) and in
+    // NVS — pull the card to import them.
+    g_q_lines.push_back("QSO log on SD card");
     g_q_lines.push_back(sd_log_status_line());
-    for (const std::string& s : g_sdtest_lines) g_q_lines.push_back(s);
     return;
   }
   for (const auto& name : files) {
@@ -1279,25 +1182,18 @@ static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
            comment_expanded.size(), comment_expanded.c_str());
   static const char* const kAdifHeader =
       "QC705 ADIF export\n<adif_ver:5>3.1.4\n<programid:5>QC705\n<eoh>\n";
-  // (1) PRIMARY: write the record straight to the SD card (mount point /sdcard)
-  // as YYYYMMDD.adi. This is crash-safe and immediately importable — pull the
-  // card after an activation and load it into logging software. This is the one
-  // that must succeed for the operator, so its result drives the return value
-  // (autoseq retries on false).
-  bool ok = storage_sd_append_with_header(path, line, kAdifHeader);
-  if (!ok) ESP_LOGW(TAG, "ADIF SD write failed (%s): code=%d", path, g_storage_sd_log_last_code);
-  // Hand the result to the core0 UI loop for on-device display. This callback can
-  // run on the core1 decode task, so DON'T touch the (unlocked) debug-line vector
-  // here — just publish plain ints; core0 polls g_adif_sd_seq and logs the change.
-  g_adif_sd_ok   = ok;
-  g_adif_sd_code = g_storage_sd_log_last_code;
-  g_adif_sd_seq++;
-  // (2) SECONDARY (best-effort): also write to internal flash so the in-app QSO
-  // list, USB-MSC drive, and "Copy Files to SD" menu all see the same log. Now
-  // that the custom partition table includes the "fatfs" partition this works;
-  // its success is independent of the SD write, so don't let it force a retry.
+  // (1) PRIMARY: NVS — always available on this board (SD writes fail at the
+  // driver level and there's no FATFS partition). The day's ADIF log is kept as
+  // a bounded blob; this is the copy that reliably survives.
+  nvs_append_adif(line, kAdifHeader);
+  // (2) SECONDARY (best-effort): the SD card as YYYYMMDD.adi — when SD writes
+  // succeed, this is the importable file the operator pulls after an activation.
+  bool sd_ok = storage_sd_append_with_header(path, line, kAdifHeader);
+  if (!sd_ok) ESP_LOGW(TAG, "ADIF SD write failed (%s): code=%d", path, g_storage_sd_log_last_code);
+  // (3) Internal flash, best-effort (only if a FATFS partition is present).
   (void)storage_append_text_locked_path(path, line, kAdifHeader, true);
-  return ok;
+  g_adif_sd_seq++;   // QSO count for the on-screen status
+  return true;       // NVS write makes the record durable; never force a retry
 }
 
 
@@ -4368,6 +4264,39 @@ static bool nvs_load_station(std::string& out) {
   return e == ESP_OK;
 }
 
+// Appends one ADIF record to the day's log blob in NVS (key "adiflog"). The blob
+// is bounded (kAdifNvsCap) by dropping whole oldest records from the front, so a
+// long session can't starve the config in NVS; the SD card keeps the full log.
+// May be called from the core1 decode task — NVS has its own internal locking.
+static void nvs_append_adif(const std::string& record, const char* header) {
+  static const size_t kAdifNvsCap = 8192;
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return;
+  std::string log;
+  size_t len = 0;
+  if (nvs_get_blob(h, "adiflog", nullptr, &len) == ESP_OK && len > 0) {
+    log.resize(len);
+    if (nvs_get_blob(h, "adiflog", &log[0], &len) != ESP_OK) log.clear();
+  }
+  const std::string hdr = (header && log.empty()) ? header : "";
+  if (!hdr.empty()) log = hdr;
+  log += record;
+  if (log.size() > kAdifNvsCap) {
+    const size_t hdr_len = header ? strlen(header) : 0;
+    std::string body = log.substr(hdr_len);
+    while (body.size() > kAdifNvsCap - hdr_len) {
+      size_t eor = body.find("<eor>\n");
+      if (eor == std::string::npos) { body.clear(); break; }
+      body.erase(0, eor + 6);
+    }
+    log = (header ? std::string(header) : std::string()) + body;
+  }
+  if (nvs_set_blob(h, "adiflog", log.data(), log.size()) == ESP_OK) {
+    nvs_commit(h);
+  }
+  nvs_close(h);
+}
+
 static void split_into_lines(const std::string& content, std::vector<std::string>& lines) {
   size_t start = 0;
   while (start <= content.size()) {
@@ -4641,8 +4570,6 @@ void save_station_data() {
   // PRIMARY: NVS (always available; SD writes fail and the FATFS partition is
   // absent on this board). This is also the source of truth for load().
   const bool nvs_ok = nvs_save_station(content);
-  g_cfg_save_seq++;
-  g_cfg_save_code = nvs_ok ? 0 : -100;  // -100 = NVS write failed
   // SECONDARY (best-effort): SD card, then internal flash, when they work.
   const bool sd_ok = storage_sd_write_file(STATION_FILE, content);
   bool flash_ok = false;
@@ -4948,7 +4875,6 @@ static void begin_usb_host_mode() {
 
 static void app_task_core0(void* /*param*/) {
   esp_err_t storage_err = storage_service_init();
-  g_storage_init_code = (int)storage_err;
   if (storage_err != ESP_OK) {
     ESP_LOGE(TAG, "Storage service init failed: %s; continuing without log/config storage",
              esp_err_to_name(storage_err));
@@ -4966,8 +4892,7 @@ static void app_task_core0(void* /*param*/) {
   // exhaust DMA. Without this the config load did its own on-demand mount, which
   // could fail (leaving config blank) while the later log-premount succeeded.
   // mount_sd_locked() is idempotent, so the later log-premount call is a no-op.
-  g_sd_premount_code = (int)storage_sd_log_premount();
-  run_sd_selftest();   // exercise the card; results shown in the QSO view
+  storage_sd_log_premount();   // best-effort; SD is a secondary log target
   hashtable_init();
 
   // Q15 NCO LUT for UAC OUT FT8 audio synthesis. One-time table fill,
@@ -4997,7 +4922,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
-  ESP_LOGW(TAG, "CONFIG loaded: call=[%s] grid=[%s]", g_call.c_str(), g_grid.c_str());
   apply_debug_uart_pin_policy();
   apply_radio_profile_binding();
   update_autoseq_cq_type();
@@ -5060,25 +4984,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   }
   apply_debug_uart_pin_policy();
 
-  // Mount the SD card for debug logging now, before WiFi/audio streaming
-  // ever start — once active, they consume nearly all DMA-capable memory
-  // (confirmed: largest free DMA block measured at 10-15 bytes mid-session),
-  // and the SD-over-SPI driver requires DMA, so mounting later reliably
-  // fails with ESP_ERR_NO_MEM. All peripheral/display init is already done
-  // at this point, so this doesn't risk the earlier SPI-ordering crash.
-  // SD was already mounted+pinned right after display init (see above); reuse the
-  // captured result. This call would be a no-op anyway.
-  esp_err_t sd_premount_err = (esp_err_t)g_sd_premount_code;
-  {
-    // Surface the SD mount result on-device (DEBUG view) — no serial available.
-    char buf[64];
-    if (sd_premount_err == ESP_OK) {
-      snprintf(buf, sizeof(buf), "SD mounted (log ready)");
-    } else {
-      snprintf(buf, sizeof(buf), "SD mount FAIL %s", esp_err_to_name(sd_premount_err));
-    }
-    debug_log_line(buf);
-  }
+  // (SD was already mounted + pinned right after display init, above.)
 
   // --- Crash diagnostics (no-serial device: read these back off the SD) ---
   // Log the reason for the LAST boot — if audio crashed the device, this is
@@ -5296,21 +5202,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   menu_flash_tick();
   rx_flash_tick();
   apply_pending_sync();
-
-  // Surface the latest ADIF-to-SD write result in the DEBUG view (no serial).
-  // log_adif_entry() publishes plain ints from whatever task runs the callback;
-  // we render here on core0, where debug_log_line()'s vector is only touched.
-  {
-    static uint32_t s_adif_sd_seen = 0;
-    uint32_t seq = g_adif_sd_seq;
-    if (seq != s_adif_sd_seen) {
-      s_adif_sd_seen = seq;
-      char buf[64];
-      if (g_adif_sd_ok) snprintf(buf, sizeof(buf), "QSO->SD ok (#%u)", (unsigned)seq);
-      else              snprintf(buf, sizeof(buf), "QSO->SD FAIL code=%d", g_adif_sd_code);
-      debug_log_line(buf);
-    }
-  }
 
   // NOTE: TX scheduling now follows reference architecture:
   // 1. decode_monitor_results() sets g_qso_xmit flag after processing
