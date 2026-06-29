@@ -1,0 +1,13 @@
+{
+  "name": "CP705 — IC-705 WiFi FT8 (Cardputer ADV)",
+  "version": "2.1b",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "CP705_Merged_Auto.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
