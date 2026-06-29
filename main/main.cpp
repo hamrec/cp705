@@ -481,7 +481,7 @@ static std::vector<std::string> g_startup_lines = {
     " M/N/O: Menu",
     " Q/F/D: File",
     "      * * * * *     ",
-    "  Thanks to AG6AQ  "
+    "mini-ft8 port: KD3AN"
 };
 
 // Runtime latch: when true, we're still showing the startup screen. Either

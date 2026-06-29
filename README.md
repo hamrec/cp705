@@ -3,10 +3,13 @@
 > Built on **[Mini-FT8 by Wei, AG6AQ](https://github.com/wcheng95/Mini-FT8)** — with
 > deep gratitude. Please visit and star the original project.
 
-CP705 is a fork of Wei (AG6AQ)'s **[Mini-FT8](https://github.com/wcheng95/Mini-FT8)**,
-and it stands entirely on the shoulders of that work — Karlis Goba's [ft8_lib](https://github.com/kgoba/ft8_lib),
-the audio/DSP and autoseq foundation from Zhenxing (N6HAN), and the inspiration
-of the DX-FT8 team. **All credit for the original application belongs to them.**
+CP705 is a port by **Dean (KD3AN)** of Wei (AG6AQ)'s
+**[Mini-FT8](https://github.com/wcheng95/Mini-FT8)**, retargeting it to drive an
+Icom IC-705 entirely over WiFi. It stands on the shoulders of that work and the
+lineage behind it — Karlis Goba's [ft8_lib](https://github.com/kgoba/ft8_lib), the
+audio/DSP and autoseq foundation from Zhenxing (N6HAN), and the inspiration of the
+DX-FT8 team. **All credit for the original application belongs to them**; this fork
+only adapts it to a different radio and link.
 
 Where Mini-FT8 drives QMX/QDX/KH1 radios over a serial/USB-audio path, **CP705
 has a completely different aim**: it turns the Cardputer ADV into a *standalone
