@@ -481,15 +481,15 @@ static std::vector<std::string> g_startup_lines = {
     " M/N/O: Menu",
     " Q/F/D: File",
     "      * * * * *     ",
-    "  By N6HAN & AG6AQ "
+    "  Thanks to AG6AQ  "
 };
 
 // Runtime latch: when true, we're still showing the startup screen. Either
-// a keypress or the 3 s auto-dismiss timer (g_startup_start_ms) takes us
+// a keypress or the 5 s auto-dismiss timer (g_startup_start_ms) takes us
 // out.
 static bool    g_startup_active  = true;
 static int64_t g_startup_start_ms = 0;    // set on the first tick we see in the splash branch
-static constexpr int64_t kStartupAutoDismissMs = 3000;
+static constexpr int64_t kStartupAutoDismissMs = 5000;
 
 static bool is_startup_direct_mode_key(char c) {
   const char k = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
