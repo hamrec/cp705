@@ -106,12 +106,12 @@ transmit audio over three UDP ports.
 
 ```text
 ┌─────────────────────┐   WiFi (IC-705 is the Access Point)   ┌──────────────────┐
-│ IC-705              │  SSID broadcast, radio = 192.168.59.1 │ Cardputer ADV    │
+│ IC-705              │ SSID broadcast, radio = 192.168.59.1  │ Cardputer ADV    │
 │  WLAN AP + remote   │<─────────────────────────────────────>│  CP705 (client)  │
-│  server             │   UDP 50001 control  (login/CI-V auth) │                  │
-│                     │   UDP 50002 serial   (CI-V frames)     │                  │
-│                     │   UDP 50003 audio    (RX + TX PCM)     │                  │
-└─────────────────────┘                                        └──────────────────┘
+│  server             │   UDP 50001 control  (login/CI-V auth)│                  │
+│                     │   UDP 50002 serial   (CI-V frames)    │                  │
+│                     │   UDP 50003 audio    (RX + TX PCM)    │                  │
+└─────────────────────┘                                       └──────────────────┘
 ```
 
 - The **radio runs as the WiFi Access Point** (Connection Type = Access Point).
