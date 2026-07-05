@@ -476,7 +476,7 @@ static std::vector<std::string> g_msc_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** CP705 V2.1d **",
+    "** CP705 V2.1e **",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",
@@ -1132,22 +1132,36 @@ static void qso_draw_page() {
   }
 }
 
+// Unix ms (UTC) -> civil UTC date/time, timezone-independent (Howard Hinnant's
+// civil_from_days). Ported from TD705 — avoids relying on the ESP TZ defaulting
+// to UTC the way localtime_r() does, so ADIF QSO_DATE/TIME_ON are always correct.
+static void civil_from_ms(int64_t ms, int* Y, int* M, int* D, int* h, int* mi, int* s) {
+  int64_t days = ms / 86400000LL;
+  int64_t rem  = ms - days * 86400000LL;
+  if (rem < 0) { rem += 86400000LL; days -= 1; }
+  int64_t secs = rem / 1000;
+  *h = (int)(secs / 3600); *mi = (int)((secs / 60) % 60); *s = (int)(secs % 60);
+  int64_t z = days + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  int64_t doe = z - era * 146097;
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t y = yoe + era * 400;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int64_t mp = (5 * doy + 2) / 153;
+  int64_t d = doy - (153 * mp + 2) / 5 + 1;
+  int64_t m = mp < 10 ? mp + 3 : mp - 9;
+  *Y = (int)(y + (m <= 2)); *M = (int)m; *D = (int)d;
+}
+
 static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t;
-  localtime_r(&now, &t);
+  int year, month, day, hour, min, sec;
+  civil_from_ms(rtc_now_ms(), &year, &month, &day, &hour, &min, &sec);
   char date[16];
-  int year = t.tm_year + 1900;
-  int month = t.tm_mon + 1;
-  int day = t.tm_mday;
   snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
   char path[64];
   snprintf(path, sizeof(path), "%s.adi", date);  // ADIF file on the SD card
 
   char time_on[16];
-  int hour = t.tm_hour;
-  int min = t.tm_min;
-  int sec = t.tm_sec;
   snprintf(time_on, sizeof(time_on), "%02d%02d%02d", hour % 100, min % 100, sec % 100);
   double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
   char freq_str[16];
@@ -4309,18 +4323,32 @@ static bool nvs_load_adiflog(std::string& out) {
   return e == ESP_OK;
 }
 
-// Writes the accumulated NVS ADIF log to the SD card as YYYYMMDD.adi (today) in
-// one shot. Run this while idle (not decoding) — that's when the flaky SD writes
-// reliably succeed. Returns a short status string for on-screen feedback.
+// Writes the accumulated NVS ADIF log to the SD card in one shot, to a UNIQUE
+// per-export file YYYYMMDD_HHMMSS.adi (so re-exports never clobber a prior one),
+// then READS IT BACK and byte-verifies before reporting success — CP705's SD
+// writes are unreliable, so a returned-OK write isn't proof the file landed.
+// NVS is the durable store, so it is left intact (the SD file is a copy). Run
+// this while idle (not decoding), when the flaky SD writes reliably succeed.
 static std::string export_adiflog_to_sd() {
   std::string log;
   if (!nvs_load_adiflog(log) || log.empty()) return "No log yet";
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t; localtime_r(&now, &t);
+
+  int Y, M, D, h, mi, s;
+  civil_from_ms(rtc_now_ms(), &Y, &M, &D, &h, &mi, &s);
   char path[40];
-  snprintf(path, sizeof(path), "%04d%02d%02d.adi",
-           (t.tm_year + 1900) % 10000, (t.tm_mon + 1) % 100, t.tm_mday % 100);
-  return storage_sd_write_file(path, log) ? "Exported to SD" : "SD write failed";
+  snprintf(path, sizeof(path), "%04d%02d%02d_%02d%02d%02d.adi", Y, M, D, h, mi, s);
+
+  if (!storage_sd_write_file(path, log)) return "SD write failed";
+
+  // Verify: read the SD file back and byte-compare before trusting the export.
+  std::string back;
+  if (!storage_sd_read_file(path, back) || back != log) return "Verify FAILED";
+
+  int n = 0;  // count records exported (each QSO ends in <eor>)
+  for (size_t p = log.find("<eor>"); p != std::string::npos; p = log.find("<eor>", p + 5)) ++n;
+  char msg[40];
+  snprintf(msg, sizeof(msg), "Verified %d QSOs", n);
+  return msg;
 }
 
 static void split_into_lines(const std::string& content, std::vector<std::string>& lines) {

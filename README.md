@@ -287,7 +287,7 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 |  | `2` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report. |
 |  | `3` | Edit active bands (Long Edit). Used by STATUS -> Band. |
 |  | `4` | Toggle `GNSS_LoRa`. `OFF` uses PORTA GPS; `ON` uses the LoRa-1262 cap GNSS. |
-|  | `5` | Export Log to SD. Writes the NVS ADIF log to the card as `YYYYMMDD.adi`. Feedback: `Exported to SD` / `SD write failed` / `No log yet`. |
+|  | `5` | Export Log to SD. Writes the NVS ADIF log to a unique `YYYYMMDD_HHMMSS.adi`, then reads it back and byte-verifies it. Feedback: `Verified N QSOs` / `SD write failed` / `Verify FAILED` / `No log yet`. |
 |  | `6` | Edit max retry (in place). Accepts any natural number or `0`. |
 | `Q` (QSO) |  | Shows session QSO count and logging status. The full ADIF log lives in NVS / on the SD card (export via MENU P3 → `5`); the internal-flash file browser is unavailable on this board. |
 | `D` (Delete Files) | `1..6` | Delete the selected internal-flash file. Inert when there's no FATFS partition. |
@@ -307,10 +307,12 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 - **Getting the log off the device:**
   1. Insert a FAT/FAT32-formatted SD card.
   2. When idle (not decoding), open MENU P3 (`O`) and press `5` (**Export Log to
-     SD**). The full NVS log is written to the card as `YYYYMMDD.adi`.
-  3. On `Exported to SD`, pull the card and import the `.adi` into your logging
-     software. If it shows `SD write failed`, retry while the radio isn't actively
-     decoding.
+     SD**). The full NVS log is written to a unique `YYYYMMDD_HHMMSS.adi`, then
+     read back and byte-verified.
+  3. On `Verified N QSOs`, pull the card and import the `.adi` into your logging
+     software — the export is confirmed on the card. If it shows `SD write failed`
+     or `Verify FAILED`, retry while the radio isn't actively decoding. Your log
+     stays safe in NVS regardless.
 
 ## GPS Connections
 
