@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Install CP705 — IC-705 WiFi FT8 for the Cardputer</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+           max-width: 680px; margin: 0 auto; padding: 2rem 1.25rem; line-height: 1.55;
+           background: #0d1117; color: #e6edf3; }
+    h1 { margin-bottom: .25rem; }
+    .sub { color: #9da7b3; margin-top: 0; }
+    a { color: #58a6ff; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+            padding: 1.25rem 1.5rem; margin: 1.5rem 0; }
+    code { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: .1rem .35rem; }
+    ol { padding-left: 1.2rem; }
+    .note { color: #9da7b3; font-size: .92rem; }
+    esp-web-install-button { --esp-tools-button-color:#0d1117; --esp-tools-button-text-color:#e6edf3; }
+  </style>
+</head>
+<body>
+  <h1>CP705</h1>
+  <p class="sub">A self-contained <strong>IC-705 WiFi FT8</strong> client for the
+     M5Stack <strong>Cardputer ADV</strong> — no PC, no soundcard, no cables.</p>
+
+  <div class="card">
+    <h2>Install / Re-install</h2>
+    <p>Use <strong>Chrome or Edge on a desktop</strong>, plug the Cardputer in via USB, then:</p>
+    <p><esp-web-install-button manifest="manifest.json"></esp-web-install-button></p>
+    <p class="note">No toolchain needed — this flashes the firmware straight from your browser.
+       If the button is greyed out, your browser doesn't support Web Serial (try Chrome/Edge).</p>
+  </div>
+
+  <div class="card">
+    <h2>After flashing — set up your station</h2>
+    <ol>
+      <li><strong>Call &amp; grid:</strong> press <code>M</code> → <code>4</code> (Call), <code>5</code> (Grid).</li>
+      <li><strong>IC-705 link:</strong> press <code>O</code>, then <code>▼</code> to the WiFi page —
+          <code>1</code> SSID, <code>2</code> WiFi&nbsp;Pass, <code>3</code> Net&nbsp;User,
+          <code>4</code> Net&nbsp;Pass, <code>5</code> CI-V.</li>
+      <li><strong>Connect:</strong> press <code>S</code> → <code>2</code>.</li>
+    </ol>
+    <p class="note">Settings persist across reboots (stored in NVS). Full radio-side setup and the
+       operating manual are in the
+       <a href="https://github.com/hamrec/cp705#readme">README</a>.</p>
+  </div>
+
+  <p class="note">CP705 is a fork of
+     <a href="https://github.com/wcheng95/Mini-FT8">Mini-FT8 by Wei, AG6AQ</a> — with thanks.
+     Source: <a href="https://github.com/hamrec/cp705">github.com/hamrec/cp705</a>.</p>
+</body>
+</html>
