@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS "main.cpp"
          "autoseq.cpp"
+         "qso_log.cpp"
          "audio_source.cpp"
          "core_api.cpp"
          "gps.cpp"

@@ -25,6 +25,7 @@ extern "C" {
 #include "esp_freertos_hooks.h"
 #include "autoseq.h"
 #include "core_api.h"
+#include "qso_log.h"
 #include "core_api_internal.h"
 #include <M5Cardputer.h>
 #include <sstream>
@@ -476,7 +477,7 @@ static std::vector<std::string> g_msc_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** CP705 V2.1e **",
+    "** CP705 V2.3 **",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",
@@ -705,7 +706,8 @@ static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
 // Count of QSO records logged this session (shown in the QSO view). Incremented
 // by log_adif_entry(), which may run on the core1 decode task — plain int only.
 static volatile uint32_t g_adif_sd_seq  = 0;
-static bool storage_append_text_locked_path(const std::string& path,
+// Non-static: qso_log.cpp reuses this for its best-effort internal-flash copy.
+bool storage_append_text_locked_path(const std::string& path,
                                             const std::string& line,
                                             const std::string& header_if_new,
                                             bool sync_to_flash);
@@ -804,7 +806,7 @@ static inline void log_mem_caps(const char*) {}
 static bool log_cabrillo_fd_entry(const std::string&, const std::string&) { return true; }
 #endif
 
-static bool storage_append_text_locked_path(const std::string& path,
+bool storage_append_text_locked_path(const std::string& path,
                                              const std::string& line,
                                              const std::string& header_if_new,
                                              bool sync_to_flash) {
@@ -913,7 +915,6 @@ static const char* qso_storage_list_failure_text(StorageOwner owner) {
 
 static bool nvs_save_station(const std::string& content);  // defined below
 static bool nvs_load_station(std::string& out);            // defined below
-static void nvs_append_adif(const std::string& record, const char* header);  // defined below
 
 // One-line log status for the QSO view: number of QSO records logged this
 // session (each is written to NVS and best-effort to the SD card).
@@ -1132,80 +1133,23 @@ static void qso_draw_page() {
   }
 }
 
-// Unix ms (UTC) -> civil UTC date/time, timezone-independent (Howard Hinnant's
-// civil_from_days). Ported from TD705 — avoids relying on the ESP TZ defaulting
-// to UTC the way localtime_r() does, so ADIF QSO_DATE/TIME_ON are always correct.
-static void civil_from_ms(int64_t ms, int* Y, int* M, int* D, int* h, int* mi, int* s) {
-  int64_t days = ms / 86400000LL;
-  int64_t rem  = ms - days * 86400000LL;
-  if (rem < 0) { rem += 86400000LL; days -= 1; }
-  int64_t secs = rem / 1000;
-  *h = (int)(secs / 3600); *mi = (int)((secs / 60) % 60); *s = (int)(secs % 60);
-  int64_t z = days + 719468;
-  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-  int64_t doe = z - era * 146097;
-  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  int64_t y = yoe + era * 400;
-  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-  int64_t mp = (5 * doy + 2) / 153;
-  int64_t d = doy - (153 * mp + 2) / 5 + 1;
-  int64_t m = mp < 10 ? mp + 3 : mp - 9;
-  *Y = (int)(y + (m <= 2)); *M = (int)m; *D = (int)d;
-}
-
+// Autoseq's log callback: gather live station/band state into a QsoLogRecord and
+// hand it to the qso_log module (ADIF formatting + durable NVS + SD/flash live
+// there now). May run on the core1 decode task — record assembly only touches
+// globals that are set once at startup / on band change.
 static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
-  int year, month, day, hour, min, sec;
-  civil_from_ms(rtc_now_ms(), &year, &month, &day, &hour, &min, &sec);
-  char date[16];
-  snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
-  char path[64];
-  snprintf(path, sizeof(path), "%s.adi", date);  // ADIF file on the SD card
-
-  char time_on[16];
-  snprintf(time_on, sizeof(time_on), "%02d%02d%02d", hour % 100, min % 100, sec % 100);
-  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
-  char freq_str[16];
-  snprintf(freq_str, sizeof(freq_str), "%.3f", freq_mhz);
-
-  std::string comment_expanded = expand_comment_macros(g_comment1);
-  const std::string my_grid4 = grid_ft8_4(g_grid);
-  // Build rst_sent/rst_rcvd fragments — omit when -99 (no data),
-  // matching DXFT8 reference behavior (ADIF.c omits when value is 0).
-  char rst_sent_buf[32] = "";
-  char rst_rcvd_buf[32] = "";
-  if (rst_sent != -99) {
-    snprintf(rst_sent_buf, sizeof(rst_sent_buf), "<rst_sent:%d>%d ",
-             (int)snprintf(nullptr, 0, "%d", rst_sent), rst_sent);
-  }
-  if (rst_rcvd != -99) {
-    snprintf(rst_rcvd_buf, sizeof(rst_rcvd_buf), "<rst_rcvd:%d>%d ",
-             (int)snprintf(nullptr, 0, "%d", rst_rcvd), rst_rcvd);
-  }
-  const char* mode_name = g_protocol->name;
-  char line[512];
-  snprintf(line, sizeof(line),
-           "<call:%zu>%s <gridsquare:%zu>%s <mode:%zu>%s<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s %s%s<comment:%zu>%s <eor>\n",
-           dxcall.size(), dxcall.c_str(),
-           dxgrid.size(), dxgrid.c_str(),
-           strlen(mode_name), mode_name,
-           date, time_on,
-           strlen(freq_str), freq_str,
-           g_call.size(), g_call.c_str(),
-           my_grid4.size(), my_grid4.c_str(),
-           rst_sent_buf, rst_rcvd_buf,
-           comment_expanded.size(), comment_expanded.c_str());
-  static const char* const kAdifHeader =
-      "CP705 ADIF export\n<adif_ver:5>3.1.4\n<programid:5>CP705\n<eoh>\n";
-  // (1) PRIMARY: NVS — always available on this board (SD writes fail at the
-  // driver level and there's no FATFS partition). The day's ADIF log is kept as
-  // a bounded blob; this is the copy that reliably survives.
-  nvs_append_adif(line, kAdifHeader);
-  // (2) SECONDARY (best-effort): the SD card as YYYYMMDD.adi — when SD writes
-  // succeed, this is the importable file the operator pulls after an activation.
-  bool sd_ok = storage_sd_append_with_header(path, line, kAdifHeader);
-  if (!sd_ok) ESP_LOGW(TAG, "ADIF SD write failed (%s): code=%d", path, g_storage_sd_log_last_code);
-  // (3) Internal flash, best-effort (only if a FATFS partition is present).
-  (void)storage_append_text_locked_path(path, line, kAdifHeader, true);
+  QsoLogRecord r;
+  r.dxcall   = dxcall;
+  r.dxgrid   = dxgrid;
+  r.rst_sent = rst_sent;
+  r.rst_rcvd = rst_rcvd;
+  r.freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
+  r.mode     = g_protocol->name;
+  r.mycall   = g_call;
+  r.mygrid   = grid_ft8_4(g_grid);
+  r.comment  = expand_comment_macros(g_comment1);
+  r.utc_ms   = rtc_now_ms();
+  qso_log_write(r);
   g_adif_sd_seq++;   // QSO count for the on-screen status
   return true;       // NVS write makes the record durable; never force a retry
 }
@@ -2829,15 +2773,6 @@ static int dec_sort_cmp(const void* a, const void* b) {
 }
 
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui) {
-  // ---- heap instrumentation ----
-  size_t heap_entry = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-  size_t heap_entry_largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  UBaseType_t stack_hw_entry = uxTaskGetStackHighWaterMark(NULL);
-  ESP_LOGW(TAG, "DECODE_HEAP ENTER: free=%u largest=%u alltime_min=%u stack_hw=%u",
-           (unsigned)heap_entry, (unsigned)heap_entry_largest,
-           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
-           (unsigned)stack_hw_entry);
-
   s_dec_count = 0;
 
   // Candidate cap. Lowered 50→24 to keep the per-slot decode under the ~2.15s
@@ -3108,18 +3043,6 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     debug_log_line(buf);
   } else {
     core_fire_rx_changed();
-  }
-
-  // ---- heap instrumentation (exit) ----
-  {
-    size_t heap_exit = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    size_t heap_exit_largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    UBaseType_t stack_hw_exit = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGW(TAG, "DECODE_HEAP EXIT: free=%u largest=%u alltime_min=%u stack_hw=%u (delta_free=%d)",
-             (unsigned)heap_exit, (unsigned)heap_exit_largest,
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
-             (unsigned)stack_hw_exit,
-             (int)heap_exit - (int)heap_entry);
   }
 
   // Mark this slot's decode as fully applied BEFORE clearing the in-progress
@@ -3487,7 +3410,7 @@ static void draw_menu_view() {
   if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
     lines.push_back(menu_copy_feedback_text);
   } else {
-    lines.push_back("Export Log to SD");
+    lines.push_back("End+Export Log SD");
   }
   if (menu_edit_idx == 17) {
     lines.push_back(std::string("Max Retry:") + menu_edit_buf);
@@ -4278,78 +4201,7 @@ static bool nvs_load_station(std::string& out) {
   return e == ESP_OK;
 }
 
-// Appends one ADIF record to the day's log blob in NVS (key "adiflog"). The blob
-// is bounded (kAdifNvsCap) by dropping whole oldest records from the front, so a
-// long session can't starve the config in NVS; the SD card keeps the full log.
-// May be called from the core1 decode task — NVS has its own internal locking.
-static void nvs_append_adif(const std::string& record, const char* header) {
-  static const size_t kAdifNvsCap = 8192;
-  nvs_handle_t h;
-  if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return;
-  std::string log;
-  size_t len = 0;
-  if (nvs_get_blob(h, "adiflog", nullptr, &len) == ESP_OK && len > 0) {
-    log.resize(len);
-    if (nvs_get_blob(h, "adiflog", &log[0], &len) != ESP_OK) log.clear();
-  }
-  const std::string hdr = (header && log.empty()) ? header : "";
-  if (!hdr.empty()) log = hdr;
-  log += record;
-  if (log.size() > kAdifNvsCap) {
-    const size_t hdr_len = header ? strlen(header) : 0;
-    std::string body = log.substr(hdr_len);
-    while (body.size() > kAdifNvsCap - hdr_len) {
-      size_t eor = body.find("<eor>\n");
-      if (eor == std::string::npos) { body.clear(); break; }
-      body.erase(0, eor + 6);
-    }
-    log = (header ? std::string(header) : std::string()) + body;
-  }
-  if (nvs_set_blob(h, "adiflog", log.data(), log.size()) == ESP_OK) {
-    nvs_commit(h);
-  }
-  nvs_close(h);
-}
-
-static bool nvs_load_adiflog(std::string& out) {
-  out.clear();
-  nvs_handle_t h;
-  if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return false;
-  size_t len = 0;
-  if (nvs_get_blob(h, "adiflog", nullptr, &len) != ESP_OK || len == 0) { nvs_close(h); return false; }
-  out.resize(len);
-  esp_err_t e = nvs_get_blob(h, "adiflog", &out[0], &len);
-  nvs_close(h);
-  return e == ESP_OK;
-}
-
-// Writes the accumulated NVS ADIF log to the SD card in one shot, to a UNIQUE
-// per-export file YYYYMMDD_HHMMSS.adi (so re-exports never clobber a prior one),
-// then READS IT BACK and byte-verifies before reporting success — CP705's SD
-// writes are unreliable, so a returned-OK write isn't proof the file landed.
-// NVS is the durable store, so it is left intact (the SD file is a copy). Run
-// this while idle (not decoding), when the flaky SD writes reliably succeed.
-static std::string export_adiflog_to_sd() {
-  std::string log;
-  if (!nvs_load_adiflog(log) || log.empty()) return "No log yet";
-
-  int Y, M, D, h, mi, s;
-  civil_from_ms(rtc_now_ms(), &Y, &M, &D, &h, &mi, &s);
-  char path[40];
-  snprintf(path, sizeof(path), "%04d%02d%02d_%02d%02d%02d.adi", Y, M, D, h, mi, s);
-
-  if (!storage_sd_write_file(path, log)) return "SD write failed";
-
-  // Verify: read the SD file back and byte-compare before trusting the export.
-  std::string back;
-  if (!storage_sd_read_file(path, back) || back != log) return "Verify FAILED";
-
-  int n = 0;  // count records exported (each QSO ends in <eor>)
-  for (size_t p = log.find("<eor>"); p != std::string::npos; p = log.find("<eor>", p + 5)) ++n;
-  char msg[40];
-  snprintf(msg, sizeof(msg), "Verified %d QSOs", n);
-  return msg;
-}
+// ADIF logging (NVS store + verified SD export) now lives in qso_log.cpp.
 
 static void split_into_lines(const std::string& content, std::vector<std::string>& lines) {
   size_t start = 0;
@@ -4785,6 +4637,45 @@ static bool g_ic705_manual_disconnect = false;
 static int g_ic705_auto_attempts = 0;
 static TickType_t g_ic705_last_auto_attempt = 0;
 
+// End-of-session SD export. The SD card mounts over SPI, which needs DMA-capable
+// heap — and during operation WiFi + audio streaming + FT8 decode starve that
+// pool, so the mount fails with 0x108 (ESP_ERR_INVALID_RESPONSE) and the export
+// "fails" even though the QSOs are safe in NVS. The fix is to tear the whole
+// radio stack DOWN first (stop audio/decode, release the radio session, drop
+// WiFi), freeing that DMA memory, and only THEN mount + write the card. This is
+// a one-way "I'm done operating, get my log off" action: reconnect needs a '2'
+// press (or reboot). Returns the human result; also logs DMA headroom so we can
+// see the teardown actually helped.
+static std::string end_session_export_to_sd() {
+  const size_t dma_before = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+
+  // Full quiesce, mirroring the graceful-disconnect path (STATUS key 7).
+  audio_source_stop();                 // stop RX/TX audio + decode tasks
+  if (canonical_radio_type(g_radio) == RadioType::IC705) {
+    g_ic705_manual_disconnect = true;  // stay disconnected (no auto-reconnect)
+    ic705_cat_disconnect();            // release the radio's network session
+  }
+  ic705_stream_stop();                 // stop the WiFi audio stream task
+  wifi_mgr_stop();                     // drop WiFi — the biggest DMA/heap holder
+  g_streaming = false;
+  vTaskDelay(pdMS_TO_TICKS(600));      // let the tasks unwind and free buffers
+
+  const size_t dma_after = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+  std::string result = qso_log_export_to_sd(rtc_now_ms());
+  // On failure show a SHORT line so the full error code fits the narrow display:
+  // "SDfail c<code>" (2+esp_err = mount fail, -6 = EIO write, -1-errno = open).
+  if (result.find("Verified") == std::string::npos) {
+    result = "SDfail c" + std::to_string(g_storage_sd_log_last_code);
+  }
+
+  ESP_LOGW(TAG, "END-SESSION EXPORT: DMA largest %uK -> %uK, sd_code=%d, result=%s",
+           (unsigned)(dma_before / 1024), (unsigned)(dma_after / 1024),
+           g_storage_sd_log_last_code, result.c_str());
+  debug_log_line(std::string("Export: ") + result +
+                 " DMA" + std::to_string(dma_after / 1024) + "K");
+  return result;
+}
+
 static void auto_advance_ic705_connect() {
   if (canonical_radio_type(g_radio) != RadioType::IC705) return;
   if (g_ic705_manual_disconnect) return;   // user asked to stay disconnected
@@ -4976,6 +4867,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
+  // Seed the on-screen QSO counter from the durable NVS log so it reflects the
+  // real logged count instead of resetting to 0 on every power-on.
+  g_adif_sd_seq = (uint32_t)qso_log_count_nvs();
   apply_debug_uart_pin_policy();
   apply_radio_profile_binding();
   update_autoseq_cq_type();
@@ -5957,7 +5851,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               } else if (c == '5') {
                 // Export the accumulated NVS ADIF log to the SD card (YYYYMMDD.adi)
                 // in one shot. Best done while idle — that's when SD writes work.
-                menu_copy_feedback_text = export_adiflog_to_sd();
+                menu_copy_feedback_text = end_session_export_to_sd();
                 menu_flash_idx = 16; // abs index of page 2 line 5
                 menu_flash_deadline = rtc_now_ms() + 500;
                 if (menu_copy_feedback_text.size() > 19) {

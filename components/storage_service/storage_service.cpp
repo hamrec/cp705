@@ -36,6 +36,17 @@ constexpr gpio_num_t kSdMiso = GPIO_NUM_39;
 constexpr gpio_num_t kSdMosi = GPIO_NUM_14;
 constexpr gpio_num_t kSdClock = GPIO_NUM_40;
 constexpr gpio_num_t kSdChipSelect = GPIO_NUM_12;
+// The M5Stack LoRa-1262 cap's SPI (SX1262) shares this EXACT bus with the SD
+// card — MOSI14/MISO39/CLK40 are identical on both, per M5Stack's own pinout
+// (LoRa NSS=G5, IRQ=G4, RST=G3, BUSY=G6). If the cap's NSS is left floating
+// while the SD card is addressed on its own CS (G12), the SX1262 can respond
+// on the shared MISO/CLK lines and corrupt the SD command/response — this was
+// root-caused as the actual cause of persistent SD WRITE failures (0x108) that
+// reproduced across multiple different, known-good cards. Root-caused 2026-07:
+// removing the physical cap made writes succeed immediately. Fix: park NSS
+// high (deasserted) before every SD bus access, exactly as TD705 already does
+// for its own LoRa cap CS — see qso_log.cpp on that project.
+constexpr gpio_num_t kLoraCapCs = GPIO_NUM_5;
 
 const char* TAG = "storage_service";
 
@@ -188,6 +199,11 @@ esp_err_t mount_sd_locked() {
         return ESP_OK;
     }
 
+    // Park the LoRa-1262 cap's NSS high (deasserted) before touching the shared
+    // SPI bus — see kLoraCapCs above. Harmless if no cap is installed.
+    gpio_set_direction(kLoraCapCs, GPIO_MODE_OUTPUT);
+    gpio_set_level(kLoraCapCs, 1);
+
     spi_bus_config_t bus_config = {};
     bus_config.mosi_io_num = kSdMosi;
     bus_config.miso_io_num = kSdMiso;
@@ -222,10 +238,11 @@ esp_err_t mount_sd_locked() {
     mount_config.allocation_unit_size = 16 * 1024;
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    // Writes were failing with EIO (FR_DISK_ERR) while reads worked at 5 MHz.
-    // Drop to a conservative clock so directory/data writes are reliable; tiny
-    // config/log writes don't need speed. Raise later if proven solid.
+    // A conservative clock + generous command timeout, kept even after the real
+    // write-corruption cause (the LoRa cap's floating CS, see kLoraCapCs above)
+    // was fixed — cheap insurance against a marginal card/cable.
     host.max_freq_khz = 400;
+    host.command_timeout_ms = 5000;
     for (int attempt = 0; attempt < 4; ++attempt) {
         err = esp_vfs_fat_sdspi_mount(kSdBasePath, &host, &slot_config, &mount_config, &s_sd_card);
         if (err == ESP_OK) break;
@@ -239,6 +256,13 @@ esp_err_t mount_sd_locked() {
     }
 
     s_sd_mounted = true;
+
+    // Internal pull-ups on the SD lines, applied AFTER the mount (the mount's
+    // own pin setup would otherwise wipe them). Belt-and-suspenders alongside
+    // the LoRa cap CS parking above — must come after the mount, not before.
+    gpio_set_pull_mode(kSdMiso, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(kSdMosi, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode(kSdChipSelect, GPIO_PULLUP_ONLY);
     return ESP_OK;
 }
 
@@ -362,13 +386,24 @@ bool storage_sd_write_file(const std::string& name, const std::string& content) 
         return false;
     }
     const std::string path = std::string(kSdBasePath) + "/" + name;
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) { g_storage_sd_log_last_code = -1 - errno; return false; }
-    const bool ok = content.empty() ||
-                    fwrite(content.data(), 1, content.size(), f) == content.size();
-    sync_file(f);  // flush data + FAT/dir entry so it survives a card pull
-    fclose(f);
-    g_storage_sd_log_last_code = ok ? 0 : -2;
+    // Marginal cards NAK the first write command(s) with 0x108/EIO but often take
+    // a subsequent attempt — retry the whole open+write+flush a few times before
+    // giving up. Verify the flush too (fflush surfaces the deferred sector-write
+    // error that fwrite's buffering hides).
+    bool ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+        if (attempt) vTaskDelay(pdMS_TO_TICKS(120));
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) { g_storage_sd_log_last_code = -1 - errno; continue; }
+        bool wrote = content.empty() ||
+                     fwrite(content.data(), 1, content.size(), f) == content.size();
+        if (wrote && fflush(f) != 0) wrote = false;  // catch deferred write EIO
+        sync_file(f);  // flush data + FAT/dir entry so it survives a card pull
+        if (fclose(f) != 0) wrote = false;
+        ok = wrote;
+        if (!ok) g_storage_sd_log_last_code = -2;
+    }
+    if (ok) g_storage_sd_log_last_code = 0;
     return ok;
 }
 

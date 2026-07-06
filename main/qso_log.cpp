@@ -1,0 +1,178 @@
+// qso_log — durable ADIF QSO logging for CP705. See qso_log.h.
+
+#include "qso_log.h"
+
+#include <cstdio>
+#include <cstring>
+
+#include "esp_log.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+
+#include "storage_service.h"
+
+// Best-effort internal-flash append, defined in main.cpp (no-op on this board,
+// which has no FATFS partition, but kept so behavior is identical to before).
+bool storage_append_text_locked_path(const std::string& path,
+                                     const std::string& line,
+                                     const std::string& header_if_new,
+                                     bool sync_to_flash);
+
+static const char* TAG = "QSOLOG";
+
+// NVS namespace shared with the rest of CP705 (config lives here too).
+static const char* kNvsNamespace = "cp705";
+
+// ADIF file header, written once at the top of a fresh log.
+static const char* const kAdifHeader =
+    "CP705 ADIF export\n<adif_ver:5>3.1.4\n<programid:5>CP705\n<eoh>\n";
+
+// Unix ms (UTC) -> civil UTC date/time, timezone-independent (Howard Hinnant's
+// civil_from_days). Avoids relying on the ESP TZ defaulting to UTC the way
+// localtime_r() does, so ADIF QSO_DATE/TIME_ON are always correct.
+static void civil_from_ms(int64_t ms, int* Y, int* M, int* D, int* h, int* mi, int* s) {
+  int64_t days = ms / 86400000LL;
+  int64_t rem  = ms - days * 86400000LL;
+  if (rem < 0) { rem += 86400000LL; days -= 1; }
+  int64_t secs = rem / 1000;
+  *h = (int)(secs / 3600); *mi = (int)((secs / 60) % 60); *s = (int)(secs % 60);
+  int64_t z = days + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  int64_t doe = z - era * 146097;
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t y = yoe + era * 400;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int64_t mp = (5 * doy + 2) / 153;
+  int64_t d = doy - (153 * mp + 2) / 5 + 1;
+  int64_t m = mp < 10 ? mp + 3 : mp - 9;
+  *Y = (int)(y + (m <= 2)); *M = (int)m; *D = (int)d;
+}
+
+// Appends one ADIF record to the day's log blob in NVS (key "adiflog"). The blob
+// is bounded (kAdifNvsCap) by dropping whole oldest records from the front, so a
+// long session can't starve the config in NVS; the SD card keeps the full log.
+// May be called from the core1 decode task — NVS has its own internal locking.
+static void nvs_append_adif(const std::string& record, const char* header) {
+  static const size_t kAdifNvsCap = 8192;
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return;
+  std::string log;
+  size_t len = 0;
+  if (nvs_get_blob(h, "adiflog", nullptr, &len) == ESP_OK && len > 0) {
+    log.resize(len);
+    if (nvs_get_blob(h, "adiflog", &log[0], &len) != ESP_OK) log.clear();
+  }
+  const std::string hdr = (header && log.empty()) ? header : "";
+  if (!hdr.empty()) log = hdr;
+  log += record;
+  if (log.size() > kAdifNvsCap) {
+    const size_t hdr_len = header ? strlen(header) : 0;
+    std::string body = log.substr(hdr_len);
+    while (body.size() > kAdifNvsCap - hdr_len) {
+      size_t eor = body.find("<eor>\n");
+      if (eor == std::string::npos) { body.clear(); break; }
+      body.erase(0, eor + 6);
+    }
+    log = (header ? std::string(header) : std::string()) + body;
+  }
+  if (nvs_set_blob(h, "adiflog", log.data(), log.size()) == ESP_OK) {
+    nvs_commit(h);
+  }
+  nvs_close(h);
+}
+
+bool qso_log_write(const QsoLogRecord& r) {
+  int year, month, day, hour, min, sec;
+  civil_from_ms(r.utc_ms, &year, &month, &day, &hour, &min, &sec);
+  char date[16];
+  snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
+  char path[64];
+  snprintf(path, sizeof(path), "%s.adi", date);  // ADIF file on the SD card
+
+  char time_on[16];
+  snprintf(time_on, sizeof(time_on), "%02d%02d%02d", hour % 100, min % 100, sec % 100);
+  char freq_str[16];
+  snprintf(freq_str, sizeof(freq_str), "%.3f", r.freq_mhz);
+
+  // Build rst_sent/rst_rcvd fragments — omit when -99 (no data),
+  // matching DXFT8 reference behavior (ADIF.c omits when value is 0).
+  char rst_sent_buf[32] = "";
+  char rst_rcvd_buf[32] = "";
+  if (r.rst_sent != -99) {
+    snprintf(rst_sent_buf, sizeof(rst_sent_buf), "<rst_sent:%d>%d ",
+             (int)snprintf(nullptr, 0, "%d", r.rst_sent), r.rst_sent);
+  }
+  if (r.rst_rcvd != -99) {
+    snprintf(rst_rcvd_buf, sizeof(rst_rcvd_buf), "<rst_rcvd:%d>%d ",
+             (int)snprintf(nullptr, 0, "%d", r.rst_rcvd), r.rst_rcvd);
+  }
+  char line[512];
+  snprintf(line, sizeof(line),
+           "<call:%zu>%s <gridsquare:%zu>%s <mode:%zu>%s<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s %s%s<comment:%zu>%s <eor>\n",
+           r.dxcall.size(), r.dxcall.c_str(),
+           r.dxgrid.size(), r.dxgrid.c_str(),
+           r.mode.size(), r.mode.c_str(),
+           date, time_on,
+           strlen(freq_str), freq_str,
+           r.mycall.size(), r.mycall.c_str(),
+           r.mygrid.size(), r.mygrid.c_str(),
+           rst_sent_buf, rst_rcvd_buf,
+           r.comment.size(), r.comment.c_str());
+
+  // (1) PRIMARY: NVS — always available on this board (SD writes fail at the
+  // driver level and there's no FATFS partition). The day's ADIF log is kept as
+  // a bounded blob; this is the copy that reliably survives.
+  nvs_append_adif(line, kAdifHeader);
+  // (2) SECONDARY (best-effort): the SD card as YYYYMMDD.adi — when SD writes
+  // succeed, this is the importable file the operator pulls after an activation.
+  bool sd_ok = storage_sd_append_with_header(path, line, kAdifHeader);
+  if (!sd_ok) ESP_LOGW(TAG, "ADIF SD write failed (%s): code=%d", path, g_storage_sd_log_last_code);
+  // (3) Internal flash, best-effort (only if a FATFS partition is present).
+  (void)storage_append_text_locked_path(path, line, kAdifHeader, true);
+  return true;       // NVS write makes the record durable; never force a retry
+}
+
+bool qso_log_load_nvs(std::string& out) {
+  out.clear();
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t len = 0;
+  if (nvs_get_blob(h, "adiflog", nullptr, &len) != ESP_OK || len == 0) { nvs_close(h); return false; }
+  out.resize(len);
+  esp_err_t e = nvs_get_blob(h, "adiflog", &out[0], &len);
+  nvs_close(h);
+  return e == ESP_OK;
+}
+
+int qso_log_count_nvs() {
+  std::string log;
+  if (!qso_log_load_nvs(log) || log.empty()) return 0;
+  int n = 0;
+  for (size_t p = log.find("<eor>"); p != std::string::npos; p = log.find("<eor>", p + 5)) ++n;
+  return n;
+}
+
+std::string qso_log_export_to_sd(int64_t utc_ms) {
+  std::string log;
+  if (!qso_log_load_nvs(log) || log.empty()) return "No log yet";
+
+  int Y, M, D, h, mi, s;
+  civil_from_ms(utc_ms, &Y, &M, &D, &h, &mi, &s);
+  // FATFS long-filename support is disabled (CONFIG_FATFS_LFN_NONE), so the file
+  // name MUST fit classic 8.3 or fopen() fails with EINVAL. MMDDHHMM.adi is 8.3,
+  // preserves the date+time, and stays unique per minute — enough for exports.
+  char path[16];
+  snprintf(path, sizeof(path), "%02d%02d%02d%02d.adi", M, D, h, mi);
+
+  if (!storage_sd_write_file(path, log)) return "SD write failed";
+
+  // Verify: read the SD file back and byte-compare before trusting the export.
+  std::string back;
+  if (!storage_sd_read_file(path, back) || back != log) return "Verify FAILED";
+
+  int n = 0;  // count records exported (each QSO ends in <eor>)
+  for (size_t p = log.find("<eor>"); p != std::string::npos; p = log.find("<eor>", p + 5)) ++n;
+  char msg[40];
+  snprintf(msg, sizeof(msg), "Verified %d QSOs", n);
+  return msg;
+}

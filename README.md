@@ -67,12 +67,18 @@ IC-705 WiFi/network settings (`O`, then page down). Settings persist in NVS. See
   TX aggregation got delivery clean.
 - **CI-V quirks** — fixing an unintended filter clobber and adding handshake
   retries so CAT control comes up reliably.
-- **Reliable config + log storage on a board with no usable filesystem** — this
-  unit has no internal FATFS partition and its SD card accepts reads but fails
-  writes at the driver level, so station settings and the ADIF QSO log are stored
-  in **NVS** (non-volatile flash key/value store), which survives power-off. The
-  log is also written best-effort to the SD card, and can be exported to the card
-  on demand in one shot.
+- **Reliable config + log storage on a board with no internal FATFS partition** —
+  station settings and the ADIF QSO log are stored in **NVS** (non-volatile
+  flash key/value store), which survives power-off and never depends on the SD
+  card at all. The log can also be exported to the SD card on demand, byte-verified
+  after writing.
+- **SD card writes silently corrupted by the LoRa-1262 cap** — the cap's SPI bus
+  (MOSI/MISO/SCK) is identical to the SD card's, and its chip-select was left
+  floating, letting the SX1262 radio interfere with SD write commands even
+  though reads worked fine — reproduced identically across multiple different,
+  known-good cards, so it looked exactly like a bad card or a driver bug until
+  the shared bus was the actual culprit. Fixed by parking the cap's CS (`G5`)
+  high before every SD access. See **Logging and Download** below.
 
 ## New features and menu changes (vs. Mini-FT8)
 
@@ -298,21 +304,36 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 ## Logging and Download
 
 - **Where the log lives:** every completed QSO is appended to an ADIF log held in
-  **NVS** (non-volatile flash), so it survives power-off. It is also written
-  best-effort to the SD card as `YYYYMMDD.adi`. Station settings persist in NVS
-  the same way.
-- **Why NVS:** on this board there is no internal FATFS partition, and the SD
-  card reads fine but its writes fail intermittently at the driver level under
-  load — so NVS is the reliable store and the SD card is a convenience copy.
+  **NVS** (non-volatile flash), so it survives power-off, reflashing, and even a
+  full firmware reinstall. It is also written best-effort to the SD card as
+  `YYYYMMDD.adi`. Station settings persist in NVS the same way.
+- **Why NVS:** on this board there is no internal FATFS partition, so NVS is the
+  primary, always-available store; the SD card is a convenience copy for pulling
+  your log off the device.
 - **Getting the log off the device:**
   1. Insert a FAT/FAT32-formatted SD card.
-  2. When idle (not decoding), open MENU P3 (`O`) and press `5` (**Export Log to
-     SD**). The full NVS log is written to a unique `YYYYMMDD_HHMMSS.adi`, then
-     read back and byte-verified.
+  2. Open MENU P3 (`O`) and press `5` (**End+Export Log SD**). This is a
+     **one-way, end-of-session action**: it stops RX/TX, releases the IC-705
+     connection, and drops WiFi before writing the card (press `2` to reconnect
+     afterward, or reboot). The full NVS log is written to a unique
+     `MMDDHHMM.adi` file, then read back and byte-verified.
   3. On `Verified N QSOs`, pull the card and import the `.adi` into your logging
-     software — the export is confirmed on the card. If it shows `SD write failed`
-     or `Verify FAILED`, retry while the radio isn't actively decoding. Your log
-     stays safe in NVS regardless.
+     software. Your log stays safe in NVS regardless of the SD result, so a
+     failed export never loses a QSO — just retry the export.
+
+### If SD export fails with the LoRa-1262 cap installed
+
+The M5Stack **LoRa-1262 cap** (used here for GNSS, see below) shares its SPI bus
+with the SD card slot — both use MOSI `G14` / MISO `G39` / SCK `G40`. If the
+cap's own chip-select (`G5`, NSS) isn't held deasserted while the SD card is
+being written, the SX1262 radio can respond on the shared bus and corrupt the
+SD write, even though **reads still work fine** and the card itself is not at
+fault (this reproduces identically across different, known-good cards). CP705
+parks the cap's NSS pin high before every SD access specifically to prevent
+this, so exporting should work with the cap installed. If you ever build a
+custom variant without that fix (or add other SPI peripherals to the same
+header), and SD writes fail while reads succeed, check this first before
+suspecting the card.
 
 ## GPS Connections
 
