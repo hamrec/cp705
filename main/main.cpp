@@ -477,7 +477,7 @@ static std::vector<std::string> g_msc_lines = {
 };
 
 static std::vector<std::string> g_startup_lines = {
-    "** CP705 V2.3 **",
+    "** CP705 V2.4 **",
     " S/R/T: Operate",
     " M/N/O: Menu",
     " Q/F/D: File",
@@ -532,6 +532,16 @@ static bool g_q_entries_have_next_page = false;
 static bool g_q_show_entries = false;
 static int q_page = 0;
 static std::string g_q_current_file;
+// "Clear QSO log" is a normal numbered row in the QSO file list (its digit
+// re-purposed as a confirm button): pressing its number arms a 2-step confirm
+// for wiping the NVS QSO log (e.g. starting fresh between POTA activations),
+// pressing the SAME number again within kQClearArmMs actually clears it.
+static bool g_q_clear_armed = false;
+static int64_t g_q_clear_arm_deadline = 0;
+static std::string g_q_clear_feedback;
+static int64_t g_q_clear_feedback_deadline = 0;
+static int g_q_clear_row_idx = -1;  // absolute index of the clear-log row in g_q_lines
+constexpr int64_t kQClearArmMs = 3000;
 static std::vector<std::string> g_d_lines;
 static std::vector<std::string> g_d_files;
 static int d_page = 0;
@@ -917,11 +927,30 @@ static bool nvs_save_station(const std::string& content);  // defined below
 static bool nvs_load_station(std::string& out);            // defined below
 
 // One-line log status for the QSO view: number of QSO records logged this
-// session (each is written to NVS and best-effort to the SD card).
+// session (each is written to NVS and best-effort to the SD card). Swaps in
+// the clear-log result feedback in the same row when active, so the confirm
+// flow doesn't shift the rest of the screen layout.
 static std::string sd_log_status_line() {
+  const int64_t now = rtc_now_ms();
+  if (!g_q_clear_feedback.empty() && now < g_q_clear_feedback_deadline) {
+    return g_q_clear_feedback;
+  }
   char sd[40];
   snprintf(sd, sizeof(sd), "Log NVS+SD  QSOs:%u", (unsigned)g_adif_sd_seq);
   return sd;
+}
+
+// Label for the numbered "Clear QSO log" row. `row_idx` is this row's 0-based
+// absolute position in g_q_lines (== the digit key that selects it, 1-based);
+// while armed it prompts to press that same digit again to confirm.
+static std::string clear_log_row_label(int row_idx) {
+  const int64_t now = rtc_now_ms();
+  if (g_q_clear_armed && now < g_q_clear_arm_deadline) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Press %d again: confirm", row_idx + 1);
+    return buf;
+  }
+  return "Clear QSO log";
 }
 
 static void qso_load_file_list() {
@@ -936,6 +965,8 @@ static void qso_load_file_list() {
     // NVS — pull the card to import them.
     g_q_lines.push_back("QSO log on SD card");
     g_q_lines.push_back(sd_log_status_line());
+    g_q_clear_row_idx = (int)g_q_lines.size();
+    g_q_lines.push_back(clear_log_row_label(g_q_clear_row_idx));
     return;
   }
   for (const auto& name : files) {
@@ -952,6 +983,8 @@ static void qso_load_file_list() {
   if (g_q_files.empty()) {
     g_q_lines.push_back("No YYYYMMDD.txt");
     g_q_lines.push_back(sd_log_status_line());
+    g_q_clear_row_idx = (int)g_q_lines.size();
+    g_q_lines.push_back(clear_log_row_label(g_q_clear_row_idx));
     return;
   }
   // File rows first so g_q_lines[i] stays aligned with g_q_files[i] for numbered
@@ -2525,6 +2558,23 @@ static void rx_flash_tick() {
     if (ui_mode == UIMode::RX) {
       ui_draw_rx();
     }
+  }
+}
+
+// Auto-revert the QSO screen's "Press N again: confirm" arm prompt (on the
+// Clear QSO log row) and the "Log cleared" feedback (on the status row) back
+// to normal once their window lapses, so a stale prompt doesn't linger without
+// a keypress to refresh it.
+static void qso_clear_tick() {
+  if (ui_mode != UIMode::QSO || g_q_show_entries) return;
+  int64_t now = rtc_now_ms();
+  bool arm_expired = g_q_clear_armed && now >= g_q_clear_arm_deadline;
+  bool feedback_expired = !g_q_clear_feedback.empty() && now >= g_q_clear_feedback_deadline;
+  if (arm_expired || feedback_expired) {
+    if (arm_expired) g_q_clear_armed = false;
+    if (feedback_expired) g_q_clear_feedback.clear();
+    qso_load_file_list();
+    qso_draw_page();
   }
 }
 
@@ -4556,6 +4606,8 @@ static void enter_mode(UIMode new_mode) {
     case UIMode::QSO:
       g_q_show_entries = false;
       q_page = 0;
+      g_q_clear_armed = false;
+      g_q_clear_feedback.clear();
       qso_load_file_list();
       qso_draw_page();
       break;
@@ -5119,6 +5171,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         ui_draw_waterfall_if_dirty();
         menu_flash_tick();
         rx_flash_tick();
+        qso_clear_tick();
         refresh_status_view_if_dirty();
       }
       last_key = 0;
@@ -5149,6 +5202,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   tx_tick();              // Process TX state machine (single-threaded, non-blocking)
   menu_flash_tick();
   rx_flash_tick();
+  qso_clear_tick();
   apply_pending_sync();
 
   // NOTE: TX scheduling now follows reference architecture:
@@ -5502,6 +5556,25 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 g_q_show_entries = true;
                 q_page = 0;
                 qso_load_entries(g_q_current_file);
+                qso_draw_page();
+              } else if (idx == g_q_clear_row_idx) {
+                // "Clear QSO log" row: its own number doubles as the confirm
+                // button. First press arms it (row re-labels itself "Press N
+                // again: confirm"); the SAME number again within kQClearArmMs
+                // clears the durable NVS log. Export first if you want a copy —
+                // this does not touch the SD card.
+                const int64_t now = rtc_now_ms();
+                if (g_q_clear_armed && now < g_q_clear_arm_deadline) {
+                  qso_log_clear_nvs();
+                  g_adif_sd_seq = 0;
+                  g_q_clear_armed = false;
+                  g_q_clear_feedback = "Log cleared";
+                  g_q_clear_feedback_deadline = now + 1500;
+                } else {
+                  g_q_clear_armed = true;
+                  g_q_clear_arm_deadline = now + kQClearArmMs;
+                }
+                qso_load_file_list();
                 qso_draw_page();
               }
             }

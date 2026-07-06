@@ -50,3 +50,8 @@ int qso_log_count_nvs();
 // ("Verified N QSOs" or an error). NVS is left intact (it is the durable copy).
 // `utc_ms` names the file; run this while idle, not while decoding.
 std::string qso_log_export_to_sd(int64_t utc_ms);
+
+// Erase the NVS ADIF log so the next QSO starts a fresh log (e.g. between POTA
+// activations). Does not touch the SD card — export first if you want a copy.
+// Safe to call when the log is already empty.
+void qso_log_clear_nvs();

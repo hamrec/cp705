@@ -176,3 +176,11 @@ std::string qso_log_export_to_sd(int64_t utc_ms) {
   snprintf(msg, sizeof(msg), "Verified %d QSOs", n);
   return msg;
 }
+
+void qso_log_clear_nvs() {
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_erase_key(h, "adiflog");  // ESP_ERR_NVS_NOT_FOUND if already empty — fine
+  nvs_commit(h);
+  nvs_close(h);
+}

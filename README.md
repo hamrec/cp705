@@ -91,8 +91,11 @@ IC-705 WiFi/network settings (`O`, then page down). Settings persist in NVS. See
   dependence on the SD card or an internal FATFS partition).
 - **On-device network login editor** — WiFi SSID/password and IC-705 network
   user/password are editable on a fourth MENU page (`O`, then page down).
-- **Export Log to SD** (MENU P3 → `5`) — writes the accumulated NVS ADIF log to
-  the card as `YYYYMMDD.adi` in one shot for import into logging software.
+- **End+Export Log SD** (MENU P3 → `5`) — writes the accumulated NVS ADIF log to
+  the card as a verified, uniquely-named `.adi` file for import into logging
+  software (see **Logging and Download** below).
+- **Clear QSO log** (QSO screen `Q`, last numbered row) — a two-press-confirm
+  action to wipe the NVS log and start fresh, e.g. between POTA activations.
 - **Streamlined to the IC-705 target** — the KH1-specific CAT/diagnostic keys
   were removed to keep the build focused on the wireless IC-705 use case.
 
@@ -320,6 +323,13 @@ network login once. You can also pre-load `Station.txt` from the SD card.
   3. On `Verified N QSOs`, pull the card and import the `.adi` into your logging
      software. Your log stays safe in NVS regardless of the SD result, so a
      failed export never loses a QSO — just retry the export.
+- **Starting a fresh log (e.g. between POTA activations):** export first (above)
+  to save a copy, then open the QSO screen (`Q`) — the last row reads
+  `Clear QSO log` with a number next to it. Press that number once and the row
+  re-labels itself `Press N again: confirm`; press the same number again within
+  3 seconds to erase the NVS log and reset the on-screen QSO count to 0. Any
+  other key, or letting the 3 seconds lapse, cancels it with no change. This
+  does not touch the SD card; only the durable NVS copy is cleared.
 
 ### If SD export fails with the LoRa-1262 cap installed
 
