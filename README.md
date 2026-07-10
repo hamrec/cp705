@@ -109,8 +109,8 @@ full radio-side configuration.
   into logging software (see **Logging and Download** below).
 - **Clear QSO log** (Logging category → `2`) — a two-press-confirm action to
   wipe the NVS log and start fresh, e.g. between POTA activations.
-- **Streamlined to the IC-705 target** — the KH1-specific CAT/diagnostic keys
-  were removed to keep the build focused on the wireless IC-705 use case, and
+- **Streamlined to the IC-705 target** — the entire KH1 radio backend was
+  removed to keep the build focused on the wireless IC-705 use case, and
   several settings inherited from Mini-FT8 (ignore list, QSO comment template,
   RX/TX text log, PORTA GPS wiring) were dropped as dead weight on this board.
 

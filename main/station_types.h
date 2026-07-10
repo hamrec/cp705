@@ -26,9 +26,6 @@ enum class RadioType {
     NONE = 0,
     TRUSDX = 1,
     QMX = 2,      // legacy USB-C radios — retained so saved station files don't break
-    KH1_USBC = 3,
-    KH1 = KH1_USBC,
-    KH1_MIC = 4,
     QDX = 5,
     IC705 = 6,    // Icom IC-705 over WiFi
 };

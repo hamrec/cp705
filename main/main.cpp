@@ -597,11 +597,8 @@ static int         g_ic705_civ_addr = 0xA4;   // default IC-705 CI-V address
 static std::string g_ic705_net_user = "";
 static std::string g_ic705_net_pass = "";
 
-static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
 static RadioType canonical_radio_type(RadioType r);
-static RadioType parse_radio_config_value(const char* raw);
-static bool is_kh1_radio(RadioType r);
 static bool radio_type_uses_display_only(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
 void apply_radio_profile_binding();   // visible to core_api.cpp
@@ -1109,8 +1106,7 @@ static void poll_uart_inject_keys() {
   // Read directly from the console UART FIFO — no driver needed.
   // sdkconfig configures ESP console on UART0 peripheral with custom
   // pins TX=G4, RX=G5 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
-  // and CONFIG_ESP_CONSOLE_UART_TX_GPIO / _RX_GPIO). KH1 CAT uses
-  // UART1 peripheral on GPIO1 — no conflict.
+  // and CONFIG_ESP_CONSOLE_UART_TX_GPIO / _RX_GPIO).
   uart_dev_t *hw = UART_LL_GET_HW(0);
   while (true) {
     uint32_t avail = uart_ll_get_rxfifo_len(hw);
@@ -1536,74 +1532,22 @@ static const char* offset_name(OffsetSrc o) {
 }
 
 static RadioType canonical_radio_type(RadioType r) {
-  if (r == RadioType::IC705 ||
-      r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) return r;
+  if (r == RadioType::IC705) return r;
   return RadioType::IC705;  // default all unrecognised to IC-705
-}
-
-static bool is_kh1_radio(RadioType r) {
-  r = canonical_radio_type(r);
-  return r == RadioType::KH1_USBC || r == RadioType::KH1_MIC;
 }
 
 static bool radio_type_uses_display_only(RadioType r) {
   // Always use display-only board init (upstream design): audio input is owned
-  // exclusively by the selected backend (UAC for QMX/KH1-USBC, native I2S mic
-  // for KH1-MIC), so general M5Unified startup must not claim speaker/mic/audio
-  // resources. The keyboard still works because beginDisplayOnly() initializes
-  // it via Keyboard.begin() (auto-detects board type) — see
-  // components/M5Cardputer/src/M5Cardputer.cpp.
+  // exclusively by the selected backend, so general M5Unified startup must
+  // not claim speaker/mic/audio resources. The keyboard still works because
+  // beginDisplayOnly() initializes it via Keyboard.begin() (auto-detects
+  // board type) — see components/M5Cardputer/src/M5Cardputer.cpp.
   (void)r;
   return true;
 }
 
-static RadioType radio_type_from_saved_int(int value) {
-  switch (value) {
-    case (int)RadioType::IC705:
-      return RadioType::IC705;
-    case (int)RadioType::KH1_USBC:
-      return RadioType::KH1_USBC;
-    case (int)RadioType::KH1_MIC:
-      return RadioType::KH1_MIC;
-    default:
-      return RadioType::IC705;
-  }
-}
-
-static RadioType parse_radio_config_value(const char* raw) {
-  if (!raw) return RadioType::IC705;
-
-  char* end = nullptr;
-  long as_int = strtol(raw, &end, 10);
-  if (end != raw) {
-    return radio_type_from_saved_int((int)as_int);
-  }
-
-  std::string token;
-  for (const char* p = raw; *p; ++p) {
-    unsigned char ch = (unsigned char)*p;
-    if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') continue;
-    token.push_back((char)std::toupper(ch));
-  }
-
-  if (token == "KH1" || token == "KH1-USBC" || token == "KH1_USBC" || token == "KH1USB") {
-    return RadioType::KH1_USBC;
-  }
-  if (token == "KH1-MIC" || token == "KH1_MIC" || token == "KH1MIC") {
-    return RadioType::KH1_MIC;
-  }
-  if (token == "IC705" || token == "IC-705" || token == "ICOM") {
-    return RadioType::IC705;
-  }
-  return RadioType::IC705;  // default
-}
-
 static RadioProfileBinding get_radio_profile_binding(RadioType r) {
   switch (canonical_radio_type(r)) {
-    case RadioType::KH1_USBC:
-      return {AUDIO_SOURCE_KH1_MIC, RADIO_CONTROL_KH1_CAT};   // KH1 USB-C uses mic audio
-    case RadioType::KH1_MIC:
-      return {AUDIO_SOURCE_KH1_MIC, RADIO_CONTROL_KH1_CAT};
     case RadioType::IC705:
     default:
       return {AUDIO_SOURCE_IC705_WIFI, RADIO_CONTROL_IC705};
@@ -1613,8 +1557,6 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r) {
 static const char* radio_name(RadioType r) {
   switch (canonical_radio_type(r)) {
     case RadioType::IC705:    return "IC-705";
-    case RadioType::KH1_USBC: return "KH1-USBC";
-    case RadioType::KH1_MIC:  return "KH1-MIC";
     default: break;
   }
   return "IC-705";
@@ -1627,8 +1569,7 @@ void apply_radio_profile_binding() {
   auto start_gps = [&]() {
     gps_start(gps_pins_for_current_source());
   };
-  // cp705 is IC-705 only — always run GPS, no KH1 CAT.
-  g_kh1_connected = false;
+  // cp705 is IC-705 only — always run GPS.
   start_gps();
 
   // For IC-705: pass the resolved IP and CI-V address to the CAT backend
@@ -1653,12 +1594,6 @@ void apply_radio_profile_binding() {
 }
 
 static bool notify_radio_control_audio_start_if_allowed(const char* reason) {
-  if (is_kh1_radio(g_radio) && !g_kh1_connected) {
-    ESP_LOGI(TAG, "Skip CAT audio start for %s: KH1 CAT/TX not connected",
-             radio_name(g_radio));
-    return false;
-  }
-
   esp_err_t rc = radio_control_on_audio_start();
   const bool ok = (rc == ESP_OK);
   ESP_LOGI(TAG, "CAT audio start %s radio=%s reason=%s rc=%d",
@@ -1668,56 +1603,6 @@ static bool notify_radio_control_audio_start_if_allowed(const char* reason) {
            (int)rc);
   debug_log_line(ok ? "CAT audio ok" : "CAT audio fail");
   return ok;
-}
-
-static bool start_rx_audio_for_current_radio(const char* reason, bool notify_cat_if_allowed) {
-  apply_radio_profile_binding();
-
-  if (audio_source_is_streaming()) {
-    ESP_LOGI(TAG, "RX audio already streaming radio=%s reason=%s",
-             radio_name(g_radio),
-             reason ? reason : "");
-    if (notify_cat_if_allowed) {
-      notify_radio_control_audio_start_if_allowed(reason);
-    }
-    return true;
-  }
-
-  const char* mode = radio_name(g_radio);
-  const char* backend = audio_source_backend_name(audio_source_get_backend());
-  ESP_LOGI(TAG, "RX audio start radio=%s backend=%s reason=%s",
-           mode,
-           backend,
-           reason ? reason : "");
-  debug_log_line(std::string("Audio start ") + mode);
-  debug_log_line(std::string("Audio bind ") + backend);
-
-  log_mem_caps("AUDIO_BEFORE_START");
-  if (!audio_source_start()) {
-    log_mem_caps("AUDIO_AFTER_FAIL");
-    ESP_LOGW(TAG, "RX audio start failed radio=%s backend=%s reason=%s",
-             mode,
-             backend,
-             reason ? reason : "");
-    debug_log_line("Audio start fail");
-    return false;
-  }
-  log_mem_caps("AUDIO_AFTER_START");
-
-  debug_log_line("Audio start ok");
-  g_decode_enabled = true;
-  ui_set_paused(false);
-  ui_clear_waterfall();
-
-  if (notify_cat_if_allowed) {
-    notify_radio_control_audio_start_if_allowed(reason);
-  }
-  return true;
-}
-
-// cp705 is IC-705 only; the KH1 CAT diagnostic keys (u/i/j/k/l) were removed.
-static bool handle_kh1_diag_key(char /*c*/) {
-  return false;
 }
 
 static std::string lat_lon_to_maidenhead8(double lat, double lon) {
@@ -2325,9 +2210,7 @@ bool sync_radio_to_current_band(const char* reason) {
 // don't have to press anything after plugging in QMX. Called from the main
 // loop every iteration (before early-exit branches). Fires at most once
 // per CDC open — cleared on successful sync, retries on later iterations
-// until CAT becomes ready and we're not TXing. For KH1 (UART CAT, no USB
-// enumeration event), this flag is never set; the STATUS-exit auto-sync
-// and S->3 handler cover KH1.
+// until CAT becomes ready and we're not TXing.
 static void consume_cdc_initial_sync() {
   if (!g_ic705_initial_sync_pending) return;
   if (sync_radio_to_current_band("initial IC-705 connect")) {
@@ -3540,17 +3423,6 @@ static std::string status_sync_line() {
   const bool streaming = audio_source_is_streaming();
   const RadioType radio = canonical_radio_type(g_radio);
 
-  if (is_kh1_radio(radio)) {
-    const char* name = radio_name(radio);
-    if (!g_kh1_connected) {
-      return std::string("Connect ") + name;
-    }
-    const bool cat_ready = radio_control_ready();
-    if (cat_ready && streaming) return std::string("Sync ") + name + " (RX+TX)";
-    if (cat_ready && !streaming) return std::string("Sync ") + name + " (TX)";
-    return std::string("Connect ") + name;
-  }
-
   if (radio == RadioType::IC705) {
     wifi_mgr_state_t ws = wifi_mgr_get_state();
     switch (ws) {
@@ -3586,11 +3458,6 @@ static void refresh_status_view_if_dirty() {
   }
   int cur_sig = audio_source_is_streaming() ? 1 : 0;
   cur_sig |= ((int)canonical_radio_type(g_radio) << 4);
-  if (is_kh1_radio(g_radio)) {
-    cur_sig |= 2;
-    if (g_kh1_connected) cur_sig |= 8;
-    if (g_kh1_connected && radio_control_ready()) cur_sig |= 4;
-  }
   std::string cur_text = status_sync_line();
   if (cur_sig != last_sig || cur_text != last_text) {
     draw_status_view();
@@ -4325,26 +4192,6 @@ static bool read_station_lines(std::vector<std::string>& lines) {
   return !lines.empty();
 }
 
-static RadioType load_station_radio_type_only() {
-  // Runs before the display is initialised, so it must NOT touch the SD card:
-  // SD shares the display's SPI bus and mounting it pre-display risks an SPI
-  // init-ordering crash. Flash-only here (cheap); the full config, including the
-  // radio, is loaded from the SD card later in load_station_data() once the
-  // display is up. (CP705 is IC-705 only, so this default rarely matters.)
-  StorageStream* stream = storage_stream_open(STATION_FILE, StorageOpenMode::READ);
-  if (!stream) return canonical_radio_type(g_radio);
-  char line[128];
-  RadioType radio = canonical_radio_type(g_radio);
-  while (storage_stream_read_line(stream, line, sizeof(line))) {
-    if (strncmp(line, "radio=", 6) == 0) {
-      radio = parse_radio_config_value(line + 6);
-      break;
-    }
-  }
-  storage_stream_close(stream);
-  return canonical_radio_type(radio);
-}
-
 static void load_station_data() {
   // NOTE: do NOT call storage_sync_station_from_sd() here. It mounts the SD then
   // unmounts it (frees the SPI bus) before the SD log-mount is pinned, and the
@@ -4521,7 +4368,6 @@ void save_station_data() {
   out << "call=" << g_call << "\n";
   out << "grid=" << g_grid_saved_manual << "\n";
   out << "offset_src=" << (int)g_offset_src << "\n";
-  out << "radio=" << (int)canonical_radio_type(g_radio) << "\n";
   out << "ic705_wifi_ssid=" << g_ic705_wifi_ssid << "\n";
   out << "ic705_wifi_pass=" << g_ic705_wifi_pass << "\n";
   out << "ic705_net_user=" << g_ic705_net_user << "\n";
@@ -4586,8 +4432,7 @@ static void enter_mode(UIMode new_mode) {
     // changes (band advance via S->3, etc.) without needing a manual
     // "Sync to QMX" button press. Idempotent — safe even if the same
     // sync already fired (e.g. from S->3 in-menu push, or from the
-    // initial-connect path for QMX). For KH1 this is the primary sync
-    // path (UART CAT has no discrete "first connect" event).
+    // initial-connect path for QMX).
     sync_radio_to_current_band("STATUS exit");
   }
   ui_mode = new_mode;
@@ -4815,8 +4660,8 @@ static void auto_start_ic705_audio_once_cat_ready() {
   g_ic705_initial_sync_pending = true;
 }
 
-// Perform the STATUS -> '2' action: connect IC-705 (WiFi + audio + CAT),
-// or connect KH1 over serial CAT. Syncs the selected band to the radio.
+// Perform the STATUS -> '2' action: connect IC-705 (WiFi + audio + CAT).
+// Syncs the selected band to the radio.
 static void begin_usb_host_mode() {
   const bool on_status_page = (ui_mode == UIMode::STATUS);
   if (on_status_page) {
@@ -4857,16 +4702,6 @@ static void begin_usb_host_mode() {
     if (!radio_control_ready()) {
       notify_radio_control_audio_start_if_allowed("status key 2");
     }
-  } else if (is_kh1_radio(radio)) {
-    if (!g_kh1_connected) {
-      g_kh1_connected = true;
-      apply_radio_profile_binding();
-    }
-    if (!audio_source_is_streaming()) {
-      start_rx_audio_for_current_radio("status key 2", true);
-    } else {
-      notify_radio_control_audio_start_if_allowed("status key 2");
-    }
   }
 
   int freq_hz = (int)(g_bands[g_band_sel].freq * 1000.0f);
@@ -4895,10 +4730,8 @@ static void app_task_core0(void* /*param*/) {
     storage_sync_station_from_sd();
   }
   board_power_init();
-  g_radio = load_station_radio_type_only();
-  // Radio selection is no longer user-exposed (menu toggle removed) — force
-  // IC-705 regardless of what an older saved config might contain. Full KH1
-  // backend removal is separate, tracked follow-up work.
+  // Radio selection is no longer user-exposed (menu toggle removed) — cp705
+  // is IC-705 only.
   g_radio = RadioType::IC705;
   ui_init(radio_type_uses_display_only(g_radio));
   // Mount + pin the SD card now — AFTER display init (SPI-ordering safe) but
@@ -5490,8 +5323,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         }
         case UIMode::STATUS: {
         if (status_edit_idx == -1) {
-          if (handle_kh1_diag_key(c)) { draw_status_view(); }
-          else if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
+          if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
           else if (c == '2') {
             begin_usb_host_mode();
           }
@@ -5508,8 +5340,8 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             //   - QMX initial-connect (consume_cdc_initial_sync reads
             //     current g_band_sel at sync time, so band edits made
             //     while QMX was still enumerating get picked up).
-            // Why deferred: KH1 band change engages a physical antenna
-            // relay, and we don't want to click it on every S->3 press.
+            // Why deferred: don't spam the radio with a CAT command on
+            // every S->3 press.
           }
               else if (c == '4') {
                 // Audio-carrier tune (debugging the carrier pump into the dummy

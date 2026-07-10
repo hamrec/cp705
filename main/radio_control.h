@@ -10,8 +10,7 @@ extern "C" {
 
 typedef enum {
     RADIO_CONTROL_IC705   = 0,
-    RADIO_CONTROL_KH1_CAT = 1,
-    RADIO_CONTROL_QDX     = 2,   // retained for any legacy KH1-USBC path
+    RADIO_CONTROL_QDX     = 2,   // retained for any legacy QDX path
 } radio_control_backend_t;
 
 void radio_control_set_backend(radio_control_backend_t backend);

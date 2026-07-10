@@ -127,8 +127,8 @@ void ui_init(bool display_only) {
     }
 
     if (display_only) {
-        // KH1-MIC needs display-only board init: full M5Unified startup can
-        // claim ES8311/I2S audio resources before the native mic path opens them.
+        // Display-only board init: full M5Unified startup can claim
+        // ES8311/I2S audio resources the radio backend needs to own itself.
         M5Cardputer.beginDisplayOnly(true);
     } else {
         auto cfg = M5.config();
