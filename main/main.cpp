@@ -463,7 +463,7 @@ static std::vector<std::string> g_msc_lines = {
     "return to radio."
 };
 
-static const char* kAppVersion = "3.0-beta1";
+static const char* kAppVersion = "3.0-beta2";
 
 // Runtime latch: when true, we're still showing the startup screen. Either
 // a keypress or the 5 s auto-dismiss timer (g_startup_start_ms) takes us
@@ -682,6 +682,7 @@ bool sync_radio_to_current_band(const char* reason);
 static void menu_flash_tick();
 static void rx_flash_tick();
 static void tune_tick();
+static void qso_done_tick();
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
@@ -1393,9 +1394,25 @@ static bool g_hero_locked = false;
 // once autoseq pops the finished entry out of the active queue.
 static QsoHeroInfo s_last_hero_info{};
 
+// Tracks whether the current/most recent hero-card contact was started by
+// us calling CQ (true) or by us answering someone else's CQ (false) --
+// determines what qso_done_tick() does once the QSO completes. Set true by
+// the C-prompt confirm and by enqueue_beacon_cq(); set false wherever we
+// answer a decode (core_cmd_tap_rx succeeds in RX-mode key dispatch).
+static bool g_cq_calling_mode = false;
+
+// Green "QSO COMPLETE" overlay: set once by render_rx_or_hero() when it
+// detects a genuine completion (the frozen stage reached SIGNOFF, not a
+// manual ESC abort), held for kQsoDoneHoldMs by qso_done_tick(), which then
+// either auto-resumes CQ (g_cq_calling_mode) or drops back to plain RX.
+static bool g_qso_done_active = false;
+static int64_t g_qso_done_since_ms = 0;
+constexpr int kQsoDoneHoldMs = 3000;
+
 static void build_qso_hero_info(QsoHeroInfo& info) {
   if (autoseq_active_count() == 0) {
     info = s_last_hero_info;
+    info.qso_done = g_qso_done_active;
     return;
   }
   QsoContext ctx{};
@@ -1427,6 +1444,7 @@ static void build_qso_hero_info(QsoHeroInfo& info) {
   info.freq_band = fbuf;
   info.snr = ctx.snr_tx;  // our measurement of their signal
   info.clock_hm = g_time.substr(0, 5);
+  info.is_tx = g_tx_active;
   s_last_hero_info = info;
 }
 
@@ -1437,7 +1455,21 @@ static void render_rx_or_hero() {
   // NOT auto-clear when autoseq_active_count() drops back to 0 (QSO signed
   // off and got popped) -- only the RX-mode '`' (ESC) handler clears the lock,
   // so the completed exchange stays on screen for review until dismissed.
-  if (autoseq_active_count() > 0) g_hero_locked = true;
+  static bool s_autoseq_was_active = false;
+  const bool autoseq_now_active = autoseq_active_count() > 0;
+  if (autoseq_now_active) g_hero_locked = true;
+  // Detect the exact transition from active to just-popped. A genuine
+  // completion always ends at SIGNOFF (stage 5, the "73" box); a one-shot
+  // CQ nobody answered ends earlier (never advances past CALLING), and an
+  // ESC abort never reaches here at all (ESC clears g_hero_locked itself
+  // before this function's next call) -- so stage==5 alone is a reliable
+  // "this was a real completion" signal.
+  if (s_autoseq_was_active && !autoseq_now_active && g_hero_locked &&
+      s_last_hero_info.stage == 5) {
+    g_qso_done_active = true;
+    g_qso_done_since_ms = rtc_now_ms();
+  }
+  s_autoseq_was_active = autoseq_now_active;
   const bool hero_now = g_hero_locked;
   if (hero_now != s_hero_was_active) {
     if (!hero_now) {
@@ -2471,6 +2503,36 @@ static void tune_tick() {
   if (ui_mode == UIMode::STATUS) draw_status_view();
 }
 
+// After a genuine QSO completion (detected in render_rx_or_hero(), which
+// sets g_qso_done_active), hold the green "QSO COMPLETE" hero-card overlay
+// for kQsoDoneHoldMs, then either auto-resume calling CQ (if this contact
+// started because we called CQ) or drop back to the plain RX list (if we'd
+// answered someone else's CQ) -- mirrors TD705's cq_run behavior. ESC during
+// the hold window bypasses this entirely: it clears g_qso_done_active itself
+// and always goes straight to RX (see the RX-mode '`' handler).
+static void qso_done_tick() {
+  if (!g_qso_done_active) return;
+  if (rtc_now_ms() - g_qso_done_since_ms < kQsoDoneHoldMs) return;
+  g_qso_done_active = false;
+  if (g_cq_calling_mode) {
+    // Resume calling CQ with whatever text/type is already set (no need to
+    // re-edit g_cq_freetext/g_cq_type) -- same start sequence as the
+    // C-prompt's confirm handler, minus the parts that only apply there.
+    const int64_t now_ms = rtc_now_ms();
+    const int slot_period = g_protocol->slot_time_ms;
+    const int next_parity = (int)(((now_ms / slot_period) + 1) & 1);
+    autoseq_start_cq(next_parity);
+    AutoseqTxEntry pending;
+    if (autoseq_fetch_pending_tx(pending)) {
+      arm_pending_tx(pending);
+    }
+    core_fire_qso_changed();
+  } else {
+    g_hero_locked = false;
+    render_rx_or_hero();
+  }
+}
+
 // Auto-revert the Logging category's "Press 2 again: confirm" arm prompt
 // (Clear QSO Log) and the "Log cleared" feedback back to normal once their
 // window lapses, so a stale prompt doesn't linger without a keypress to
@@ -3112,6 +3174,7 @@ static void encode_and_log_pending_tx() {
 static void enqueue_beacon_cq() {
   int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
   autoseq_start_cq(target_parity);
+  g_cq_calling_mode = true;  // this contact originates from us calling CQ
   core_fire_qso_changed();  // propagates to all registered consumers
 }
 
@@ -3169,6 +3232,19 @@ static void tx_start(int skip_tones) {
   if (!g_pending_tx_valid || g_pending_tx.text.empty()) {
     ESP_LOGW(TAG, "tx_start: no pending TX");
     return;
+  }
+
+  // Draw the hero card's TX indicator now, strictly before the WiFi audio
+  // streaming call below -- LCD SPI traffic contends with the WiFi DMA once
+  // that starts (the documented root cause of the 1Hz carrier pulse), so
+  // this has to be the last screen write until TX ends. g_tx_active is still
+  // false at this point (set at the bottom of this function), so override
+  // is_tx directly on this one draw rather than waiting for it.
+  if (ui_mode == UIMode::RX && g_hero_locked) {
+    QsoHeroInfo tx_start_info;
+    build_qso_hero_info(tx_start_info);
+    tx_start_info.is_tx = true;
+    ui_draw_qso_hero(tx_start_info);
   }
 
   // Get current slot info
@@ -5084,6 +5160,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
     tune_tick();            // Auto-stop the tune burst once its window elapses
+    qso_done_tick();        // Auto-resume CQ or drop to RX after QSO COMPLETE holds
 
     // Drain deferred config saves requested by core commands.
     if (g_config_save_pending && storage_service_firmware_available()) {
@@ -5105,6 +5182,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       if (ui_mode == UIMode::RX && g_hero_locked) {
         core_cmd_drop_qso(0);
         g_hero_locked = false;
+        g_qso_done_active = false;  // cancel any pending auto-resume/auto-RX
         render_rx_or_hero();
       }
       debug_log_line("TX cancel requested");
@@ -5306,6 +5384,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         int sel = ui_handle_rx_key(c);
         if (sel >= 0 && core_cmd_tap_rx(sel)) {
           // TX-state arming lives inside core_cmd_tap_rx for every UI path.
+          // This contact originates from us answering someone else's CQ (not
+          // calling our own), so a completion should return to RX, not
+          // auto-resume calling CQ -- see qso_done_tick().
+          g_cq_calling_mode = false;
           rx_flash_idx = sel;
           rx_flash_deadline = rtc_now_ms() + 500;
           ui_draw_rx(rx_flash_idx);
@@ -5604,6 +5686,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   const int slot_period = g_protocol->slot_time_ms;
                   const int next_parity = (int)(((now_ms / slot_period) + 1) & 1);
                   autoseq_start_cq(next_parity);
+                  g_cq_calling_mode = true;  // this contact originates from us calling CQ
                   AutoseqTxEntry pending;
                   if (autoseq_fetch_pending_tx(pending)) {
                     arm_pending_tx(pending);

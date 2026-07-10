@@ -62,6 +62,8 @@ struct QsoHeroInfo {
     std::string freq_band;     // e.g. "14.074  20m"
     int snr = -99;             // -99 = unknown/not yet reported (our measurement of them)
     std::string clock_hm;      // "HH:MM", already formatted
+    bool is_tx = false;        // true while actually transmitting (g_tx_active)
+    bool qso_done = false;     // brief green "QSO COMPLETE" overlay after SIGNOFF
 };
 
 void ui_init(bool display_only = false);

@@ -413,14 +413,20 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
     // Row 0: status label + clock, y 0-19
     M5.Display.fillRect(0, 0, SCREEN_W, 19, TFT_BLACK);
     M5.Display.setTextSize(1);
-    M5.Display.setTextColor(rgb565(120, 170, 255), TFT_BLACK);
     M5.Display.setCursor(4, 3);
-    if (info.calling_cq) {
+    if (info.qso_done) {
+        // Brief green success overlay after a genuine completion (SIGNOFF
+        // reached) -- same green as the tracker's "done" boxes below.
+        M5.Display.setTextColor(rgb565(0, 220, 0), TFT_BLACK);
+        M5.Display.print("QSO COMPLETE");
+    } else if (info.calling_cq) {
         // Show the actual outgoing CQ text (incl. any POTA/SOTA/QRP prefix)
         // instead of a generic label, so it's visible at a glance that the
         // right message is armed -- falls back to the label if unavailable.
+        M5.Display.setTextColor(rgb565(120, 170, 255), TFT_BLACK);
         M5.Display.print(info.cq_text.empty() ? "CALLING CQ" : info.cq_text.c_str());
     } else {
+        M5.Display.setTextColor(rgb565(120, 170, 255), TFT_BLACK);
         M5.Display.print("WORKING");
     }
     if (!info.clock_hm.empty()) {
@@ -429,6 +435,12 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
         M5.Display.setCursor(SCREEN_W - tw - 4, 3);
         M5.Display.print(info.clock_hm.c_str());
     }
+    // Fixed-position RX/TX indicator, left of the clock (clock_hm is always
+    // "HH:MM" -- 5 chars, 30px -- so its cursor always lands at SCREEN_W-34;
+    // this sits 12px plus a 16px gap (2 extra char-widths) to the left of that).
+    M5.Display.setTextColor(info.is_tx ? TFT_RED : rgb565(120, 170, 255), TFT_BLACK);
+    M5.Display.setCursor(SCREEN_W - 34 - 16 - 12, 3);
+    M5.Display.print(info.is_tx ? "TX" : "RX");
 
     // Row 1: callsign + grid, y 32-60. Cursor at y=35 centers the size-3
     // glyph (24px tall) on y=47 -- the midpoint between the countdown bar's
@@ -454,7 +466,10 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
     const int box_y = 73, box_h = 28, gap = 4;
     const int box_w = (SCREEN_W - gap * 5) / 6;
     for (int i = 0; i < 6; ++i) {
-        int box_state = (i < info.stage) ? 2 : (i == info.stage ? 1 : 0);
+        // qso_done: every box (including the final "73") shows fully done/
+        // green -- otherwise the last-reached stage would sit at state 1
+        // (navy "current") forever even though it's actually complete.
+        int box_state = info.qso_done ? 2 : (i < info.stage) ? 2 : (i == info.stage ? 1 : 0);
         hero_draw_stage_box(i * (box_w + gap), box_y, box_w, box_h, kStageLabels[i], box_state);
     }
 
