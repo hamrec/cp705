@@ -98,11 +98,20 @@ static void tx_pace_cb(void*) { if (s_tx_tick_sem) xSemaphoreGive(s_tx_tick_sem)
 // TX audio output level as a Q8 fraction of full scale (256 = 1.0 = raw DDS).
 // Full scale overdrives the IC-705 input (ALC pumps, meters bounce). ~0.5 with
 // a normal WLAN MOD Level (~10-20%) reaches full power without ALC. Lower if
-// still hot, raise if the radio can't reach power.
-#define TX_GAIN_Q8           128   // 0.50 of full scale ≈ -6dB (steady-trigger level
-                                   // before the low-level blip test). Level is NOT
-                                   // the splatter cause (0.5 and 0.6 both splatter;
-                                   // <-12dB just blips below the TX threshold).
+// still hot, raise if the radio can't reach power. Live-adjustable (+/- on the
+// STATUS screen, per-band saved in NVS -- see main.cpp) rather than a fixed
+// build-time value, matching TD705. Clamped to [16, 256]. Default 128 (0.50 of
+// full scale ~ -6dB): the steady-trigger level before the low-level blip test.
+// Level is NOT the splatter cause (0.5 and 0.6 both splatter; <-12dB just
+// blips below the TX threshold).
+static volatile int s_tx_gain_q8 = 128;
+
+void ic705_tx_set_gain_q8(int v) {
+    if (v < 16)  v = 16;
+    if (v > 256) v = 256;
+    s_tx_gain_q8 = v;
+}
+int ic705_tx_get_gain_q8(void) { return s_tx_gain_q8; }
 
 // Look-ahead ring (filled by the DDS render) drained one 480-sample frame per
 // hardware-timer tick for steady, crystal-locked send cadence.
@@ -128,7 +137,7 @@ static void tx_writer_task(void* /*arg*/) {
                         | ((int32_t)stereo_buf[i * 6 + 1] << 8)
                         | ((int32_t)stereo_buf[i * 6 + 2] << 16);
             if (val & 0x800000) val |= 0xFF000000;  // sign-extend
-            int16_t s16 = (int16_t)(((val >> 8) * TX_GAIN_Q8) >> 8);
+            int16_t s16 = (int16_t)(((val >> 8) * s_tx_gain_q8) >> 8);
             look[wr] = s16;
             if (++wr >= TX_LOOK_N) wr = 0;
             ++count;

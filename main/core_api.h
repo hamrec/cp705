@@ -89,7 +89,6 @@ struct StationConfig {
   // Identity
   std::string      call;
   std::string      grid;
-  std::string      comment;
 
   // Radio
   CoreRadioType         radio;
@@ -113,9 +112,6 @@ struct StationConfig {
   int32_t          rtc_comp;       // ppm-like drift comp
   std::string      date;           // "YYYY-MM-DD"
   std::string      time;           // "HH:MM:SS"
-
-  // Filters
-  std::vector<std::string> ignore_prefixes;
 };
 
 // One row from the live waterfall stream.
@@ -198,7 +194,6 @@ bool core_cmd_set_radio(CoreRadioType r);
 // Identity
 bool core_cmd_set_call(const std::string& call);
 bool core_cmd_set_grid(const std::string& grid);
-bool core_cmd_set_comment(const std::string& comment);
 
 // CQ / beacon
 bool core_cmd_set_cq_type(CoreCqType t);
@@ -216,11 +211,6 @@ bool core_cmd_set_max_retry(int n);
 // RTC
 bool core_cmd_set_rtc(int64_t epoch_ms);
 bool core_cmd_set_rtc_comp(int32_t ppm_like);
-
-// Ignore list
-bool core_cmd_ignore_add   (const std::string& prefix);
-bool core_cmd_ignore_remove(const std::string& prefix);
-bool core_cmd_ignore_clear();
 
 // System
 bool core_cmd_save_config();   // persist to flash (most setters do this auto)

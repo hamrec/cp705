@@ -141,7 +141,7 @@ void ui_init(bool display_only) {
     }
     M5.Display.setRotation(1);
     M5.Display.fillScreen(TFT_BLACK);
-    ui_draw_countdown(0.0f, true, 1500);
+    ui_draw_countdown(0.0f, true);
 }
 
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
@@ -196,14 +196,19 @@ void ui_draw_waterfall() {
     // LovyanGFX pushImage(uint16_t*) sends bytes straight from memory without
     // swapping — it expects data already in big-endian (wire) order.  Our
     // rgb565() returns little-endian uint16_t, so we must bswap16 each value
-    // when storing.  Example: yellow = rgb565(v,v,0) = 0xFFE0; stored LE as
-    // [0xE0,0xFF]; without swap SPI sends 0xE0FF → purple.  After bswap16,
-    // stored as [0xFF,0xE0]; SPI sends 0xFFE0 → yellow.
+    // when storing; without the swap SPI sends the byte-reversed value and
+    // the hue comes out wrong.
+    //
+    // Dark navy floor (noise) fading up to light blue (decode signal peaks),
+    // linearly interpolated by intensity v (0..255).
     for (int i = 0; i < WATERFALL_H; ++i) {
         int src = (waterfall_head + i) % WATERFALL_H;
         for (int x = 0; x < SCREEN_W; ++x) {
             uint8_t v = waterfall[src][x];
-            wf_fb[i * SCREEN_W + x] = __builtin_bswap16(rgb565(v, v, 0));  // yellow, wire order
+            uint8_t r = (uint8_t)((8   * (255 - v) + 140 * v) / 255);
+            uint8_t g = (uint8_t)((8   * (255 - v) + 190 * v) / 255);
+            uint8_t b = (uint8_t)((60  * (255 - v) + 255 * v) / 255);
+            wf_fb[i * SCREEN_W + x] = __builtin_bswap16(rgb565(r, g, b));
         }
     }
 
@@ -213,39 +218,7 @@ void ui_draw_waterfall() {
     M5.Display.pushImage(0, 0, SCREEN_W, WATERFALL_H, wf_fb);
 }
 
-static inline int hz_to_x(int hz) {
-    // clamp to waterfall range
-    //if (hz < 200)  hz = 200;
-    //if (hz > 3000) hz = 3000;
-
-    // map [200..3000] -> [0..SCREEN_W-1]
-    const int in_min = 200, in_max = 3000;
-    int x = (int)((int64_t)(hz - in_min) * (SCREEN_W - 1) / (in_max - in_min));
-    if (x < 0) x = 0;
-    if (x > SCREEN_W - 1) x = SCREEN_W - 1;
-    return x;
-}
-
-static void ui_draw_offset_cursor_dot(int offset_hz) {
-    const int y = WATERFALL_H;                 // countdown bar top
-    const int cy = y + (COUNTDOWN_H / 2);      // vertically centered in bar
-    int cx = hz_to_x(offset_hz);
-
-    // 3x3 dot centered at (cx, cy)
-    int x0 = cx - 1;
-    int y0 = cy - 1;
-
-    // clamp so we don't draw outside
-    if (x0 < 0) x0 = 0;
-    if (y0 < y) y0 = y;
-    if (x0 + 3 > SCREEN_W) x0 = SCREEN_W - 3;
-    if (y0 + 3 > y + COUNTDOWN_H) y0 = y + COUNTDOWN_H - 3;
-
-    if(offset_hz>=200 && offset_hz <=3000)
-      M5.Display.fillRect(x0, y0, 5, 3, rgb565(0, 80, 160));   // blue cursor dot
-}
-
-void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
+void ui_draw_countdown(float fraction, bool even_slot) {
     if (fraction < 0.0f) fraction = 0.0f;
     if (fraction > 1.0f) fraction = 1.0f;
     int filled = (int)(fraction * SCREEN_W);
@@ -257,8 +230,6 @@ void ui_draw_countdown(float fraction, bool even_slot, int offset_hz) {
         uint16_t color = even_slot ? rgb565(0, 180, 0) : rgb565(180, 0, 0);
         M5.Display.fillRect(0, y, filled, COUNTDOWN_H, color);
     }
-    // draw cursor last so countdown never overwrites it
-    ui_draw_offset_cursor_dot(offset_hz);
 }
 
 // Helper: copy a UiRxLine into a RxDecodeEntry with bounded string copies
@@ -396,6 +367,166 @@ void ui_draw_rx(int flash_index) {
         last_page = -1;
         last_drawn_count = 0;
     }
+}
+
+// --- QSO hero card -----------------------------------------------------
+// Full-screen QSO/CQ progress view, replaces the waterfall + decode list
+// while autoseq has an active context. Always a full repaint (QSO state
+// changes every ~15s at most, so there's no need for the RX list's
+// diff/cache machinery) — fillScreen on every call, not just the
+// transition in, since whatever mode was on screen before (menu, RX list,
+// waterfall) doesn't share this layout and can leave stale pixels in the
+// gaps between the hero card's row bands otherwise.
+
+static void hero_draw_stage_box(int x, int y, int w, int h, const char* label, int box_state) {
+    // box_state: 0 = pending (dim outline), 1 = current (navy fill, white
+    // outline — reuses the existing "selected" navy from the list views),
+    // 2 = done (green outline, matches the app's existing CQ/is_cq green).
+    uint16_t outline = TFT_WHITE;
+    uint16_t fill = TFT_BLACK;
+    uint16_t text_color = rgb565(90, 90, 90);
+    if (box_state == 2) {
+        outline = rgb565(0, 220, 0);
+        text_color = outline;
+    } else if (box_state == 1) {
+        outline = TFT_WHITE;
+        fill = rgb565(30, 30, 60);
+        text_color = TFT_WHITE;
+    } else {
+        outline = rgb565(68, 68, 68);
+    }
+    M5.Display.fillRect(x, y, w, h, fill);
+    M5.Display.drawRect(x, y, w, h, outline);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(text_color, fill);
+    int tw = (int)strlen(label) * 6;  // Font0 glyph width at textSize(1)
+    M5.Display.setCursor(x + (w - tw) / 2, y + (h - 8) / 2);
+    M5.Display.print(label);
+}
+
+void ui_draw_qso_hero(const QsoHeroInfo& info) {
+    DispGuard guard;
+    M5.Display.startWrite();
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextWrap(false);
+
+    // Row 0: status label + clock, y 0-19
+    M5.Display.fillRect(0, 0, SCREEN_W, 19, TFT_BLACK);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(rgb565(120, 170, 255), TFT_BLACK);
+    M5.Display.setCursor(4, 3);
+    if (info.calling_cq) {
+        // Show the actual outgoing CQ text (incl. any POTA/SOTA/QRP prefix)
+        // instead of a generic label, so it's visible at a glance that the
+        // right message is armed -- falls back to the label if unavailable.
+        M5.Display.print(info.cq_text.empty() ? "CALLING CQ" : info.cq_text.c_str());
+    } else {
+        M5.Display.print("WORKING");
+    }
+    if (!info.clock_hm.empty()) {
+        int tw = (int)info.clock_hm.size() * 6;
+        M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
+        M5.Display.setCursor(SCREEN_W - tw - 4, 3);
+        M5.Display.print(info.clock_hm.c_str());
+    }
+
+    // Row 1: callsign + grid, y 32-60. Cursor at y=35 centers the size-3
+    // glyph (24px tall) on y=47 -- the midpoint between the countdown bar's
+    // bottom edge (UI_START_Y=21) and the tracker's top edge (box_y=73).
+    M5.Display.fillRect(0, 32, SCREEN_W, 28, TFT_BLACK);
+    M5.Display.setTextSize(3);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    M5.Display.setCursor(4, 35);
+    M5.Display.print(info.dxcall.empty() ? "--" : info.dxcall.c_str());
+    if (!info.dxgrid.empty()) {
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
+        int gx = SCREEN_W - (int)info.dxgrid.size() * 12 - 4;
+        M5.Display.setCursor(gx, 39);
+        M5.Display.print(info.dxgrid.c_str());
+    }
+    M5.Display.setTextSize(1);
+
+    // Row 2: six-stage tracker, y 73-100. Shifted +22px down from the
+    // original y=51 (as a block with rows 3/4 below, spacing between the
+    // three unchanged) so the footer's bottom gap matches row 0's top gap.
+    static const char* kStageLabels[6] = { "CQ", "GR", "RP", "R", "RR73", "73" };
+    const int box_y = 73, box_h = 28, gap = 4;
+    const int box_w = (SCREEN_W - gap * 5) / 6;
+    for (int i = 0; i < 6; ++i) {
+        int box_state = (i < info.stage) ? 2 : (i == info.stage ? 1 : 0);
+        hero_draw_stage_box(i * (box_w + gap), box_y, box_w, box_h, kStageLabels[i], box_state);
+    }
+
+    // Row 3: freq/band + SNR/DT, y 102-121 (TX line row removed -- redundant
+    // with the CQ text now shown up in row 0 / the tracker's own state).
+    M5.Display.fillRect(0, 102, SCREEN_W, 19, TFT_BLACK);
+    M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
+    M5.Display.setCursor(4, 105);
+    M5.Display.print(info.freq_band.c_str());
+    if (info.snr > -99) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "SNR %+d", info.snr);
+        int tw = (int)strlen(buf) * 6;
+        M5.Display.setCursor(SCREEN_W - tw - 4, 105);
+        M5.Display.print(buf);
+    }
+
+    // Row 4: footer legend, y 121-135. Text at y=124 puts its bottom edge
+    // (~132, 8px glyph) 3px above the screen bottom (135), matching row 0's
+    // 3px top gap (its text sits at y=3).
+    M5.Display.fillRect(0, 121, SCREEN_W, SCREEN_H - 121, TFT_BLACK);
+    M5.Display.setTextColor(rgb565(0, 255, 255), TFT_BLACK);
+    M5.Display.setCursor(4, 124);
+    M5.Display.print("ESC to Stop");
+
+    M5.Display.setTextWrap(true);
+    M5.Display.endWrite();
+}
+
+// --- Boot splash ---------------------------------------------------------
+// Icom-styled: red/blue accent bars (bracketing the screen top/bottom, the
+// way Icom's own branding blocks color), white title, grey version, blue
+// callsign. Drawn once at boot and held until dismissed — no dirty-tracking
+// needed.
+void ui_draw_splash(const std::string& callsign, const std::string& version) {
+    DispGuard guard;
+    M5.Display.startWrite();
+    M5.Display.fillScreen(TFT_BLACK);
+    M5.Display.setTextWrap(false);
+
+    const uint16_t icom_red  = rgb565(210, 20, 30);
+    const uint16_t icom_blue = rgb565(0, 90, 170);
+    const uint16_t dark_grey = rgb565(55, 55, 55);
+
+    M5.Display.fillRect(0, 0, SCREEN_W, 6, icom_red);
+    M5.Display.fillRect(0, SCREEN_H - 6, SCREEN_W, 6, icom_blue);
+
+    M5.Display.setTextSize(4);
+    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    static const char* kTitle = "CP705";
+    int title_w = (int)strlen(kTitle) * 24;  // 6px glyph * textSize(4)
+    M5.Display.setCursor((SCREEN_W - title_w) / 2, 28);
+    M5.Display.print(kTitle);
+
+    M5.Display.drawFastHLine(20, 62, SCREEN_W - 40, dark_grey);
+
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
+    std::string vbuf = "v" + version;
+    int vw = (int)vbuf.size() * 12;
+    M5.Display.setCursor((SCREEN_W - vw) / 2, 72);
+    M5.Display.print(vbuf.c_str());
+
+    M5.Display.setTextColor(icom_blue, TFT_BLACK);
+    std::string cbuf = callsign.empty() ? "--" : callsign;
+    int cw = (int)cbuf.size() * 12;
+    M5.Display.setCursor((SCREEN_W - cw) / 2, 98);
+    M5.Display.print(cbuf.c_str());
+
+    M5.Display.setTextSize(1);
+    M5.Display.setTextWrap(true);
+    M5.Display.endWrite();
 }
 
 // Simple keyboard: dot/‘.’ scroll forward page, comma/‘,’ scroll back.

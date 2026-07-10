@@ -83,6 +83,11 @@ bool ic705_tx_begin_tune(float tone_hz);
 // Stop TX audio streaming.
 void ic705_tx_end(void);
 
+// Live TX gain control (Q8: 256 = full DDS scale, clamped to [16, 256]).
+// Adjustable from the STATUS screen (+/-); per-band value persisted in NVS.
+void ic705_tx_set_gain_q8(int v);
+int  ic705_tx_get_gain_q8(void);
+
 #ifdef __cplusplus
 }
 #endif

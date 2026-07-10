@@ -28,7 +28,6 @@
 // ---------------------------------------------------------------------------
 extern std::string       g_call;
 extern std::string       g_grid;
-extern std::string       g_comment1;
 extern RadioType         g_radio;
 extern std::vector<BandItem> g_bands;
 extern int               g_band_sel;
@@ -42,7 +41,6 @@ extern int               g_autoseq_max_retry;
 extern int               g_rtc_comp;
 extern std::string       g_date;
 extern std::string       g_time;
-extern std::vector<std::string> g_ignore_prefixes;
 extern volatile bool     g_tx_cancel_requested;
 
 // Functions from main.cpp that core_api delegates to.
@@ -50,7 +48,6 @@ void save_station_data();
 void apply_radio_profile_binding();
 void update_autoseq_cq_type();
 void rebuild_active_bands();
-void rebuild_ignore_prefixes();
 bool rtc_apply_manual_time_from_strings();
 
 // Access to ui.cpp (RX list live in ui.cpp's static array).
@@ -291,7 +288,6 @@ void core_get_config(StationConfig& out) {
   ConfigGuard g;
   out.call        = g_call;
   out.grid        = g_grid;
-  out.comment     = g_comment1;
 
   out.radio       = map_out(g_radio);
   out.bands_hz.clear();
@@ -314,8 +310,6 @@ void core_get_config(StationConfig& out) {
   out.rtc_comp    = g_rtc_comp;
   out.date        = g_date;
   out.time        = g_time;
-
-  out.ignore_prefixes = g_ignore_prefixes;
 }
 
 // ---------------------------------------------------------------------------
@@ -496,9 +490,6 @@ bool core_cmd_set_grid(const std::string& grid) {
   autoseq_set_station(g_call, grid_ft8_4(g_grid));
   return true;
 }
-bool core_cmd_set_comment(const std::string& comment) {
-  return apply_config_write([&]{ g_comment1 = comment; });
-}
 
 bool core_cmd_set_cq_type(CoreCqType t) {
   {
@@ -582,44 +573,6 @@ bool core_cmd_set_rtc_comp(int32_t ppm_like) {
   return apply_config_write([&]{ g_rtc_comp = ppm_like; });
 }
 
-bool core_cmd_ignore_add(const std::string& prefix) {
-  if (prefix.empty()) return false;
-  {
-    ConfigGuard g;
-    for (const auto& p : g_ignore_prefixes) {
-      if (p == prefix) return true;  // already present
-    }
-    g_ignore_prefixes.push_back(prefix);
-  }
-  rebuild_ignore_prefixes();
-  g_config_save_pending = true;
-  core_fire_config_changed();
-  return true;
-}
-bool core_cmd_ignore_remove(const std::string& prefix) {
-  bool removed = false;
-  {
-    ConfigGuard g;
-    for (auto it = g_ignore_prefixes.begin(); it != g_ignore_prefixes.end(); ++it) {
-      if (*it == prefix) { g_ignore_prefixes.erase(it); removed = true; break; }
-    }
-  }
-  if (!removed) return false;
-  rebuild_ignore_prefixes();
-  g_config_save_pending = true;
-  core_fire_config_changed();
-  return true;
-}
-bool core_cmd_ignore_clear() {
-  {
-    ConfigGuard g;
-    g_ignore_prefixes.clear();
-  }
-  rebuild_ignore_prefixes();
-  g_config_save_pending = true;
-  core_fire_config_changed();
-  return true;
-}
 
 bool core_cmd_save_config() {
   g_config_save_pending = true;

@@ -47,7 +47,26 @@ struct RxDecodeEntry {
     bool is_to_me;
 };
 
+// Hero-card display data for the active QSO — populated by main.cpp from
+// autoseq's QsoContext, kept plain (no autoseq.h dependency here) matching
+// how ui_draw_tx() already takes plain strings rather than QsoContext itself.
+struct QsoHeroInfo {
+    bool calling_cq = false;   // true = our own CQ one-shot, no dxcall yet
+    std::string cq_text;       // calling_cq only: actual outgoing CQ message
+                                // (e.g. "CQ POTA KD3AN EM66"), shown in place
+                                // of the generic status label so any modifier
+                                // (POTA/SOTA/QRP/...) is visible at a glance
+    std::string dxcall;
+    std::string dxgrid;
+    int stage = 0;             // 0..5, matches AutoseqState CALLING..SIGNOFF
+    std::string freq_band;     // e.g. "14.074  20m"
+    int snr = -99;             // -99 = unknown/not yet reported (our measurement of them)
+    std::string clock_hm;      // "HH:MM", already formatted
+};
+
 void ui_init(bool display_only = false);
+// Icom-styled boot splash: app title, version, and the operator's callsign.
+void ui_draw_splash(const std::string& callsign, const std::string& version);
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len);
 // Push a new row from the RX audio pipeline.  Suppressed during TX (see ui_set_rx_waterfall_muted).
 void ui_push_waterfall_row(const uint8_t* bins, int len);
@@ -59,7 +78,7 @@ void ui_clear_waterfall();
 void ui_draw_waterfall();
 void ui_draw_waterfall_if_dirty();
 bool ui_waterfall_dirty();
-void ui_draw_countdown(float fraction, bool even_slot, int offset_hz);  // 0.0-1.0 fill of the countdown bar
+void ui_draw_countdown(float fraction, bool even_slot);  // 0.0-1.0 fill of the countdown bar
 void ui_set_rx_list(const std::vector<UiRxLine>& lines);
 // Zero-heap RX list setter — preferred when callers use RxDecodeEntry directly.
 void ui_set_rx_list_static(const RxDecodeEntry* entries, int count);
@@ -72,6 +91,10 @@ void ui_set_paused(bool paused);
 bool ui_is_paused();
 void ui_draw_rx(int flash_index = -1);
 void ui_force_redraw_rx();
+// Full-screen QSO progress card, replaces the decode list while a QSO/CQ is
+// active. Fully blanks the screen on every call (covers the waterfall/menu/
+// RX list, whatever was on screen before, so must repaint cleanly).
+void ui_draw_qso_hero(const QsoHeroInfo& info);
 // Colors: pass same-length slot_colors (0 even->green, 1 odd->red) for next/queue
 void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete, const std::vector<int>& slot_colors = {});
 // Returns selected absolute index or -1 if none
