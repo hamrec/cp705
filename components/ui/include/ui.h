@@ -45,9 +45,36 @@ struct RxDecodeEntry {
     float time_s;
     bool is_cq;
     bool is_to_me;
+    int64_t heard_ms = 0;  // wall-clock ms this station was last (re-)heard;
+                           // drives newest-first display order in the
+                           // persistent, refresh-in-place decode list.
+};
+
+// Hero-card display data for the active QSO — populated by main.cpp from
+// autoseq's QsoContext, kept plain (no autoseq.h dependency here).
+struct QsoHeroInfo {
+    bool calling_cq = false;   // true = our own CQ one-shot, no dxcall yet
+    std::string cq_text;       // calling_cq only: actual outgoing CQ message
+                                // (e.g. "CQ POTA KD3AN EM66"), shown in place
+                                // of the generic status label so any modifier
+                                // (POTA/SOTA/QRP/...) is visible at a glance
+    std::string dxcall;
+    std::string dxgrid;
+    int stage = 0;             // 0..5, matches AutoseqState CALLING..SIGNOFF; 6 = all done (qso_done)
+    std::string freq_band;     // e.g. "14.074  20m"
+    int snr = -99;             // -99 = unknown/not yet reported (our measurement of them)
+    std::string clock_hm;      // "HH:MM", already formatted
+    int qso_count = 0;         // total logged QSOs this session, shown bottom-right
+    bool qso_done = false;     // true during the post-QSO "COMPLETE" hold (all stages green)
+    bool qso_gave_up = false;  // true during a post-give-up hold (retries exhausted, no
+                               // reply ever heard) -- same auto-clear timing as qso_done,
+                               // but the tracker stays frozen at its real stage (not all
+                               // green) and the label reads differently.
 };
 
 void ui_init(bool display_only = false);
+// Icom-styled boot splash: app title, version, and the operator's callsign.
+void ui_draw_splash(const std::string& callsign, const std::string& version);
 void ui_set_waterfall_row(int row, const uint8_t* bins, int len);
 // Push a new row from the RX audio pipeline.  Suppressed during TX (see ui_set_rx_waterfall_muted).
 void ui_push_waterfall_row(const uint8_t* bins, int len);
@@ -59,7 +86,13 @@ void ui_clear_waterfall();
 void ui_draw_waterfall();
 void ui_draw_waterfall_if_dirty();
 bool ui_waterfall_dirty();
-void ui_draw_countdown(float fraction, bool even_slot, int offset_hz);  // 0.0-1.0 fill of the countdown bar
+void ui_draw_countdown(float fraction, bool even_slot);  // 0.0-1.0 fill of the countdown bar
+// Blanks the countdown bar strip to black. Called once, right before a TX
+// starts, so the bar (frozen at whatever fraction it had when TX began,
+// since redraws are held during TX) doesn't sit there stale for the whole
+// transmission and then visibly jump once RX resumes and it starts ticking
+// again -- a plain blank reads as "intentionally hidden" instead.
+void ui_clear_countdown();
 void ui_set_rx_list(const std::vector<UiRxLine>& lines);
 // Zero-heap RX list setter — preferred when callers use RxDecodeEntry directly.
 void ui_set_rx_list_static(const RxDecodeEntry* entries, int count);
@@ -72,8 +105,21 @@ void ui_set_paused(bool paused);
 bool ui_is_paused();
 void ui_draw_rx(int flash_index = -1);
 void ui_force_redraw_rx();
-// Colors: pass same-length slot_colors (0 even->green, 1 odd->red) for next/queue
-void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete, const std::vector<int>& slot_colors = {});
+// QSO progress card, replaces the decode list while a QSO/CQ is active.
+// Diff-aware: only the regions whose content actually changed since the last
+// call are repainted, so a routine redraw (e.g. just the clock digit) is a
+// few hundred bytes of SPI instead of a full ~65KB screen blast. A full-screen
+// blast contends with the WiFi DMA on the S3 (documented in main.cpp) and,
+// during the RX window, can perturb the radio link / keepalive timing -- so
+// keeping each redraw small directly protects the connection. Call
+// ui_hero_invalidate() to force the next call to do a full repaint (needed
+// whenever something else -- menu, status, a full clear -- has painted over
+// the card since it was last shown).
+void ui_draw_qso_hero(const QsoHeroInfo& info);
+// Force the next ui_draw_qso_hero() call to fully repaint the card (drops the
+// diff cache). Call when transitioning into the hero view or after anything
+// else has drawn over the screen.
+void ui_hero_invalidate();
 // Returns selected absolute index or -1 if none
 int ui_handle_rx_key(char c);
 // Generic list draw (6 lines per page)

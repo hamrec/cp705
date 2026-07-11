@@ -36,10 +36,9 @@ const char* core_api_version();   // "major.minor.patch"
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
-enum class CoreBeaconMode : uint8_t { OFF = 0, EVEN = 1, ODD = 2 };
 enum class CoreCqType     : uint8_t { CQ = 0, SOTA, POTA, QRP, FD, FREETEXT };
 enum class CoreOffsetSrc  : uint8_t { RX = 0, CURSOR = 1, RANDOM = 2 };
-enum class CoreRadioType  : uint8_t { QMX = 0, KH1 = 1, QDX = 2 };
+enum class CoreRadioType  : uint8_t { QMX = 0, QDX = 2 };
 
 enum class CoreQsoState : uint8_t {
   CALLING, REPLYING, REPORT, ROGER_REPORT, ROGERS, SIGNOFF, IDLE
@@ -89,17 +88,15 @@ struct StationConfig {
   // Identity
   std::string      call;
   std::string      grid;
-  std::string      comment;
 
   // Radio
   CoreRadioType         radio;
   std::vector<uint32_t> bands_hz;   // band frequencies in Hz
   int                   band_idx;
 
-  // CQ / beacon
+  // CQ
   CoreCqType       cq_type;
   std::string      cq_freetext;
-  CoreBeaconMode   beacon;
 
   // Offset
   CoreOffsetSrc    offset_src;
@@ -113,9 +110,6 @@ struct StationConfig {
   int32_t          rtc_comp;       // ppm-like drift comp
   std::string      date;           // "YYYY-MM-DD"
   std::string      time;           // "HH:MM:SS"
-
-  // Filters
-  std::vector<std::string> ignore_prefixes;
 };
 
 // One row from the live waterfall stream.
@@ -198,12 +192,10 @@ bool core_cmd_set_radio(CoreRadioType r);
 // Identity
 bool core_cmd_set_call(const std::string& call);
 bool core_cmd_set_grid(const std::string& grid);
-bool core_cmd_set_comment(const std::string& comment);
 
-// CQ / beacon
+// CQ
 bool core_cmd_set_cq_type(CoreCqType t);
 bool core_cmd_set_cq_freetext(const std::string& text);
-bool core_cmd_set_beacon(CoreBeaconMode m);
 
 // Offset
 bool core_cmd_set_offset_src(CoreOffsetSrc s);
@@ -216,11 +208,6 @@ bool core_cmd_set_max_retry(int n);
 // RTC
 bool core_cmd_set_rtc(int64_t epoch_ms);
 bool core_cmd_set_rtc_comp(int32_t ppm_like);
-
-// Ignore list
-bool core_cmd_ignore_add   (const std::string& prefix);
-bool core_cmd_ignore_remove(const std::string& prefix);
-bool core_cmd_ignore_clear();
 
 // System
 bool core_cmd_save_config();   // persist to flash (most setters do this auto)

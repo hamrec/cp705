@@ -12,9 +12,6 @@
 
 #include <string>
 
-// Beacon (automatic CQ) mode.
-enum class BeaconMode { OFF = 0, EVEN, ODD };
-
 // CQ prefix variants.
 enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
 
@@ -26,9 +23,6 @@ enum class RadioType {
     NONE = 0,
     TRUSDX = 1,
     QMX = 2,      // legacy USB-C radios — retained so saved station files don't break
-    KH1_USBC = 3,
-    KH1 = KH1_USBC,
-    KH1_MIC = 4,
     QDX = 5,
     IC705 = 6,    // Icom IC-705 over WiFi
 };

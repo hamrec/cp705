@@ -116,10 +116,6 @@ void autoseq_clear();
 // For active QSOs, this moves the context to inactive; CQ entries are removed.
 bool autoseq_drop_index(int idx);
 
-// Rotate to the next QSO with the same slot parity as the current head.
-// Returns true if a rotation occurred.
-bool autoseq_rotate_same_parity();
-
 // Start a CQ call (adds CQ to queue). One-shot: transmits once then evicts.
 // slot_parity: 0 for even slots, 1 for odd slots
 void autoseq_start_cq(int slot_parity);
@@ -142,9 +138,6 @@ void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages);
 // This advances retry counter and sets next_tx for the next attempt
 void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary);
 
-// Get next TX text based on current state (does NOT modify state)
-bool autoseq_get_next_tx(std::string& out_text);
-
 // Fetch pending TX entry based on current state (does NOT modify state)
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out);
 
@@ -156,9 +149,6 @@ void autoseq_mark_sent(int64_t slot_idx);
 // single logging trigger. ctx->logged flag prevents duplicate logs across
 // retries or re-emissions.
 void autoseq_on_tx_starting();
-
-// Get display strings for active QSOs
-void autoseq_get_qso_states(std::vector<std::string>& out);
 
 // Copy the full active-zone QsoContext entries for structured consumers
 // (e.g. the core_api). Returns active contexts only; inactive
@@ -172,9 +162,6 @@ bool autoseq_get_active_context(int idx, QsoContext* out);
 
 // Check if there's any active QSO (not IDLE)
 bool autoseq_has_active_qso();
-
-// Get current queue size
-int autoseq_queue_size();
 
 // Set the ADIF logging callback
 void autoseq_set_adif_callback(AdifLogCallback cb);

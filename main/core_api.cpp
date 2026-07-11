@@ -28,13 +28,11 @@
 // ---------------------------------------------------------------------------
 extern std::string       g_call;
 extern std::string       g_grid;
-extern std::string       g_comment1;
 extern RadioType         g_radio;
 extern std::vector<BandItem> g_bands;
 extern int               g_band_sel;
 extern CqType            g_cq_type;
 extern std::string       g_cq_freetext;
-extern BeaconMode        g_beacon;
 extern OffsetSrc         g_offset_src;
 extern int               g_offset_hz;
 extern bool              g_skip_tx1;
@@ -42,7 +40,6 @@ extern int               g_autoseq_max_retry;
 extern int               g_rtc_comp;
 extern std::string       g_date;
 extern std::string       g_time;
-extern std::vector<std::string> g_ignore_prefixes;
 extern volatile bool     g_tx_cancel_requested;
 
 // Functions from main.cpp that core_api delegates to.
@@ -50,7 +47,6 @@ void save_station_data();
 void apply_radio_profile_binding();
 void update_autoseq_cq_type();
 void rebuild_active_bands();
-void rebuild_ignore_prefixes();
 bool rtc_apply_manual_time_from_strings();
 
 // Access to ui.cpp (RX list live in ui.cpp's static array).
@@ -91,23 +87,6 @@ struct ConfigGuard {
 // ---------------------------------------------------------------------------
 // Enum mapping helpers (core_api.h <-> station_types.h)
 // ---------------------------------------------------------------------------
-
-CoreBeaconMode map_out(BeaconMode m) {
-  switch (m) {
-    case BeaconMode::OFF:  return CoreBeaconMode::OFF;
-    case BeaconMode::EVEN: return CoreBeaconMode::EVEN;
-    case BeaconMode::ODD:  return CoreBeaconMode::ODD;
-  }
-  return CoreBeaconMode::OFF;
-}
-BeaconMode map_in(CoreBeaconMode m) {
-  switch (m) {
-    case CoreBeaconMode::OFF:  return BeaconMode::OFF;
-    case CoreBeaconMode::EVEN: return BeaconMode::EVEN;
-    case CoreBeaconMode::ODD:  return BeaconMode::ODD;
-  }
-  return BeaconMode::OFF;
-}
 
 CoreCqType map_out(CqType t) {
   switch (t) {
@@ -150,13 +129,9 @@ OffsetSrc map_in(CoreOffsetSrc s) {
 }
 
 CoreRadioType map_out(RadioType r) {
-  if (r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) {
-    return CoreRadioType::KH1;
-  }
   return (r == RadioType::QDX) ? CoreRadioType::QDX : CoreRadioType::QMX;
 }
 RadioType map_in(CoreRadioType r) {
-  if (r == CoreRadioType::KH1) return RadioType::KH1;
   return (r == CoreRadioType::QDX) ? RadioType::QDX : RadioType::QMX;
 }
 
@@ -291,7 +266,6 @@ void core_get_config(StationConfig& out) {
   ConfigGuard g;
   out.call        = g_call;
   out.grid        = g_grid;
-  out.comment     = g_comment1;
 
   out.radio       = map_out(g_radio);
   out.bands_hz.clear();
@@ -303,7 +277,6 @@ void core_get_config(StationConfig& out) {
 
   out.cq_type     = map_out(g_cq_type);
   out.cq_freetext = g_cq_freetext;
-  out.beacon      = map_out(g_beacon);
 
   out.offset_src  = map_out(g_offset_src);
   out.offset_hz   = g_offset_hz;
@@ -314,8 +287,6 @@ void core_get_config(StationConfig& out) {
   out.rtc_comp    = g_rtc_comp;
   out.date        = g_date;
   out.time        = g_time;
-
-  out.ignore_prefixes = g_ignore_prefixes;
 }
 
 // ---------------------------------------------------------------------------
@@ -459,8 +430,8 @@ bool core_cmd_set_band(int band_idx) {
   if (band_idx < 0 || band_idx >= (int)g_bands.size()) return false;
   if (!apply_config_write([&]{ g_band_sel = band_idx; })) return false;
   // The Cardputer defers the CAT push to STATUS exit because S->3 is a
-  // tap-cycle through bands (each press would otherwise click the KH1
-  // antenna relay). External clients pick a band in one operation, so
+  // tap-cycle through bands (each press would otherwise spam the radio
+  // with a CAT command). External clients pick a band in one operation, so
   // intentional change — so commit to the radio immediately.
   sync_radio_to_current_band("core set_band");
   return true;
@@ -496,9 +467,6 @@ bool core_cmd_set_grid(const std::string& grid) {
   autoseq_set_station(g_call, grid_ft8_4(g_grid));
   return true;
 }
-bool core_cmd_set_comment(const std::string& comment) {
-  return apply_config_write([&]{ g_comment1 = comment; });
-}
 
 bool core_cmd_set_cq_type(CoreCqType t) {
   {
@@ -520,10 +488,6 @@ bool core_cmd_set_cq_freetext(const std::string& text) {
   core_fire_config_changed();
   return true;
 }
-bool core_cmd_set_beacon(CoreBeaconMode m) {
-  return apply_config_write([&]{ g_beacon = map_in(m); });
-}
-
 bool core_cmd_set_offset_src(CoreOffsetSrc s) {
   return apply_config_write([&]{ g_offset_src = map_in(s); });
 }
@@ -582,44 +546,6 @@ bool core_cmd_set_rtc_comp(int32_t ppm_like) {
   return apply_config_write([&]{ g_rtc_comp = ppm_like; });
 }
 
-bool core_cmd_ignore_add(const std::string& prefix) {
-  if (prefix.empty()) return false;
-  {
-    ConfigGuard g;
-    for (const auto& p : g_ignore_prefixes) {
-      if (p == prefix) return true;  // already present
-    }
-    g_ignore_prefixes.push_back(prefix);
-  }
-  rebuild_ignore_prefixes();
-  g_config_save_pending = true;
-  core_fire_config_changed();
-  return true;
-}
-bool core_cmd_ignore_remove(const std::string& prefix) {
-  bool removed = false;
-  {
-    ConfigGuard g;
-    for (auto it = g_ignore_prefixes.begin(); it != g_ignore_prefixes.end(); ++it) {
-      if (*it == prefix) { g_ignore_prefixes.erase(it); removed = true; break; }
-    }
-  }
-  if (!removed) return false;
-  rebuild_ignore_prefixes();
-  g_config_save_pending = true;
-  core_fire_config_changed();
-  return true;
-}
-bool core_cmd_ignore_clear() {
-  {
-    ConfigGuard g;
-    g_ignore_prefixes.clear();
-  }
-  rebuild_ignore_prefixes();
-  g_config_save_pending = true;
-  core_fire_config_changed();
-  return true;
-}
 
 bool core_cmd_save_config() {
   g_config_save_pending = true;

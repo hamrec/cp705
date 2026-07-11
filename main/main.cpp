@@ -89,18 +89,6 @@ void debug_log_line_public(const std::string& msg) {
   debug_log_line(msg);
 }
 
-static void build_rxtx_log_path(char* path, size_t path_sz) {
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t;
-  localtime_r(&now, &t);
-
-  // RT[YYMMDD].txt
-  snprintf(path, path_sz, "RT%02d%02d%02d.txt",
-           (t.tm_year + 1900) % 100,
-           (t.tm_mon + 1) % 100,
-           t.tm_mday % 100);
-}
-
 static std::string today_qso_file_name() {
   time_t now = (time_t)(rtc_now_ms() / 1000);
   struct tm t;
@@ -119,10 +107,7 @@ static std::string storage_basename(const std::string& name_or_path) {
 
 static bool storage_is_active_log_name(const std::string& name_or_path) {
   const std::string name = storage_basename(name_or_path);
-  char rt_path[64];
-  build_rxtx_log_path(rt_path, sizeof(rt_path));
-  return name == storage_basename(rt_path) ||
-         name == today_qso_file_name() ||
+  return name == today_qso_file_name() ||
          name == "fieldday.txt";
 }
 
@@ -348,7 +333,7 @@ static bool rewrite_dxpedition_for_mycall(const std::string& raw_text,
 }
 
 static const char* TAG = "FT8";
-enum class UIMode { RX, TX, BAND, MENU, MSC, DEBUG, STATUS, QSO, GPS, PERF };
+enum class UIMode { RX, BAND, MENU, STATUS, GPS, PERF };
 enum class RtcTimeSource : uint8_t {
   SAVED = 0,
   ESP_RTC,
@@ -357,12 +342,10 @@ enum class RtcTimeSource : uint8_t {
   MANUAL,
 };
 static UIMode ui_mode = UIMode::RX;
-static int tx_page = 0;
 // NOTE: previous `std::vector<UiRxLine> g_rx_lines` was removed to eliminate
 // the last heap allocation in the decode/display path. The RX list now lives
 // as a static RxDecodeEntry array inside ui.cpp, populated via
 // ui_set_rx_list_static() and read back via ui_get_rx_entry()/ui_get_rx_count().
-static volatile bool g_tx_view_dirty = false;  // Set when autoseq state changes
 int64_t g_decode_slot_idx = -1; // set at decode trigger to tag RX lines with slot parity
 // Monotonic index of the most recent slot whose decode has been fully applied to
 // autoseq state (or whose audio was never decoded, e.g. paused/skipped). Enforces
@@ -399,7 +382,7 @@ static uint8_t g_perf_cpu_busy_pct[2] = {0, 0};
 static bool g_perf_cpu_hook_ok[2] = {false, false};
 static bool g_perf_cpu_sample_valid = false;
 
-// BeaconMode and BandItem now defined in station_types.h
+// BandItem now defined in station_types.h
 #include "station_types.h"
 std::vector<BandItem> g_bands = {   // visible to core_api.cpp
     {"160m", 1840},   {"80m", 3573},   {"60m", 5357},   {"40m", 7074},
@@ -412,11 +395,31 @@ static int band_page = 0;
 static int band_edit_idx = -1;       // absolute index into g_bands
 static std::string band_edit_buffer; // text while editing
 void update_autoseq_cq_type();  // visible to core_api.cpp
-BeaconMode g_beacon = BeaconMode::OFF;   // visible to core_api.cpp
 int g_offset_hz = 1500;                  // visible to core_api.cpp
 int g_band_sel = 5; // default 20m (index into g_bands)  // visible to core_api.cpp
 static bool g_tune = false;
-static BeaconMode g_status_beacon_temp = BeaconMode::OFF;
+static int64_t g_tune_stop_at_ms = 0;
+constexpr int kTuneAutoStopMs = 5000;  // brief automatic tone burst, not a manual toggle; matches TD705's 5s hard cap
+// Calling CQ (the `C` prompt) IS the beacon trigger now -- no separate STATUS
+// toggle. True from the moment a CQ is confirmed; keeps decode_monitor_results()
+// re-issuing that same CQ (enqueue_running_cq()) every cycle the queue goes
+// idle -- whether nobody answered, or a full QSO just finished -- until the
+// user answers someone else's decode or presses ESC.
+static bool g_cq_running = false;
+// "QSO COMPLETE" hero-card hold, set the instant a signed-off exchange leaves
+// the active queue (check_slot_boundary(), right after autoseq_tick() evicts
+// it -- see there for why this is the correct, already-logged completion
+// point). Held for a few seconds (matching TD705's reference behavior) before
+// either resuming the running CQ or falling back to the plain RX list.
+static bool g_qso_done_active = false;
+static int64_t g_qso_done_since_ms = 0;
+static bool g_qso_done_was_cq_running = false;
+// True when this hold is a give-up (retries exhausted mid-exchange, no RR73/73
+// ever heard) rather than a genuine sign-off -- same hold/auto-clear timing,
+// different label/color so a failed contact doesn't read as a success.
+static bool g_qso_done_gave_up = false;
+constexpr int64_t kQsoDoneResumeCqMs = 4000;   // TD705: hold, then resume calling CQ
+constexpr int64_t kQsoDoneReturnRxMs = 12000;  // TD705: hold, then fall back to RX (answered someone else's CQ)
 [[maybe_unused]] static bool g_cat_toggle_high = false;
 std::string g_date = "2025-12-11";      // visible to core_api.cpp
 std::string g_time = "10:10:00";        // visible to core_api.cpp
@@ -432,8 +435,6 @@ static TickType_t g_app_core0_stack_last_sample_tick = 0;
 static uint32_t g_app_core0_stack_cur_free_bytes = 0;
 static uint32_t g_app_core0_stack_min_free_bytes = 0;
 
-static void enter_msc_mode(const char* reason);
-static void exit_msc_mode();
 static void host_handle_line(const std::string& line);
 void save_station_data();  // visible to core_api.cpp
 
@@ -467,23 +468,17 @@ static bool g_rx_dirty = false;
 
 
 
-static std::vector<std::string> g_msc_lines = {
-    "CP705 USB drive",
-    "now mounted on PC.",
-    "",
-    "Safely eject on PC,",
-    "then press C to",
-    "return to radio."
+// HELP text for the serial host-command console (host_handle_line()) --
+// unrelated to any on-screen UI mode.
+static std::vector<std::string> g_host_help_lines = {
+    "WRITE/APPEND/READ",
+    "DELETE/LIST <file>",
+    "WRITEBIN <file> <n>",
+    "DATE/TIME/SLEEP",
+    "INFO/HELP/EXIT",
 };
 
-static std::vector<std::string> g_startup_lines = {
-    "** CP705 V2.4 **",
-    " S/R/T: Operate",
-    " M/N/O: Menu",
-    " Q/F/D: File",
-    "      * * * * *     ",
-    "mini-ft8 port: KD3AN"
-};
+static const char* kAppVersion = "3.0";
 
 // Runtime latch: when true, we're still showing the startup screen. Either
 // a keypress or the 5 s auto-dismiss timer (g_startup_start_ms) takes us
@@ -514,37 +509,15 @@ static bool is_startup_direct_mode_key(char c) {
   }
 }
 
-static std::vector<std::string> g_q_lines;
-static std::vector<std::string> g_q_files;
-enum class QPageView { Default, Alternate };
-struct QsoLogEntry {
-  std::string time_on;
-  std::string band;
-  std::string call;
-  bool has_rst_rcvd = false;
-  int rst_rcvd = 0;
-  bool has_rst_sent = false;
-  int rst_sent = 0;
-};
-static QPageView g_q_page_view = QPageView::Default;
-static std::vector<QsoLogEntry> g_q_entries;
-static bool g_q_entries_have_next_page = false;
-static bool g_q_show_entries = false;
-static int q_page = 0;
-static std::string g_q_current_file;
-// "Clear QSO log" is a normal numbered row in the QSO file list (its digit
-// re-purposed as a confirm button): pressing its number arms a 2-step confirm
+// "Clear QSO log" lives in the settings menu (Logging category): its item
+// number doubles as the confirm button — pressing it arms a 2-step confirm
 // for wiping the NVS QSO log (e.g. starting fresh between POTA activations),
 // pressing the SAME number again within kQClearArmMs actually clears it.
 static bool g_q_clear_armed = false;
 static int64_t g_q_clear_arm_deadline = 0;
 static std::string g_q_clear_feedback;
 static int64_t g_q_clear_feedback_deadline = 0;
-static int g_q_clear_row_idx = -1;  // absolute index of the clear-log row in g_q_lines
 constexpr int64_t kQClearArmMs = 3000;
-static std::vector<std::string> g_d_lines;
-static std::vector<std::string> g_d_files;
-static int d_page = 0;
 static std::string host_input;
 static const char* HOST_PROMPT = "CP705> ";
 static bool usb_ready = false;
@@ -592,6 +565,15 @@ CqType g_cq_type = CqType::CQ;                // visible to core_api.cpp
 std::string g_cq_freetext = "FreeText";       // visible to core_api.cpp
 bool g_skip_tx1 = false;                      // visible to core_api.cpp
 int g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;  // visible to core_api.cpp
+// Display brightness, in steps of 1..10 (10% .. 100%). Persisted; applied to
+// the panel via apply_brightness() on load and whenever changed in the menu.
+static int g_brightness_step = 10;
+static void apply_brightness() {
+  int pct = g_brightness_step;
+  if (pct < 1) pct = 1;
+  if (pct > 10) pct = 10;
+  M5.Display.setBrightness((uint8_t)(255 * pct / 10));
+}
 static std::string g_free_text = "TNX 73";
 std::string g_call = "";   // visible to core_api.cpp; set via MENU P1 / Station.txt
 std::string g_grid = "";    // visible to core_api.cpp; set via MENU P1 / Station.txt
@@ -621,22 +603,12 @@ static int         g_ic705_civ_addr = 0xA4;   // default IC-705 CI-V address
 static std::string g_ic705_net_user = "";
 static std::string g_ic705_net_pass = "";
 
-static bool g_kh1_connected = false;
 static int g_gps_baud = 115200;
-static bool g_gnss_lora_enabled = false;
-static constexpr size_t kIgnorePrefixTextMaxLen = 64;
-std::string g_comment1 = "CP705 /Radio";      // visible to core_api.cpp
-static std::string g_ignore_prefix_text;
-std::vector<std::string> g_ignore_prefixes;     // visible to core_api.cpp
-static bool g_rxtx_log = true;
 static RadioType canonical_radio_type(RadioType r);
-static RadioType parse_radio_config_value(const char* raw);
-static bool is_kh1_radio(RadioType r);
 static bool radio_type_uses_display_only(RadioType r);
 static RadioProfileBinding get_radio_profile_binding(RadioType r);
 void apply_radio_profile_binding();   // visible to core_api.cpp
 static void gps_runtime_tick();
-static std::string expand_comment_macros(const std::string& src);
 static std::string normalize_grid_maidenhead(const std::string& src);
 // Non-static so core_api.cpp's set_call / set_grid RPCs can refresh the
 // autoseq station info exactly like the on-device MENU/STATUS edits do.
@@ -662,7 +634,20 @@ static bool storage_reject_active_log_user_mutation(const std::string& name_or_p
   return storage_should_guard_active_logs() && storage_is_active_log_name(name_or_path);
 }
 
-static int menu_page = 0;
+// Settings menu: M opens a category picker; picking one (1-4) shows that
+// category's settings. -1 = picker, 0-3 = category index (see kCat* below).
+// Each category fits in exactly one page of 6 rows, so unlike the old flat
+// paged menu there's no in-category paging. menu_edit_idx stays a GLOBAL
+// index across all categories (matches the pre-existing convention elsewhere
+// in this file); MENU_CAT_BASE converts it to/from the local 0-5 row index
+// each category's own small `lines` vector needs for ui_draw_list().
+static int menu_category = -1;
+constexpr int kCatStation  = 0;
+constexpr int kCatOperating = 1;
+constexpr int kCatNetwork  = 2;
+constexpr int kCatLogging  = 3;
+constexpr int kCatSystem  = 4;
+constexpr int MENU_CAT_BASE = 6;  // global_index = category*6 + local_index
 static int menu_edit_idx = -1;
 // Tracks the protocol mode that has been saved to Station.txt and will take
 // effect on next reboot.  Initialised from g_protocol after load_station_data().
@@ -673,9 +658,14 @@ static bool g_protocol_pending_ft4 = false;
 static std::string menu_edit_buf;
 static int menu_cursor_edit_original = 0;
 static bool menu_long_edit = false;
-static enum { LONG_NONE, LONG_FT, LONG_COMMENT, LONG_ACTIVE, LONG_IGNORE } menu_long_kind = LONG_NONE;
+static enum { LONG_NONE, LONG_FT, LONG_ACTIVE } menu_long_kind = LONG_NONE;
 static std::string menu_long_buf;
 static std::string menu_long_backup;
+// -1 = cursor always at buffer end (ActiveBand's existing behavior).
+// >=0 = insert/backspace operate at this position instead (used by the CQ
+// text prompt, pre-positioned right after "CQ " so typing a prefix needs no
+// backspacing/navigation first).
+static int menu_long_cursor_pos = -1;
 static int menu_flash_idx = -1;          // absolute index to flash highlight
 static int64_t menu_flash_deadline = 0;  // ms timestamp when flash ends
 static std::string menu_copy_feedback_text;
@@ -695,6 +685,7 @@ static void consume_cdc_initial_sync();
 bool sync_radio_to_current_band(const char* reason);
 static void menu_flash_tick();
 static void rx_flash_tick();
+static void tune_tick();
 static bool looks_like_grid(const std::string& s);
 static bool looks_like_report(const std::string& s, int& out);
 static std::string g_last_reply_text;
@@ -703,15 +694,9 @@ static void schedule_tx_if_idle();
 static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry scheduling
 [[maybe_unused]] static bool g_sync_pending = false;
 [[maybe_unused]] static int g_sync_delta_ms = 0;
-static void enqueue_beacon_cq();
-static void load_storage_regular_files(std::vector<std::string>& files);
-static void qso_load_file_list();
-static void qso_load_fetch_file_list();
-static void delete_load_file_list();
-static void qso_load_entries(const std::string& path);
-static void qso_draw_page();
-
-static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter = -1);
+static void enqueue_running_cq();
+static void qso_done_tick();
+static void clear_decode_list();
 static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
 // Count of QSO records logged this session (shown in the QSO view). Incremented
 // by log_adif_entry(), which may run on the core1 decode task — plain int only.
@@ -836,335 +821,8 @@ static bool storage_write_cabrillo_fd_entry(const std::string& mycall,
 #endif
 }
 
-static void log_rxtx_line(char dir, int snr, int offset_hz, const std::string& text, int repeat_counter) {
-  if (!g_rxtx_log) return;
-
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t;
-  localtime_r(&now, &t);
-  char ts[32];
-  snprintf(ts, sizeof(ts), "%04d%02d%02d %02d%02d%02d",
-           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-           t.tm_hour, t.tm_min, t.tm_sec);
-  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
-
-  char log_path[64];
-  build_rxtx_log_path(log_path, sizeof(log_path));
-
-  char line[256];
-  if (dir == 'T') {
-    snprintf(line, sizeof(line), "%c [%s][%.3f] %s %d\n",
-             dir, ts, freq_mhz, text.c_str(), offset_hz);
-  } else {
-    snprintf(line, sizeof(line), "%c [%s][%.3f] %s %d %d\n",
-             dir, ts, freq_mhz, text.c_str(), snr, offset_hz);
-  }
-  (void)repeat_counter;
-  (void)storage_append_text_locked_path(log_path, line, "", false);
-}
-
-static bool log_gps_grid_line(const std::string& grid8) {
-  if (!g_rxtx_log) return false;
-  if (grid8.size() != 8) return false;
-
-  // GPS grid breadcrumbs use RT files but not log_rxtx_line(), which appends
-  // RX SNR/offset fields that do not apply to this record type.
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t;
-  localtime_r(&now, &t);
-  char ts[32];
-  snprintf(ts, sizeof(ts), "%04d%02d%02d %02d%02d%02d",
-           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-           t.tm_hour, t.tm_min, t.tm_sec);
-  double freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
-
-  char log_path[64];
-  build_rxtx_log_path(log_path, sizeof(log_path));
-
-  char line[128];
-  snprintf(line, sizeof(line), "G [%s][%.3f] %s\n", ts, freq_mhz, grid8.c_str());
-  bool ok = storage_append_text_locked_path(log_path, line, "", false);
-  if (ok) ESP_LOGI(TAG, "GPS grid logged: %s", grid8.c_str());
-  return ok;
-}
-
-static bool is_daily_qso_txt_file(const char* name) {
-  if (!name) return false;
-  if (strlen(name) != 12) return false;  // YYYYMMDD.txt
-  for (int i = 0; i < 8; ++i) {
-    if (!std::isdigit(static_cast<unsigned char>(name[i]))) return false;
-  }
-  return name[8] == '.' &&
-         std::tolower(static_cast<unsigned char>(name[9])) == 't' &&
-         std::tolower(static_cast<unsigned char>(name[10])) == 'x' &&
-         std::tolower(static_cast<unsigned char>(name[11])) == 't';
-}
-
-static const char* storage_owner_label(StorageOwner owner) {
-  switch (owner) {
-    case StorageOwner::UNAVAILABLE: return "unavailable";
-    case StorageOwner::FIRMWARE:    return "firmware";
-    case StorageOwner::USB_HOST:    return "usb_host";
-    case StorageOwner::TRANSITION:  return "transition";
-  }
-  return "unknown";
-}
-
-static const char* qso_storage_list_failure_text(StorageOwner owner) {
-  switch (owner) {
-    case StorageOwner::USB_HOST:
-    case StorageOwner::TRANSITION:
-      return "Storage busy";
-    case StorageOwner::UNAVAILABLE:
-      return "Storage unavailable";
-    case StorageOwner::FIRMWARE:
-      return "List failed";
-  }
-  return "List failed";
-}
-
 static bool nvs_save_station(const std::string& content);  // defined below
 static bool nvs_load_station(std::string& out);            // defined below
-
-// One-line log status for the QSO view: number of QSO records logged this
-// session (each is written to NVS and best-effort to the SD card). Swaps in
-// the clear-log result feedback in the same row when active, so the confirm
-// flow doesn't shift the rest of the screen layout.
-static std::string sd_log_status_line() {
-  const int64_t now = rtc_now_ms();
-  if (!g_q_clear_feedback.empty() && now < g_q_clear_feedback_deadline) {
-    return g_q_clear_feedback;
-  }
-  char sd[40];
-  snprintf(sd, sizeof(sd), "Log NVS+SD  QSOs:%u", (unsigned)g_adif_sd_seq);
-  return sd;
-}
-
-// Label for the numbered "Clear QSO log" row. `row_idx` is this row's 0-based
-// absolute position in g_q_lines (== the digit key that selects it, 1-based);
-// while armed it prompts to press that same digit again to confirm.
-static std::string clear_log_row_label(int row_idx) {
-  const int64_t now = rtc_now_ms();
-  if (g_q_clear_armed && now < g_q_clear_arm_deadline) {
-    char buf[48];
-    snprintf(buf, sizeof(buf), "Press %d again: confirm", row_idx + 1);
-    return buf;
-  }
-  return "Clear QSO log";
-}
-
-static void qso_load_file_list() {
-  g_q_files.clear();
-  g_q_entries.clear();
-  g_q_lines.clear();
-  g_q_entries_have_next_page = false;
-  std::vector<std::string> files;
-  if (!storage_file_list(files)) {
-    // Internal flash has no FATFS partition on this board, so the in-app file
-    // list is unavailable. QSO logs live on the SD card (YYYYMMDD.adi) and in
-    // NVS — pull the card to import them.
-    g_q_lines.push_back("QSO log on SD card");
-    g_q_lines.push_back(sd_log_status_line());
-    g_q_clear_row_idx = (int)g_q_lines.size();
-    g_q_lines.push_back(clear_log_row_label(g_q_clear_row_idx));
-    return;
-  }
-  for (const auto& name : files) {
-    if (is_daily_qso_txt_file(name.c_str())) {
-      g_q_files.push_back(name);
-    }
-  }
-  std::sort(g_q_files.begin(), g_q_files.end(), std::greater<std::string>());
-  const StorageOwner owner = storage_service_owner();
-  ESP_LOGI(TAG, "QSO file list: owner=%s files=%u daily=%u",
-           storage_owner_label(owner),
-           static_cast<unsigned>(files.size()),
-           static_cast<unsigned>(g_q_files.size()));
-  if (g_q_files.empty()) {
-    g_q_lines.push_back("No YYYYMMDD.txt");
-    g_q_lines.push_back(sd_log_status_line());
-    g_q_clear_row_idx = (int)g_q_lines.size();
-    g_q_lines.push_back(clear_log_row_label(g_q_clear_row_idx));
-    return;
-  }
-  // File rows first so g_q_lines[i] stays aligned with g_q_files[i] for numbered
-  // selection; the SD status goes last (its row index >= g_q_files.size(), so the
-  // selection handler safely ignores a press on it).
-  for (size_t i = 0; i < g_q_files.size(); ++i) {
-    g_q_lines.push_back(g_q_files[i]);
-  }
-  g_q_lines.push_back(sd_log_status_line());
-}
-
-static void load_storage_regular_files(std::vector<std::string>& files) {
-  if (!storage_file_list(files)) files.clear();
-  std::sort(files.begin(), files.end(), std::greater<std::string>());
-}
-
-static void delete_load_file_list() {
-  g_d_files.clear();
-  g_d_lines.clear();
-  load_storage_regular_files(g_d_files);
-  g_d_files.erase(std::remove(g_d_files.begin(), g_d_files.end(), "Station.txt"), g_d_files.end());
-  if (g_d_files.empty()) {
-    g_d_lines.push_back("No storage files");
-    return;
-  }
-  for (size_t i = 0; i < g_d_files.size(); ++i) {
-    g_d_lines.push_back(std::string("DEL ") + g_d_files[i]);
-  }
-}
-
-static void qso_load_fetch_file_list() {
-  g_q_files.clear();
-  g_q_entries.clear();
-  g_q_lines.clear();
-  g_q_entries_have_next_page = false;
-  load_storage_regular_files(g_q_files);
-  if (g_q_files.empty()) {
-    g_q_lines.push_back("No storage files");
-    return;
-  }
-  for (size_t i = 0; i < g_q_files.size(); ++i) {
-    g_q_lines.push_back(g_q_files[i]);
-  }
-}
-
-static std::string qso_trim_head(const std::string& in, size_t max_len) {
-  if (in.size() <= max_len) return in;
-  if (max_len == 0) return "";
-  if (max_len == 1) return ">";
-  return in.substr(0, max_len - 1) + ">";
-}
-
-static bool qso_parse_rst(const std::string& raw, int& out) {
-  if (raw.empty()) return false;
-  char* end = nullptr;
-  long v = std::strtol(raw.c_str(), &end, 10);
-  if (end == raw.c_str() || !end || *end != '\0') return false;
-  if (v < -99) v = -99;
-  if (v > 99) v = 99;
-  out = static_cast<int>(v);
-  return true;
-}
-
-static std::string qso_format_signed3(bool has_value, int value) {
-  if (!has_value) return "-??";
-  char out[4];
-  std::snprintf(out, sizeof(out), "%+03d", value);
-  return out;
-}
-
-static std::string qso_format_sent4(bool has_value, int value) {
-  if (!has_value) return "S-??";
-  char out[5];
-  std::snprintf(out, sizeof(out), "S%+03d", value);
-  return out;
-}
-
-static void qso_rebuild_entry_lines() {
-  g_q_lines.clear();
-  for (const auto& e : g_q_entries) {
-    std::string call_field = qso_trim_head(e.call, 11);
-    if (call_field.size() < 11) {
-      call_field.append(11 - call_field.size(), ' ');
-    }
-
-    if (g_q_page_view == QPageView::Alternate) {
-      const std::string rcvd = qso_format_signed3(e.has_rst_rcvd, e.rst_rcvd);
-      const std::string sent = qso_format_sent4(e.has_rst_sent, e.rst_sent);
-      g_q_lines.push_back(call_field + rcvd + " " + sent);
-    } else {
-      const std::string band_disp = qso_trim_head(e.band, 6);
-      g_q_lines.push_back(e.time_on + " " + band_disp + " " + call_field);
-    }
-  }
-
-  if (g_q_lines.empty()) {
-    g_q_lines.push_back("No QSOs");
-  }
-}
-
-static void qso_load_entries(const std::string& path) {
-  g_q_entries.clear();
-  g_q_lines.clear();
-  g_q_entries_have_next_page = false;
-  StorageStream* stream = storage_stream_open(path, StorageOpenMode::READ);
-  if (!stream) {
-    g_q_lines.push_back("Open fail");
-    return;
-  }
-  const int first_qso = std::max(0, q_page) * 6;
-  int qso_index = 0;
-  int page_count = 0;
-  char line[512];
-  while (storage_stream_read_line(stream, line, sizeof(line))) {
-    std::string s(line);
-    std::string s_lower = s;
-    std::transform(s_lower.begin(), s_lower.end(), s_lower.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    if (s_lower.find("<call:") == std::string::npos) continue;
-    if (qso_index++ < first_qso) continue;
-    if (page_count >= 6) {
-      g_q_entries_have_next_page = true;
-      break;
-    }
-    auto get_field = [&](const std::string& tag)->std::string {
-      size_t p = s_lower.find("<" + tag);
-      if (p == std::string::npos) return "";
-      size_t gt = s.find('>', p);
-      if (gt == std::string::npos) return "";
-      size_t end_space = s.find(' ', gt + 1);
-      size_t end_tag = s.find('<', gt + 1);
-      size_t end = s.size();
-      if (end_space != std::string::npos && end_space < end) end = end_space;
-      if (end_tag != std::string::npos && end_tag < end) end = end_tag;
-      return s.substr(gt + 1, end - gt - 1);
-    };
-    std::string call = get_field("call:");
-    std::string time_on = get_field("time_on:");
-    std::string freq = get_field("freq:");
-    std::string rst_rcvd_raw = get_field("rst_rcvd:");
-    std::string rst_sent_raw = get_field("rst_sent:");
-    std::string band = freq;
-    if (!freq.empty()) {
-      // crude map: take MHz and map to band name from our band list
-      double mhz = atof(freq.c_str());
-      for (const auto& b : g_bands) {
-        double bm = b.freq * 0.001;
-        if (fabs(bm - mhz) < 0.1) { band = b.name; break; }
-      }
-    }
-    if (time_on.size() >= 4) {
-      time_on = time_on.substr(0,4);
-      time_on.insert(2, ":");
-    }
-    if (time_on.size() != 5) time_on = "??:??";
-    if (call.empty()) call = "?";
-    if (band.empty()) band = freq.empty() ? "?" : freq;
-
-    QsoLogEntry e;
-    e.time_on = time_on;
-    e.band = band;
-    e.call = call;
-    e.has_rst_rcvd = qso_parse_rst(rst_rcvd_raw, e.rst_rcvd);
-    e.has_rst_sent = qso_parse_rst(rst_sent_raw, e.rst_sent);
-    g_q_entries.push_back(e);
-    page_count++;
-  }
-  storage_stream_close(stream);
-  qso_rebuild_entry_lines();
-}
-
-static void qso_draw_page() {
-  if (g_q_show_entries) {
-    // Entry view: render raw QSO lines without "1..6 " prefixes.
-    ui_draw_debug(g_q_lines, 0);
-  } else {
-    // File list view: keep numbered selection rows.
-    ui_draw_list(g_q_lines, q_page, -1);
-  }
-}
 
 // Autoseq's log callback: gather live station/band state into a QsoLogRecord and
 // hand it to the qso_log module (ADIF formatting + durable NVS + SD/flash live
@@ -1180,10 +838,10 @@ static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   r.mode     = g_protocol->name;
   r.mycall   = g_call;
   r.mygrid   = grid_ft8_4(g_grid);
-  r.comment  = expand_comment_macros(g_comment1);
+  r.comment  = "CP705 IC-705";
   r.utc_ms   = rtc_now_ms();
   qso_log_write(r);
-  g_adif_sd_seq++;   // QSO count for the on-screen status
+  g_adif_sd_seq = g_adif_sd_seq + 1;   // QSO count for the on-screen status
   return true;       // NVS write makes the record durable; never force a retry
 }
 
@@ -1207,8 +865,7 @@ static void poll_uart_inject_keys() {
   // Read directly from the console UART FIFO — no driver needed.
   // sdkconfig configures ESP console on UART0 peripheral with custom
   // pins TX=G4, RX=G5 (see CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0
-  // and CONFIG_ESP_CONSOLE_UART_TX_GPIO / _RX_GPIO). KH1 CAT uses
-  // UART1 peripheral on GPIO1 — no conflict.
+  // and CONFIG_ESP_CONSOLE_UART_TX_GPIO / _RX_GPIO).
   uart_dev_t *hw = UART_LL_GET_HW(0);
   while (true) {
     uint32_t avail = uart_ll_get_rxfifo_len(hw);
@@ -1267,13 +924,9 @@ static volatile bool g_uart_mirror_pending = false;
 static const char* uart_mirror_mode_label(UIMode mode) {
   switch (mode) {
     case UIMode::RX:      return "RX";
-    case UIMode::TX:      return "TX";
     case UIMode::BAND:    return "BAND";
     case UIMode::MENU:    return "MENU";
-    case UIMode::MSC:     return "MSC";
-    case UIMode::DEBUG:   return "DEBUG";
     case UIMode::STATUS:  return "STATUS";
-    case UIMode::QSO:     return "QSO";
     case UIMode::GPS:     return "GPS";
     case UIMode::PERF:    return "PERF";
   }
@@ -1307,29 +960,22 @@ static void set_gpio_floating_input(gpio_num_t pin) {
   gpio_intr_disable(pin);
 }
 
+// The LoRa-1262 cap's GNSS is the only GPS source now, and it always needs
+// G4/G5 free — so the debug UART on those pins stays parked floating
+// unconditionally (previously conditional on the PORTA/GNSS_LoRa toggle).
 static void apply_debug_uart_pin_policy() {
-  const bool enable = !g_gnss_lora_enabled;
-  if (enable && g_debug_uart_pins_enabled) return;
-
   const gpio_num_t tx = (gpio_num_t)U0TXD_GPIO_NUM;
   const gpio_num_t rx = (gpio_num_t)U0RXD_GPIO_NUM;
-  if (enable) {
-    uart_set_pin(UART_NUM_0, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    uart_inject_last_was_cr = false;
-    g_debug_uart_pins_enabled = true;
-    ESP_LOGI(TAG, "G4/G5 debug UART enabled");
-  } else {
-    if (s_key_inject_queue) xQueueReset(s_key_inject_queue);
-    uart_inject_last_was_cr = false;
+  if (s_key_inject_queue) xQueueReset(s_key_inject_queue);
+  uart_inject_last_was_cr = false;
 #if UART_SCREEN_MIRROR
-    g_uart_mirror_pending = false;
+  g_uart_mirror_pending = false;
 #endif
-    set_gpio_floating_input(tx);
-    set_gpio_floating_input(rx);
-    const bool changed = g_debug_uart_pins_enabled;
-    g_debug_uart_pins_enabled = false;
-    if (changed) ESP_LOGI(TAG, "G4/G5 debug UART disabled for GNSS LoRa");
-  }
+  set_gpio_floating_input(tx);
+  set_gpio_floating_input(rx);
+  const bool changed = g_debug_uart_pins_enabled;
+  g_debug_uart_pins_enabled = false;
+  if (changed) ESP_LOGI(TAG, "G4/G5 debug UART disabled for GNSS LoRa");
 }
 
 struct WAVHeader {
@@ -1457,31 +1103,106 @@ struct WAVHeader {
   return ESP_OK;
 }
 
-static void redraw_tx_view() {
-  // Get QSO states from autoseq for display
-  std::vector<std::string> qtext;
-  autoseq_get_qso_states(qtext);
+// Tracks which view (decode list vs hero card) was drawn last, so switching
+// between them gets a one-time full-screen force-redraw instead of visual
+// bleed from whichever view was showing before.
+static bool s_hero_was_active = false;
 
-  std::vector<bool> marks(qtext.size(), false);  // No delete marks with autoseq
-  std::vector<int> slots;
+// Once a QSO/CQ goes active, the hero card locks on screen and stays there
+// even after autoseq finishes and pops the context back to an empty queue --
+// it only comes down when the user explicitly presses ESC (backtick). See
+// render_rx_or_hero() (sets this true) and the RX-mode '`' handler (clears it).
+static bool g_hero_locked = false;
 
-  // Slot color for pending TX
-  slots.push_back(g_pending_tx_valid ? (g_pending_tx.slot_id & 1) : 0);
-  // All QSO entries use their context's slot
-  for (size_t i = 0; i < qtext.size(); ++i) {
-    slots.push_back(0);  // Default to even; autoseq manages internally
+// Snapshot of the last real (non-empty) hero info, so the frozen post-QSO
+// display shows the completed exchange instead of a blank/zeroed context
+// once autoseq pops the finished entry out of the active queue.
+static QsoHeroInfo s_last_hero_info{};
+
+static void build_qso_hero_info(QsoHeroInfo& info) {
+  if (autoseq_active_count() == 0) {
+    info = s_last_hero_info;
+    // g_qso_done_active means this is the exact context that just legitimately
+    // ended (see check_slot_boundary()) -- either a real sign-off (show fully
+    // complete, all 6 stage boxes green) or a give-up (retries exhausted, no
+    // RR73/73 ever heard -- leave the tracker frozen at whatever stage it
+    // actually reached instead of falsely marking the whole thing green).
+    info.qso_done = g_qso_done_active && !g_qso_done_gave_up;
+    info.qso_gave_up = g_qso_done_active && g_qso_done_gave_up;
+    if (info.qso_done) info.stage = 6;
+    return;
   }
+  QsoContext ctx{};
+  autoseq_get_active_context(0, &ctx);
+  // autoseq_start_cq() enqueues a self-CQ one-shot with the literal
+  // placeholder dxcall "CQ" (see enqueue_one_shot in autoseq.cpp) — that's
+  // not a real worked station, so detect it by that placeholder rather than
+  // by an empty dxcall (which never actually happens for this context).
+  info.calling_cq = (ctx.dxcall == "CQ");
+  // While calling CQ there's no worked station yet -- leave dxcall/dxgrid
+  // empty so ui_draw_qso_hero() falls back to "--" instead of showing our
+  // own callsign, which read as if we'd already worked ourselves.
+  info.dxcall = info.calling_cq ? "" : ctx.dxcall;
+  info.dxgrid = info.calling_cq ? "" : ctx.dxgrid;
+  // Only meaningful (and only guaranteed to match what's actually keyed out)
+  // when g_cq_type is CQFREETEXT -- that's the only path the C prompt uses,
+  // but guard it explicitly rather than assume, since g_cq_type can still be
+  // set to something else via a stale saved config or the external core_api.
+  info.cq_text = (info.calling_cq && g_cq_type == CqType::CQFREETEXT) ? g_cq_freetext : "";
+  // AutoseqState CALLING..SIGNOFF (autoseq.h) maps 0..5 directly onto the
+  // 6-stage tracker (CQ/GRID/RPT/R/RR73/73) — same order, same count.
+  info.stage = (int)ctx.state;
+  if (info.stage < 0) info.stage = 0;
+  if (info.stage > 5) info.stage = 5;
 
-  std::string next_line;
-  if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
-    // Use scheduled TX text if available
-    next_line = g_pending_tx.text;
+  char fbuf[32];
+  snprintf(fbuf, sizeof(fbuf), "%.3f  %s  G:%d", 0.001 * (double)g_bands[g_band_sel].freq,
+           g_bands[g_band_sel].name, ic705_tx_get_gain_q8());
+  info.freq_band = fbuf;
+  info.snr = ctx.snr_tx;  // our measurement of their signal
+  info.clock_hm = g_time.substr(0, 5);
+  info.qso_count = (int)g_adif_sd_seq;
+  info.qso_done = false;      // still mid-exchange, not the completion hold
+  info.qso_gave_up = false;
+  s_last_hero_info = info;
+}
+
+// Draws the decode list or the QSO hero card, whichever applies right now.
+// Call sites: the two g_rx_dirty-gated spots in the main loop.
+static void render_rx_or_hero() {
+  // Lock the hero card on as soon as a QSO/CQ goes active. Deliberately does
+  // NOT auto-clear when autoseq_active_count() drops back to 0 (QSO signed
+  // off and got popped) -- only the RX-mode '`' (ESC) handler clears the lock,
+  // so the completed exchange stays on screen for review until dismissed.
+  if (autoseq_active_count() > 0) g_hero_locked = true;
+  const bool hero_now = g_hero_locked;
+  if (hero_now != s_hero_was_active) {
+    if (!hero_now) {
+      // Hero's status/clock row overlaps the waterfall + countdown bar's
+      // screen real estate (both live in the top ~21px), and neither of
+      // those get touched by ui_force_redraw_rx() (that only invalidates
+      // the decode list's own diff cache) -- so without a full clear here,
+      // stale hero pixels (e.g. "CALLING CQ" + the clock) linger at the top
+      // until fresh waterfall data happens to paint over them. The decode
+      // list, waterfall, and countdown bar all repaint themselves within
+      // the next tick or two via their existing dirty-tracked redraws.
+      M5.Display.fillScreen(TFT_BLACK);
+      ui_force_redraw_rx();
+    } else {
+      // Entering the hero view: the decode list / waterfall were on screen,
+      // so force the first hero draw to be a full repaint (its diff cache is
+      // stale relative to what's actually on the glass).
+      ui_hero_invalidate();
+    }
+    s_hero_was_active = hero_now;
+  }
+  if (hero_now) {
+    QsoHeroInfo info;
+    build_qso_hero_info(info);
+    ui_draw_qso_hero(info);
   } else {
-    // Fall back to autoseq's next TX (for display when TX not yet scheduled)
-    autoseq_get_next_tx(next_line);
+    ui_draw_rx(rx_flash_idx);
   }
-
-  ui_draw_tx(next_line, qtext, tx_page, -1, marks, slots);
 }
 
 static void draw_band_view() {
@@ -1503,29 +1224,6 @@ static void draw_band_view() {
   ui_draw_list(lines, band_page, band_edit_idx);
 }
 
-static const char* beacon_name(BeaconMode m) {
-  switch (m) {
-    case BeaconMode::OFF: return "OFF";
-    case BeaconMode::EVEN: return "EVEN";
-    //case BeaconMode::EVEN2: return "EVEN2";
-    case BeaconMode::ODD: return "ODD";
-    //case BeaconMode::ODD2: return "ODD2";
-  }
-  return "OFF";
-}
-
-static const char* cq_type_name(CqType t) {
-  switch (t) {
-    case CqType::CQ: return "CQ";
-    case CqType::CQSOTA: return "CQ SOTA";
-    case CqType::CQPOTA: return "CQ POTA";
-    case CqType::CQQRP: return "CQ QRP";
-    case CqType::CQFD: return "CQ FD";
-    case CqType::CQFREETEXT: return "FreeText";
-  }
-  return "CQ";
-}
-
 static const char* offset_name(OffsetSrc o) {
   switch (o) {
     case OffsetSrc::RANDOM: return "Random";
@@ -1536,74 +1234,22 @@ static const char* offset_name(OffsetSrc o) {
 }
 
 static RadioType canonical_radio_type(RadioType r) {
-  if (r == RadioType::IC705 ||
-      r == RadioType::KH1_USBC || r == RadioType::KH1_MIC) return r;
+  if (r == RadioType::IC705) return r;
   return RadioType::IC705;  // default all unrecognised to IC-705
-}
-
-static bool is_kh1_radio(RadioType r) {
-  r = canonical_radio_type(r);
-  return r == RadioType::KH1_USBC || r == RadioType::KH1_MIC;
 }
 
 static bool radio_type_uses_display_only(RadioType r) {
   // Always use display-only board init (upstream design): audio input is owned
-  // exclusively by the selected backend (UAC for QMX/KH1-USBC, native I2S mic
-  // for KH1-MIC), so general M5Unified startup must not claim speaker/mic/audio
-  // resources. The keyboard still works because beginDisplayOnly() initializes
-  // it via Keyboard.begin() (auto-detects board type) — see
-  // components/M5Cardputer/src/M5Cardputer.cpp.
+  // exclusively by the selected backend, so general M5Unified startup must
+  // not claim speaker/mic/audio resources. The keyboard still works because
+  // beginDisplayOnly() initializes it via Keyboard.begin() (auto-detects
+  // board type) — see components/M5Cardputer/src/M5Cardputer.cpp.
   (void)r;
   return true;
 }
 
-static RadioType radio_type_from_saved_int(int value) {
-  switch (value) {
-    case (int)RadioType::IC705:
-      return RadioType::IC705;
-    case (int)RadioType::KH1_USBC:
-      return RadioType::KH1_USBC;
-    case (int)RadioType::KH1_MIC:
-      return RadioType::KH1_MIC;
-    default:
-      return RadioType::IC705;
-  }
-}
-
-static RadioType parse_radio_config_value(const char* raw) {
-  if (!raw) return RadioType::IC705;
-
-  char* end = nullptr;
-  long as_int = strtol(raw, &end, 10);
-  if (end != raw) {
-    return radio_type_from_saved_int((int)as_int);
-  }
-
-  std::string token;
-  for (const char* p = raw; *p; ++p) {
-    unsigned char ch = (unsigned char)*p;
-    if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') continue;
-    token.push_back((char)std::toupper(ch));
-  }
-
-  if (token == "KH1" || token == "KH1-USBC" || token == "KH1_USBC" || token == "KH1USB") {
-    return RadioType::KH1_USBC;
-  }
-  if (token == "KH1-MIC" || token == "KH1_MIC" || token == "KH1MIC") {
-    return RadioType::KH1_MIC;
-  }
-  if (token == "IC705" || token == "IC-705" || token == "ICOM") {
-    return RadioType::IC705;
-  }
-  return RadioType::IC705;  // default
-}
-
 static RadioProfileBinding get_radio_profile_binding(RadioType r) {
   switch (canonical_radio_type(r)) {
-    case RadioType::KH1_USBC:
-      return {AUDIO_SOURCE_KH1_MIC, RADIO_CONTROL_KH1_CAT};   // KH1 USB-C uses mic audio
-    case RadioType::KH1_MIC:
-      return {AUDIO_SOURCE_KH1_MIC, RADIO_CONTROL_KH1_CAT};
     case RadioType::IC705:
     default:
       return {AUDIO_SOURCE_IC705_WIFI, RADIO_CONTROL_IC705};
@@ -1613,8 +1259,6 @@ static RadioProfileBinding get_radio_profile_binding(RadioType r) {
 static const char* radio_name(RadioType r) {
   switch (canonical_radio_type(r)) {
     case RadioType::IC705:    return "IC-705";
-    case RadioType::KH1_USBC: return "KH1-USBC";
-    case RadioType::KH1_MIC:  return "KH1-MIC";
     default: break;
   }
   return "IC-705";
@@ -1627,8 +1271,7 @@ void apply_radio_profile_binding() {
   auto start_gps = [&]() {
     gps_start(gps_pins_for_current_source());
   };
-  // cp705 is IC-705 only — always run GPS, no KH1 CAT.
-  g_kh1_connected = false;
+  // cp705 is IC-705 only — always run GPS.
   start_gps();
 
   // For IC-705: pass the resolved IP and CI-V address to the CAT backend
@@ -1653,12 +1296,6 @@ void apply_radio_profile_binding() {
 }
 
 static bool notify_radio_control_audio_start_if_allowed(const char* reason) {
-  if (is_kh1_radio(g_radio) && !g_kh1_connected) {
-    ESP_LOGI(TAG, "Skip CAT audio start for %s: KH1 CAT/TX not connected",
-             radio_name(g_radio));
-    return false;
-  }
-
   esp_err_t rc = radio_control_on_audio_start();
   const bool ok = (rc == ESP_OK);
   ESP_LOGI(TAG, "CAT audio start %s radio=%s reason=%s rc=%d",
@@ -1668,56 +1305,6 @@ static bool notify_radio_control_audio_start_if_allowed(const char* reason) {
            (int)rc);
   debug_log_line(ok ? "CAT audio ok" : "CAT audio fail");
   return ok;
-}
-
-static bool start_rx_audio_for_current_radio(const char* reason, bool notify_cat_if_allowed) {
-  apply_radio_profile_binding();
-
-  if (audio_source_is_streaming()) {
-    ESP_LOGI(TAG, "RX audio already streaming radio=%s reason=%s",
-             radio_name(g_radio),
-             reason ? reason : "");
-    if (notify_cat_if_allowed) {
-      notify_radio_control_audio_start_if_allowed(reason);
-    }
-    return true;
-  }
-
-  const char* mode = radio_name(g_radio);
-  const char* backend = audio_source_backend_name(audio_source_get_backend());
-  ESP_LOGI(TAG, "RX audio start radio=%s backend=%s reason=%s",
-           mode,
-           backend,
-           reason ? reason : "");
-  debug_log_line(std::string("Audio start ") + mode);
-  debug_log_line(std::string("Audio bind ") + backend);
-
-  log_mem_caps("AUDIO_BEFORE_START");
-  if (!audio_source_start()) {
-    log_mem_caps("AUDIO_AFTER_FAIL");
-    ESP_LOGW(TAG, "RX audio start failed radio=%s backend=%s reason=%s",
-             mode,
-             backend,
-             reason ? reason : "");
-    debug_log_line("Audio start fail");
-    return false;
-  }
-  log_mem_caps("AUDIO_AFTER_START");
-
-  debug_log_line("Audio start ok");
-  g_decode_enabled = true;
-  ui_set_paused(false);
-  ui_clear_waterfall();
-
-  if (notify_cat_if_allowed) {
-    notify_radio_control_audio_start_if_allowed(reason);
-  }
-  return true;
-}
-
-// cp705 is IC-705 only; the KH1 CAT diagnostic keys (u/i/j/k/l) were removed.
-static bool handle_kh1_diag_key(char /*c*/) {
-  return false;
 }
 
 static std::string lat_lon_to_maidenhead8(double lat, double lon) {
@@ -1777,10 +1364,7 @@ static void draw_gps_view(bool force_redraw = false);
 static void gps_runtime_tick() {
   static int64_t s_last_apply_ms = 0;
   static bool s_time_synced_once = false;
-  static bool s_gps_grid_logged = false;
   static int s_last_time_sync_hour_key = -1;
-
-  if (is_kh1_radio(g_radio) && g_kh1_connected && !g_gnss_lora_enabled) return;
 
   gps_tick();
 
@@ -1863,71 +1447,11 @@ static void gps_runtime_tick() {
 
   // One session breadcrumb is enough to preserve the GPS grid even if no QSO
   // completes; retry later if logging is disabled or the file write fails.
-  if (!s_gps_grid_logged &&
-      g_time_synced_from_gps &&
-      g_grid_from_gps &&
-      g_grid_gps_display8.size() == 8) {
-    s_gps_grid_logged = log_gps_grid_line(g_grid_gps_display8);
-  }
-
   if (changed) {
     save_station_data();
   }
 }
 
-static std::string expand_comment_macros(const std::string& src) {
-  std::string out = src;
-  auto repl = [](std::string& s, const std::string& from, const std::string& to) {
-    size_t pos = 0;
-    while ((pos = s.find(from, pos)) != std::string::npos) {
-      s.replace(pos, from.size(), to);
-      pos += to.size();
-    }
-  };
-  repl(out, "/Radio", radio_name(g_radio));
-
-  const std::string grid_macro =
-      (g_time_synced_from_gps && g_grid_from_gps && g_grid_gps_display8.size() == 8)
-          ? g_grid_gps_display8
-          : g_grid;
-  repl(out, "/Grid", grid_macro);
-  return out;
-}
-
-static std::string expand_comment1() {
-  return expand_comment_macros(g_comment1);
-}
-
-void rebuild_ignore_prefixes() {
-  g_ignore_prefixes.clear();
-  std::istringstream iss(g_ignore_prefix_text);
-  std::string tok;
-  while (iss >> tok) {
-    std::string norm = normalize_call_token(tok);
-    if (norm.empty()) continue;
-    bool duplicate = false;
-    for (const auto& existing : g_ignore_prefixes) {
-      if (existing == norm) {
-        duplicate = true;
-        break;
-      }
-    }
-    if (!duplicate) g_ignore_prefixes.push_back(norm);
-  }
-}
-
-static bool ignorelist_matches_normalized_dxcall(const std::string& dxcall_norm) {
-  if (dxcall_norm.empty()) return false;
-  for (const auto& prefix : g_ignore_prefixes) {
-    if (!prefix.empty() && dxcall_norm.rfind(prefix, 0) == 0) return true;
-  }
-  return false;
-}
-
-static std::string clamp_ignore_prefix_text(const std::string& s) {
-  if (s.size() <= kIgnorePrefixTextMaxLen) return s;
-  return s.substr(0, kIgnorePrefixTextMaxLen);
-}
 
 static std::string normalize_time_hms(const std::string& src) {
   int h = 0, m = 0, s = 0;
@@ -1962,25 +1486,19 @@ static int normalize_gps_baud_value(int value) {
 }
 
 static gps_pins_t gps_pins_for_current_source() {
+  // The LoRa-1262 cap's GNSS is the only supported GPS source now (PORTA
+  // wiring removed) — always UART2/G15/G13 at a fixed 115200 baud.
   gps_pins_t pins = {};
-  if (g_gnss_lora_enabled) {
-    pins.uart = UART_NUM_2;
-    pins.rx = GPIO_NUM_15;
-    pins.tx = GPIO_NUM_13;
-    pins.default_baud = 115200;
-    pins.auto_baud = false;
-  } else {
-    pins.uart = UART_NUM_1;
-    pins.rx = GPIO_NUM_1;
-    pins.tx = GPIO_NUM_2;
-    pins.default_baud = normalize_gps_baud_value(g_gps_baud);
-    pins.auto_baud = true;
-  }
+  pins.uart = UART_NUM_2;
+  pins.rx = GPIO_NUM_15;
+  pins.tx = GPIO_NUM_13;
+  pins.default_baud = 115200;
+  pins.auto_baud = false;
   return pins;
 }
 
 static const char* gps_source_name() {
-  return g_gnss_lora_enabled ? "GNSS_LoRa" : "PORTA";
+  return "GNSS_LoRa";
 }
 
 static std::string normalize_date_ymd(const std::string& src) {
@@ -2340,7 +1858,7 @@ static void rtc_tick() {
   int64_t now_ms = esp_timer_get_time() / 1000;
   if (now_ms - rtc_last_update >= 1000) {
     rtc_last_update += 1000; // Increment by interval to prevent drift accumulation
-    if (status_edit_idx != 5) { // keep time ticking unless editing time
+    if (status_edit_idx != 4) { // keep time ticking unless editing time
       std::string old_date = g_date;
       std::string old_time = g_time;
       rtc_update_strings();
@@ -2353,10 +1871,10 @@ static void rtc_tick() {
       if (ui_mode == UIMode::STATUS && status_edit_idx == -1 &&
           !(g_tx_active || g_tune)) {
         if (old_date != g_date) {
-          draw_status_line(4, std::string("Date: ") + g_date, false);
+          draw_status_line(3, std::string("Date: ") + g_date, false);
         }
         if (old_time != g_time) {
-          draw_status_line(5, std::string("Time: ") + g_time + rtc_time_source_suffix(), false);
+          draw_status_line(4, std::string("Time: ") + g_time + rtc_time_source_suffix(), false);
         }
       }
     }
@@ -2394,9 +1912,7 @@ bool sync_radio_to_current_band(const char* reason) {
 // don't have to press anything after plugging in QMX. Called from the main
 // loop every iteration (before early-exit branches). Fires at most once
 // per CDC open — cleared on successful sync, retries on later iterations
-// until CAT becomes ready and we're not TXing. For KH1 (UART CAT, no USB
-// enumeration event), this flag is never set; the STATUS-exit auto-sync
-// and S->3 handler cover KH1.
+// until CAT becomes ready and we're not TXing.
 static void consume_cdc_initial_sync() {
   if (!g_ic705_initial_sync_pending) return;
   if (sync_radio_to_current_band("initial IC-705 connect")) {
@@ -2409,11 +1925,27 @@ static void update_countdown() {
   // contends with the WiFi DMA on the S3 and momentarily stalls the outgoing
   // audio stream, which underruns the radio's TX buffer and pulses the carrier
   // ~1x/sec (this redraw fires once per second on the seconds change). The
-  // screen simply holds during TX; we're transmitting, not reading the display.
-  if (g_tx_active || g_tune) return;
-  int64_t now_ms = rtc_now_ms();
+  // screen simply holds blank during TX (see ui_clear_countdown() in
+  // tx_start()); we're transmitting, not reading the display.
+  //
+  // holdSlotIdx: our own TX only occupies the first ~12.6s of its 15s slot,
+  // leaving a ~2.4s RX tail before the NEXT TX (in a running QSO) blanks it
+  // again. Resuming the instant TX ends would draw the bar at its true
+  // (already ~84% full) position for that brief tail, then blank again a
+  // couple seconds later -- reading as a flash, not useful information. Hold
+  // blank through the rest of the CURRENT slot instead, so the bar only ever
+  // resumes at a fresh slot boundary, starting from 0% -- never a mid-slot
+  // jump. Dean: "during tx, I don't want to see a progress bar at all ever,
+  // not even a tiny part of one. I only want to see it during the RX cycle."
+  static int64_t s_hold_slot_idx = -1;
   const int slot_period = g_protocol->slot_time_ms;
+  if (g_tx_active || g_tune) {
+    s_hold_slot_idx = rtc_now_ms() / slot_period;
+    return;
+  }
+  int64_t now_ms = rtc_now_ms();
   int64_t slot_idx = now_ms / slot_period;
+  if (slot_idx <= s_hold_slot_idx) return;  // still in this TX slot's RX tail -- stay blank
   int64_t slot_ms = now_ms % slot_period;
   static int64_t last_slot_idx = -1;
   static int last_sec = -1;
@@ -2421,7 +1953,7 @@ static void update_countdown() {
   if (slot_idx != last_slot_idx || sec != last_sec) {
     float frac = (float)slot_ms / (float)slot_period;
     bool even = (slot_idx % 2) == 0;
-    ui_draw_countdown(frac, even, g_offset_hz);
+    ui_draw_countdown(frac, even);
     last_slot_idx = slot_idx;
     last_sec = sec;
   }
@@ -2434,7 +1966,29 @@ static void redraw_countdown_now() {
   int64_t slot_ms = now_ms % slot_period;
   float frac = (float)slot_ms / (float)slot_period;
   bool even = (slot_idx % 2) == 0;
-  ui_draw_countdown(frac, even, g_offset_hz);
+  ui_draw_countdown(frac, even);
+}
+
+// Mirrors update_countdown()'s hold-until-next-slot pattern for the
+// hero-card/RX-list redraw. tx_tick() clears g_tx_active the instant TX
+// completes, within the SAME loop iteration that later checks "is it safe
+// to redraw" -- so redrawing right then reads as a flash exactly when TX
+// stops, then a second one moments later at the real slot boundary. Hold
+// through the rest of that TX slot's tail (same ~2.4s window the countdown
+// bar holds through) so the hero card only ever refreshes once, cleanly, at
+// the start of the next slot. Must be called unconditionally every loop
+// iteration (not just when !g_tx_active) so it can actually latch the hold
+// while TX is still active.
+static bool rx_redraw_should_hold() {
+  static int64_t s_hold_slot_idx = -1;
+  const int slot_period = g_protocol->slot_time_ms;
+  int64_t now_ms = rtc_now_ms();
+  int64_t slot_idx = now_ms / slot_period;
+  if (g_tx_active || g_tune) {
+    s_hold_slot_idx = slot_idx;
+    return true;
+  }
+  return slot_idx <= s_hold_slot_idx;
 }
 
 // Forward declarations for single-threaded TX state machine
@@ -2459,8 +2013,9 @@ static int resolve_tx_offset(const AutoseqTxEntry& e) {
       e.text.rfind("CQ ", 0) != 0) {
     return e.offset_hz;
   }
-  // RANDOM, or RX mode + CQ: roll a fresh offset in [500, 2500] Hz.
-  return 500 + (int)(esp_random() % 2001);
+  // RANDOM, or RX mode + CQ: roll a fresh offset in [1500, 2000] Hz -- kept
+  // tight (Dean) rather than spanning the full audio passband.
+  return 1500 + (int)(esp_random() % 501);
 }
 
 // Single point of truth for arming the next TX. Replaces the 4-line
@@ -2492,7 +2047,39 @@ static void check_slot_boundary() {
   if (g_was_txing && !g_tx_active) {
     ESP_LOGI(TAG, "TX completed, calling tick (slot %lld, parity %d)",
              (long long)slot_idx, slot_parity);
+    // Snapshot state BEFORE the tick: if we were signing off (just finished
+    // sending TX5/73 -- already logged, in autoseq_on_tx_starting(), the
+    // instant that TX began), and the tick below evicts it from the active
+    // queue (into inactive-parked-for-late-RR73, or straight to gone -- both
+    // read the same to the operator: the exchange is over), this is a real,
+    // logged QSO completion. Only reachable here for genuine completions:
+    // a cancelled TX clears g_was_txing directly and never reaches this branch.
+    //
+    // Same hold also covers the OTHER way an exchange ends: retries exhausted
+    // mid-QSO with no RR73/73 ever heard back (autoseq.cpp's retry_counter >=
+    // retry_limit branch, evicted the same tick). Dean: "if something is done
+    // or not working, there's no reason to wait" -- a failed contact shouldn't
+    // freeze the hero card forever any more than a completed one should.
+    QsoContext pre_tick_ctx{};
+    const bool had_active_ctx = autoseq_get_active_context(0, &pre_tick_ctx);
     autoseq_tick(slot_idx, slot_parity, 0);
+    if (had_active_ctx && autoseq_active_count() == 0) {
+      const bool was_signoff = (pre_tick_ctx.state == AutoseqState::SIGNOFF);
+      const bool was_mid_exchange_giveup =
+          (pre_tick_ctx.state == AutoseqState::REPLYING ||
+           pre_tick_ctx.state == AutoseqState::REPORT ||
+           pre_tick_ctx.state == AutoseqState::ROGER_REPORT ||
+           pre_tick_ctx.state == AutoseqState::ROGERS) &&
+          (pre_tick_ctx.retry_counter >= pre_tick_ctx.retry_limit);
+      if (was_signoff || was_mid_exchange_giveup) {
+        g_qso_done_active = true;
+        g_qso_done_since_ms = rtc_now_ms();
+        g_qso_done_was_cq_running = g_cq_running;
+        g_qso_done_gave_up = was_mid_exchange_giveup;
+        g_cq_running = false;  // suspend auto-repeat until the hold elapses
+        g_rx_dirty = true;
+      }
+    }
     g_was_txing = false;
     core_fire_qso_changed();  // propagates to all registered consumers
   }
@@ -2500,18 +2087,51 @@ static void check_slot_boundary() {
   // TX trigger: check if we should start TX in this slot
   // Conditions: qso_xmit flag set, correct parity, early enough in slot, not already TXing,
   // and decode must be complete (TX is always triggered by decode results).
-  // Additional guard (g_decode_applied_slot_idx): enforces that decode for the
-  // previous RX slot (slot_idx - 1) has been fully applied to autoseq state before
-  // we fire TX. Without this, a slot boundary that arrives before audio capture
-  // has completed (FT8: ~12.6s of 15s slot; FT4: ~5.0s of 7.5s slot) could fire
-  // TX based on a prior cycle's state. See AUTOSEQ_INACTIVE_QUEUE.md.
+  // Additional guard (g_decode_applied_slot_idx): enforces that a recent-enough
+  // decode has been fully applied to autoseq state before we fire TX, so we
+  // never act on a stale prior cycle's state.
+  //
+  // Bound is slot_idx - 2, NOT slot_idx - 1. This board's audio pipeline only
+  // decodes every OTHER slot (the synchronous ~2.7-2.8s LDPC pass overruns the
+  // slot boundary, so it re-anchors to the NEXT one and the slot in between is
+  // dead air -- see ft8_audio_pipeline.cpp). That means g_decode_applied_slot_idx
+  // only ever advances by 2 at a time, so for HALF of all slot parities it is
+  // structurally impossible for it to ever reach slot_idx - 1 -- requiring that
+  // bound didn't just add a safety margin, it permanently blocked TX on
+  // whichever parity happened to line up with the actively-decoded slot instead
+  // of the skipped one, forcing a full extra 30s cycle (or more) every time a
+  // reply's target parity landed there. slot_idx - 2 is the freshest bound that
+  // can actually be satisfied given the every-other-slot cadence, for both
+  // parities, while still rejecting a genuinely stalled/hung decode.
+  // See AUTOSEQ_INACTIVE_QUEUE.md.
   // Window = 4/15 of slot_time_ms (~26.7%): FT8=4000ms, FT4=2000ms.
+  const bool parity_ok = (g_target_slot_parity == slot_parity);
+  const bool window_ok = (slot_ms < (g_protocol->slot_time_ms * 4 / 15));
+  const bool decode_ok = (g_decode_applied_slot_idx >= slot_idx - 2);
+
+  // A CQ transmits a fixed, self-originated message -- it depends on NOTHING we
+  // decoded, so it must NOT sit behind the decode-completion guards the way a
+  // QSO reply does. This board decodes only one parity (it decodes a slot,
+  // overruns ~2.7s into the next, re-anchors forward, and keeps landing on the
+  // same parity), so g_decode_in_progress is true for the first ~2.7s of every
+  // decoded-parity slot. The running CQ is re-armed from inside
+  // decode_monitor_results, so its target parity ((now/slot)+1) lands on
+  // exactly that decoded parity -- meaning the CQ could only ever squeeze
+  // through the ~1.3s gap between the decode finishing and the ~4s TX window
+  // closing. On a busy-enough band the decode runs long, the CQ misses that
+  // gap, and it waits a full extra same-parity cycle (+30s) -- the "sat through
+  // a whole green+red and fired on the next green" bug. Gate the CQ on window +
+  // parity only; a reply still honors both decode guards (it genuinely must
+  // decode the other station before it can answer).
+  const bool is_cq_tx = (g_pending_tx.text.rfind("CQ ", 0) == 0) ||
+                        (g_pending_tx.text == "CQ");
+  const bool decode_gate_ok = is_cq_tx || (!g_decode_in_progress && decode_ok);
+
   if (g_qso_xmit &&
-      g_target_slot_parity == slot_parity &&
-      slot_ms < (g_protocol->slot_time_ms * 4 / 15) &&
+      parity_ok &&
+      window_ok &&
       !g_tx_active &&
-      !g_decode_in_progress &&
-      g_decode_applied_slot_idx >= slot_idx - 1) {
+      decode_gate_ok) {
 
     ESP_LOGI(TAG, "TX trigger: starting TX in slot %lld (parity %d)",
              (long long)slot_idx, slot_parity);
@@ -2528,12 +2148,23 @@ static void check_slot_boundary() {
         g_qso_xmit = false;  // Clear flag only AFTER validation succeeds
         g_was_txing = true;  // Set IMMEDIATELY when TX starts (prevents decode_monitor_results from re-setting flags)
 
-        // Offset was resolved at scheduling time by arm_pending_tx, so
-        // g_pending_tx.offset_hz is already what's going on air.
-        log_rxtx_line('T', 0, g_pending_tx.offset_hz, g_pending_tx.text,
-                      g_pending_tx.repeat_counter);
         tx_start(skip_tones);
       }
+    }
+  } else if (g_qso_xmit) {
+    // A TX is armed (g_qso_xmit) but didn't fire this slot -- throttled to
+    // once/sec so a real stall (armed forever, never triggers) leaves a
+    // trace showing exactly which guard is blocking it, instead of the
+    // silence that made the retry-exhaustion stall so hard to diagnose live.
+    static int64_t s_last_xmit_stall_log_ms = 0;
+    if (now_ms - s_last_xmit_stall_log_ms >= 1000) {
+      s_last_xmit_stall_log_ms = now_ms;
+      ESP_LOGW(TAG, "TX armed but not firing: is_cq=%d parity_ok=%d(target=%d,slot=%d) "
+               "window_ok=%d(slot_ms=%d) tx_active=%d decode_in_progress=%d "
+               "decode_ok=%d(applied=%lld,slot_idx=%lld)",
+               (int)is_cq_tx, (int)parity_ok, g_target_slot_parity, slot_parity,
+               (int)window_ok, slot_ms, (int)g_tx_active, (int)g_decode_in_progress,
+               (int)decode_ok, (long long)g_decode_applied_slot_idx, (long long)slot_idx);
     }
   }
 }
@@ -2555,27 +2186,77 @@ static void rx_flash_tick() {
   if (now >= rx_flash_deadline) {
     rx_flash_idx = -1;
     rx_flash_deadline = 0;
-    if (ui_mode == UIMode::RX) {
-      ui_draw_rx();
+    // Hold like every other redraw here: one of this function's two call
+    // sites has no TX/tune guard around it.
+    if (ui_mode == UIMode::RX && !(g_tx_active || g_tune)) {
+      // Route through the hero-aware dispatcher, not the plain list directly.
+      // Answering a CQ locks the hero card on (g_hero_locked) well before
+      // this 500ms flash-highlight timer expires -- calling ui_draw_rx()
+      // unconditionally here repainted the plain list right over the hero
+      // card that a decode-driven redraw had already correctly shown,
+      // and it stuck until the next decode cycle fixed it.
+      render_rx_or_hero();
     }
   }
 }
 
-// Auto-revert the QSO screen's "Press N again: confirm" arm prompt (on the
-// Clear QSO log row) and the "Log cleared" feedback (on the status row) back
-// to normal once their window lapses, so a stale prompt doesn't linger without
-// a keypress to refresh it.
+// Brief automatic tune burst (not a manual toggle): key PTT + stream a
+// short tone, then unkey and resume decode on its own after kTuneAutoStopMs,
+// no second keypress required. Called unconditionally every main-loop pass
+// so it fires even while other UI ticks are held off during TX/tune.
+static void tune_tick() {
+  if (!g_tune) return;
+  int64_t now = rtc_now_ms();
+  if (now < g_tune_stop_at_ms) return;
+  radio_control_set_tune(false, 0, 0);
+  g_tune = false;
+  g_decode_enabled = true;
+  debug_log_line("CAT tune: RX (auto)");
+  if (ui_mode == UIMode::STATUS) draw_status_view();
+}
+
+// Auto-revert the Logging category's "Press 2 again: confirm" arm prompt
+// (Clear QSO Log) and the "Log cleared" feedback back to normal once their
+// window lapses, so a stale prompt doesn't linger without a keypress to
+// refresh it.
 static void qso_clear_tick() {
-  if (ui_mode != UIMode::QSO || g_q_show_entries) return;
+  if (ui_mode != UIMode::MENU || menu_category != kCatLogging || menu_long_edit) return;
   int64_t now = rtc_now_ms();
   bool arm_expired = g_q_clear_armed && now >= g_q_clear_arm_deadline;
   bool feedback_expired = !g_q_clear_feedback.empty() && now >= g_q_clear_feedback_deadline;
   if (arm_expired || feedback_expired) {
     if (arm_expired) g_q_clear_armed = false;
     if (feedback_expired) g_q_clear_feedback.clear();
-    qso_load_file_list();
-    qso_draw_page();
+    draw_menu_view();
   }
+}
+
+// Advance the "QSO COMPLETE" hero-card hold set by check_slot_boundary().
+// Matches TD705's reference behavior: hold a few seconds, then either resume
+// the running CQ (this contact came from our own CQ) or fall back to the
+// plain RX list (we were answering someone else's).
+static void qso_done_tick() {
+  if (!g_qso_done_active) return;
+  if (autoseq_active_count() > 0) {
+    // Something else started during the hold (e.g. a fresh 'C' prompt) --
+    // abandon the hold rather than stomp on whatever's active now.
+    g_qso_done_active = false;
+    g_qso_done_gave_up = false;
+    return;
+  }
+  const int64_t hold_ms = g_qso_done_was_cq_running ? kQsoDoneResumeCqMs : kQsoDoneReturnRxMs;
+  if (rtc_now_ms() - g_qso_done_since_ms < hold_ms) return;
+  g_qso_done_active = false;
+  g_qso_done_gave_up = false;
+  if (g_qso_done_was_cq_running) {
+    g_cq_running = true;
+    enqueue_running_cq();
+    AutoseqTxEntry pending;
+    if (autoseq_fetch_pending_tx(pending)) arm_pending_tx(pending);
+  } else {
+    g_hero_locked = false;
+  }
+  g_rx_dirty = true;
 }
 
 static void apply_pending_sync() {}
@@ -2591,6 +2272,12 @@ static int band_number_from_name(const std::string& name) {
   }
   return num;
 }
+
+// Per-band TX gain: load whichever band g_band_sel lands on after a band
+// change, or leave the gain untouched if that band has no saved value yet.
+// Defined near the other NVS helpers further down; forward-declared here
+// since rebuild_active_bands()/advance_active_band() are defined first.
+static void apply_band_gain_for_current();
 
 void rebuild_active_bands() {
   std::string cleaned = g_active_band_text;
@@ -2621,6 +2308,7 @@ void rebuild_active_bands() {
   if (std::find(g_active_band_indices.begin(), g_active_band_indices.end(), g_band_sel) == g_active_band_indices.end()) {
     g_band_sel = g_active_band_indices[0];
   }
+  apply_band_gain_for_current();
   // normalize text
   std::ostringstream oss;
   for (size_t i = 0; i < g_active_band_indices.size(); ++i) {
@@ -2640,8 +2328,16 @@ void update_autoseq_cq_type() {
     case CqType::CQFREETEXT: t = AutoseqCqType::FREETEXT; break;
     default: t = AutoseqCqType::CQ; break;
   }
+  // g_free_text is the Field Day EXCHANGE string (parsed by format_tx_text's
+  // TX2/TX3 is_fd branch in autoseq.cpp) -- only CQFD wants that. CQFREETEXT
+  // (the CQ prompt's typed message, incl. any POTA/SOTA/QRP prefix) must use
+  // g_cq_freetext instead, since generate_cq_text_into()'s FREETEXT case
+  // sends s_cq_freetext out verbatim as the actual CQ payload. Grouping
+  // CQFREETEXT with CQFD here was a bug: every custom CQ typed via the C
+  // prompt was silently transmitting g_free_text ("TNX 73" by default)
+  // instead of what was actually typed.
   const std::string& ft =
-    (g_cq_type == CqType::CQFREETEXT || g_cq_type == CqType::CQFD) ? g_free_text : g_cq_freetext;
+    (g_cq_type == CqType::CQFD) ? g_free_text : g_cq_freetext;
   autoseq_set_cq_type(t, ft);
 }
 
@@ -2655,6 +2351,11 @@ static void advance_active_band(int delta) {
   int n = (int)g_active_band_indices.size();
   pos = (pos + delta + n) % n;
   g_band_sel = g_active_band_indices[pos];
+  apply_band_gain_for_current();
+  // Decodes from the old band are no longer relevant -- the persistent
+  // decode list (decode_monitor_results()) would otherwise keep showing them
+  // mixed in with the new band's traffic indefinitely.
+  clear_decode_list();
 }
 
 static int tx_waterfall_hz_to_x(float tone_hz) {
@@ -2812,18 +2513,33 @@ static void dec_normalize_call(const char* src, char* out, int out_sz) {
 static int dec_sort_cmp(const void* a, const void* b) {
   const DecodeMsg* da = (const DecodeMsg*)a;
   const DecodeMsg* db = (const DecodeMsg*)b;
-  int ga = da->is_to_me ? 0 : (da->is_cq ? 1 : 2);
-  int gb = db->is_to_me ? 0 : (db->is_cq ? 1 : 2);
+  // Messages addressed to us stay pinned above everything else regardless of
+  // age. Everything else (including CQs) is newest-heard-first -- the list
+  // is persistent now, so recency is what "put the newest ones at the top"
+  // means for a station that's been sitting there a while.
+  int ga = da->is_to_me ? 0 : 1;
+  int gb = db->is_to_me ? 0 : 1;
   if (ga != gb) return ga - gb;
-  // CQ block only: strongest first.
-  if (ga == 1 && da->snr != db->snr) {
-    return db->snr - da->snr;
-  }
+  if (da->heard_ms != db->heard_ms) return (da->heard_ms > db->heard_ms) ? -1 : 1;
   return 0;
 }
 
-void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui) {
+// Clears the persistent decode list -- call whenever previously-heard
+// entries stop being relevant (e.g. a band change; the old band's decodes
+// would otherwise keep sitting there mixed in with the new band's traffic).
+static void clear_decode_list() {
   s_dec_count = 0;
+  ui_set_rx_list_static(s_dec, 0);
+}
+
+void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui) {
+  // The decode list persists across cycles (Dean: don't blank it away between
+  // cycles on a quiet band -- keep everything, newest at top; repeats from
+  // the same station refresh their existing row rather than piling up).
+  // this_cycle_ms tags every entry added/refreshed THIS call so downstream
+  // consumers (autoseq's to-me feed, the RTC soft-sync) can tell "freshly
+  // heard this cycle" apart from "still sitting in the list from before."
+  const int64_t this_cycle_ms = rtc_now_ms();
 
   // Candidate cap. Lowered 50→24 to keep the per-slot decode under the ~2.15s
   // gap between the end of the FT8 transmission (12.64s) and the next 15s UTC
@@ -2886,9 +2602,18 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   for (int i = 0; i < kMaxDecoded; ++i) decoded_hashtable[i] = nullptr;
   int num_decoded = 0;
 
+  // Track this cycle's own timing samples for the RTC soft-sync below --
+  // s_dec[] now holds decodes from many cycles back, so it can no longer be
+  // scanned directly for that (it would sync against stale timing).
+  float this_cycle_time_s[DEC_MAX];
+  int this_cycle_n = 0;
+  int fresh_this_cycle = 0;  // count of entries actually touched this cycle, for the log below
+
   if (num_candidates <= 0) {
     ESP_LOGW(TAG, "No candidates found");
-    ui_set_rx_list_static(nullptr, 0);
+    // Keep showing whatever's already accumulated -- a quiet slot adds
+    // nothing new, but shouldn't blank out what's already on screen.
+    ui_set_rx_list_static(s_dec, s_dec_count);
     if (update_ui) { ui_draw_rx(); }
     else core_fire_rx_changed();
     // No candidates means we processed the slot's audio but found nothing —
@@ -2900,7 +2625,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     return;
   }
 
-  for (int i = 0; i < num_candidates && s_dec_count < DEC_MAX; ++i) {
+  for (int i = 0; i < num_candidates; ++i) {
     ftx_message_t message;
     ftx_decode_status_t status;
     memset(&message, 0, sizeof(message));
@@ -2972,52 +2697,97 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       final_text[DEC_TEXT_MAX - 1] = '\0';
     }
 
-    // UI text dedup (linear scan — 32 entries max, no hash map needed)
+    if (this_cycle_n < DEC_MAX) this_cycle_time_s[this_cycle_n++] = time_s;
+
+    // UI text dedup (linear scan through the whole persistent list — 32 max)
     int dup_idx = -1;
     for (int j = 0; j < s_dec_count; ++j) {
       if (strcmp(s_dec[j].text, final_text) == 0) { dup_idx = j; break; }
     }
     if (dup_idx >= 0) {
+      // Exact same text already in the list (this cycle or an earlier one) --
+      // refresh it in place instead of adding a duplicate line.
       if (snr_q > s_dec[dup_idx].snr) {
         s_dec[dup_idx].snr = snr_q;
         s_dec[dup_idx].offset_hz = (int)lrintf(freq_hz);
         s_dec[dup_idx].slot_id = slot_id;
       }
+      s_dec[dup_idx].heard_ms = this_cycle_ms;
+      fresh_this_cycle++;
       continue;
     }
 
     ESP_LOGI(TAG, "Decoded[%d] t=%.2fs f=%.1fHz snr=%d : %s",
-             s_dec_count, time_s, freq_hz, snr_q, final_text);
+             fresh_this_cycle, time_s, freq_hz, snr_q, final_text);
 
-    // Fill static entry
-    DecodeMsg* d = &s_dec[s_dec_count];
-    strncpy(d->text, final_text, DEC_TEXT_MAX - 1); d->text[DEC_TEXT_MAX - 1] = '\0';
-    d->snr = snr_q;
-    d->offset_hz = (int)lrintf(freq_hz);
-    d->slot_id = slot_id;
-    d->time_s = time_s;
+    // Parse into a scratch entry so we can match it against the existing
+    // list by station (field2 = the transmitting callsign, for both CQ and
+    // directed messages) before deciding whether to refresh an existing row
+    // or add a new one.
+    DecodeMsg scratch{};
+    strncpy(scratch.text, final_text, DEC_TEXT_MAX - 1); scratch.text[DEC_TEXT_MAX - 1] = '\0';
+    scratch.snr = snr_q;
+    scratch.offset_hz = (int)lrintf(freq_hz);
+    scratch.slot_id = slot_id;
+    scratch.time_s = time_s;
 
-    dec_fill_fields(d);
+    dec_fill_fields(&scratch);
 
-    d->is_cq = (strncmp(d->text, "CQ ", 3) == 0 || strcmp(d->text, "CQ") == 0);
+    scratch.is_cq = (strncmp(scratch.text, "CQ ", 3) == 0 || strcmp(scratch.text, "CQ") == 0);
 
     char f1_norm[DEC_FIELD_MAX];
-    dec_normalize_call(d->field1, f1_norm, DEC_FIELD_MAX);
-    d->is_to_me = (mycall_up[0] != '\0' && strcmp(f1_norm, mycall_up) == 0);
+    dec_normalize_call(scratch.field1, f1_norm, DEC_FIELD_MAX);
+    scratch.is_to_me = (mycall_up[0] != '\0' && strcmp(f1_norm, mycall_up) == 0);
+    scratch.heard_ms = this_cycle_ms;
 
-    log_rxtx_line('R', snr_q, (int)lrintf(freq_hz), std::string(final_text), -1);
+    // Same-station refresh: a station repeating (or advancing to its next
+    // message) updates its existing row and jumps to the top via heard_ms,
+    // instead of spawning a duplicate line for the same caller.
+    char f2_norm[DEC_FIELD_MAX];
+    dec_normalize_call(scratch.field2, f2_norm, DEC_FIELD_MAX);
+    int station_idx = -1;
+    if (f2_norm[0] != '\0') {
+      for (int j = 0; j < s_dec_count; ++j) {
+        char existing_f2[DEC_FIELD_MAX];
+        dec_normalize_call(s_dec[j].field2, existing_f2, DEC_FIELD_MAX);
+        if (strcmp(existing_f2, f2_norm) == 0) { station_idx = j; break; }
+      }
+    }
 
-    s_dec_count++;
+    if (station_idx >= 0) {
+      s_dec[station_idx] = scratch;
+    } else if (s_dec_count < DEC_MAX) {
+      s_dec[s_dec_count++] = scratch;
+    } else {
+      // List's at capacity -- evict the least-recently-heard entry to make
+      // room, rather than dropping the newest decode on the floor.
+      int oldest_idx = 0;
+      for (int j = 1; j < s_dec_count; ++j) {
+        if (s_dec[j].heard_ms < s_dec[oldest_idx].heard_ms) oldest_idx = j;
+      }
+      s_dec[oldest_idx] = scratch;
+    }
+    fresh_this_cycle++;
   }
 
-  ESP_LOGI(TAG, "Decoded %d unique messages", s_dec_count);
+  ESP_LOGI(TAG, "Decoded %d unique messages (%d total in list)", fresh_this_cycle, s_dec_count);
 
-  // ---- Auto sync soft RTC from decode timing ----
-  if (s_dec_count > 3) {
+  // ---- Auto sync soft RTC from decode timing (this cycle's samples only --
+  // s_dec[] holds decodes from many cycles back now, so it can't be used
+  // directly here without syncing against stale timing) ----
+  //
+  // NEVER shift the clock while transmitting. tx_start() latches the TX tone
+  // schedule off rtc_now_ms() at the top of the slot; a CQ can now fire (see
+  // check_slot_boundary's is_cq_tx path) while the previous slot's decode is
+  // still overrunning, so this soft-sync can complete DURING our TX. A ±320ms
+  // shift under the running tone schedule would jump us ~2 FT8 symbols and
+  // corrupt the transmission. Skipping one sync opportunity is harmless -- the
+  // next RX cycle re-syncs.
+  if (this_cycle_n > 3 && !g_tx_active) {
     // Simple insertion sort to find median of time_s values
     float sorted_t[DEC_MAX];
-    int nt = 0;
-    for (int i = 0; i < s_dec_count; ++i) sorted_t[nt++] = s_dec[i].time_s;
+    int nt = this_cycle_n;
+    memcpy(sorted_t, this_cycle_time_s, sizeof(float) * (size_t)nt);
     for (int i = 1; i < nt; ++i) {
       float key = sorted_t[i];
       int j = i - 1;
@@ -3037,20 +2807,19 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     }
   }
 
-  // ---- Sort in-place: to_me first, CQ second, others last ----
+  // ---- Sort in-place: to-me pinned first, everything else newest-heard-first ----
   qsort(s_dec, s_dec_count, sizeof(DecodeMsg), dec_sort_cmp);
 
-  // ---- Autoseq: build small to_me vector at boundary (only to_me entries) ----
+  // ---- Autoseq: build small to_me vector at boundary (only FRESH to_me
+  // entries -- s_dec[] is persistent now, so a to-me row can still be
+  // sitting there from a prior cycle if the station never repeated; feeding
+  // that stale entry to autoseq again would reprocess an already-handled
+  // decode every single cycle) ----
   if (!g_was_txing) {
     std::vector<UiRxLine> to_me_auto;
     for (int i = 0; i < s_dec_count; ++i) {
       if (!s_dec[i].is_to_me) break;  // sorted, so once we pass to_me we're done
-      char dxnorm[DEC_FIELD_MAX];
-      dec_normalize_call(s_dec[i].field2, dxnorm, DEC_FIELD_MAX);
-      if (ignorelist_matches_normalized_dxcall(std::string(dxnorm))) {
-        ESP_LOGI(TAG, "IgnoreList: skip auto reply to %s", dxnorm);
-        continue;
-      }
+      if (s_dec[i].heard_ms != this_cycle_ms) continue;  // stale carry-over, not new this cycle
       UiRxLine rx;
       rx.text = s_dec[i].text;
       rx.field1 = s_dec[i].field1;
@@ -3074,11 +2843,14 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     if (autoseq_fetch_pending_tx(pending)) {
       arm_pending_tx(pending);
       ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
-    } else if (g_beacon != BeaconMode::OFF) {
-      enqueue_beacon_cq();
+    } else if (g_cq_running) {
+      // Calling CQ is the beacon trigger now: keep re-issuing the same CQ
+      // every cycle the queue is idle (unanswered CQ, or a finished QSO)
+      // until the user answers someone else or presses ESC.
+      enqueue_running_cq();
       if (autoseq_fetch_pending_tx(pending)) {
         arm_pending_tx(pending);
-        ESP_LOGI(TAG, "Beacon CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
+        ESP_LOGI(TAG, "Running CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
       }
     }
   }
@@ -3106,57 +2878,31 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
 
 static void draw_menu_long_edit() {
   std::vector<std::string> lines(6, "");
-  std::string text = menu_long_buf;
+  // Mark the cursor position before chunking into display rows. Mid-buffer
+  // (e.g. the CQ prompt's pre-positioned cursor) brackets the character it
+  // sits on, same convention as the Date/Time editor's highlight_pos() --
+  // splicing in a literal "_" there would look like part of the text and
+  // can't be backspaced (it isn't really in the buffer). At the end of the
+  // buffer (the common append-while-typing case) there's no character to
+  // bracket, so fall back to a trailing "_".
+  int cpos = (menu_long_cursor_pos >= 0 && menu_long_cursor_pos <= (int)menu_long_buf.size())
+                 ? menu_long_cursor_pos : (int)menu_long_buf.size();
+  std::string display;
+  if (cpos < (int)menu_long_buf.size()) {
+    display = highlight_pos(menu_long_buf, cpos);
+  } else {
+    display = menu_long_buf;
+    display.push_back('_');
+  }
   size_t idx = 0;
   int line = 0;
-  while (idx < text.size() && line < 6) {
-    size_t chunk = std::min<size_t>(18, text.size() - idx);
-    lines[line] = text.substr(idx, chunk);
+  while (idx < display.size() && line < 6) {
+    size_t chunk = std::min<size_t>(18, display.size() - idx);
+    lines[line] = display.substr(idx, chunk);
     idx += chunk;
     line++;
   }
-  // cursor indicator on the last line
-  if (line == 0) {
-    lines[0] = "_";
-  } else {
-    if (lines[line - 1].size() < 20) lines[line - 1].push_back('_');
-    else if (line < 6) lines[line] = "_";
-  }
   ui_draw_debug(lines, 0);
-}
-
-static void log_tones(const uint8_t* tones, size_t n) {
-  std::string line;
-  for (size_t i = 0; i < n; ++i) {
-    char buf[4];
-    snprintf(buf, sizeof(buf), "%u", (unsigned)tones[i]);
-    line += buf;
-    if ((i + 1) % 20 == 0 || i + 1 == n) {
-      debug_log_line(line);
-      line.clear();
-    }
-  }
-}
-
-static void encode_and_log_pending_tx() {
-  if (!g_pending_tx_valid || g_pending_tx.text.empty()) {
-    debug_log_line("No pending TX to encode");
-    return;
-  }
-  ftx_message_t msg;
-  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, g_pending_tx.text.c_str());
-  if (rc != FTX_MESSAGE_RC_OK) {
-    debug_log_line("Encode failed");
-    return;
-  }
-  uint8_t tones[FT4_NN] = {0};
-  if (g_protocol->protocol_id == FTX_PROTOCOL_FT4) {
-    ft4_encode(msg.payload, tones);
-  } else {
-    ft8_encode(msg.payload, tones);
-  }
-  debug_log_line(std::string("Tones for '") + g_pending_tx.text + "'");
-  log_tones(tones, g_protocol->total_symbols);
 }
 
 [[maybe_unused]] static bool looks_like_grid(const std::string& s) {
@@ -3181,12 +2927,15 @@ static void encode_and_log_pending_tx() {
   return true;
 }
 
-// Enqueue a beacon CQ. Parity is determined by beacon mode.
+// Re-issue the CQ that's already running (g_cq_running), targeting the next
+// available slot after now -- same parity calc the C-prompt confirm uses.
 // Duplicate prevention is handled by autoseq_start_cq().
 // TX trigger happens at slot boundary via check_slot_boundary().
-static void enqueue_beacon_cq() {
-  int target_parity = (g_beacon == BeaconMode::EVEN) ? 0 : 1;
-  autoseq_start_cq(target_parity);
+static void enqueue_running_cq() {
+  const int64_t now_ms = rtc_now_ms();
+  const int slot_period = g_protocol->slot_time_ms;
+  const int next_parity = (int)(((now_ms / slot_period) + 1) & 1);
+  autoseq_start_cq(next_parity);
   core_fire_qso_changed();  // propagates to all registered consumers
 }
 
@@ -3245,6 +2994,14 @@ static void tx_start(int skip_tones) {
     ESP_LOGW(TAG, "tx_start: no pending TX");
     return;
   }
+
+  // Blank the countdown bar now, before any audio/CAT setup below -- once TX
+  // is actually underway, redraws are held (SPI/DMA contention with the
+  // outgoing audio), so this is the only safe moment to touch it. Otherwise
+  // it sits frozen at whatever fraction it had when TX began for the whole
+  // transmission, then visibly jumps once RX resumes and it starts ticking
+  // again from the real elapsed time -- blank reads as intentional instead.
+  ui_clear_countdown();
 
   // Get current slot info
   int64_t now_ms = rtc_now_ms();
@@ -3411,149 +3168,138 @@ static void draw_menu_view() {
     menu_copy_feedback_deadline = 0;
     menu_copy_feedback_text.clear();
   }
+  if (!g_q_clear_feedback.empty() && now >= g_q_clear_feedback_deadline) {
+    g_q_clear_feedback.clear();
+  }
+  if (g_q_clear_armed && now >= g_q_clear_arm_deadline) {
+    g_q_clear_armed = false;
+  }
+
+  if (menu_category < 0) {
+    // Category picker.
+    std::vector<std::string> cats = {"Station", "Operating", "IC-705/Network", "Logging", "System"};
+    ui_draw_list(cats, 0, -1);
+    return;
+  }
 
   std::vector<std::string> lines;
-  lines.reserve(12);
+  lines.reserve(6);
 
-  std::string cq_line = std::string("CQ Type:");
-  if (g_cq_type == CqType::CQFREETEXT) cq_line += g_cq_freetext;
-  else cq_line += cq_type_name(g_cq_type);
-  lines.push_back(cq_line);
-  lines.push_back("Send FreeText");
-  lines.push_back(std::string("F:") + head_trim(g_free_text, 16));
-  lines.push_back(std::string("Call:") + elide_right(menu_edit_idx == 3 ? menu_edit_buf : g_call));
-  std::string display_grid = g_grid;
-  if (menu_edit_idx == 4) {
-    display_grid = menu_edit_buf;
-  } else if (g_time_synced_from_gps && g_grid_from_gps && g_grid_gps_display8.size() == 8) {
-    display_grid = g_grid_gps_display8.substr(0, 6);
-  }
-  lines.push_back(std::string("Grid:") + elide_right(display_grid));
-  lines.push_back(menu_sleep_batt_line());
-
-  lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
-  if (menu_edit_idx == 7) {
-    lines.push_back(std::string("Fixed:") + menu_edit_buf);
-  } else {
-    lines.push_back(std::string("Fixed:") + std::to_string(g_offset_hz));
-  }
-  lines.push_back(std::string("Radio:") + radio_name(g_radio));
-  lines.push_back(std::string("IgnoreList:") + head_trim(g_ignore_prefix_text, 10));
-  lines.push_back(std::string("C:") + head_trim(expand_comment1(), 16));
+  if (menu_category == kCatStation) {
+    lines.push_back(std::string("Call:") + elide_right(menu_edit_idx == kCatStation * MENU_CAT_BASE + 0 ? menu_edit_buf : g_call));
+    std::string display_grid = g_grid;
+    if (menu_edit_idx == kCatStation * MENU_CAT_BASE + 1) {
+      display_grid = menu_edit_buf;
+    } else if (g_time_synced_from_gps && g_grid_from_gps && g_grid_gps_display8.size() == 8) {
+      display_grid = g_grid_gps_display8.substr(0, 6);
+    }
+    lines.push_back(std::string("Grid:") + elide_right(display_grid));
+    lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
+    lines.push_back("Edit Band Freqs");
+    lines.push_back(std::string("UTC:") + g_time + rtc_time_source_suffix());
+  } else if (menu_category == kCatOperating) {
+    lines.push_back(std::string("Offset:") + offset_name(g_offset_src));
+    if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 1) {
+      lines.push_back(std::string("Fixed:") + menu_edit_buf);
+    } else {
+      lines.push_back(std::string("Fixed:") + std::to_string(g_offset_hz));
+    }
+    lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
+    if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 3) {
+      lines.push_back(std::string("Max Retry:") + menu_edit_buf);
+    } else {
+      lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
+    }
 #if ENABLE_FT4
-  {
-    // Show the saved (pending) mode.  Add '*' if it differs from the running
-    // boot mode so the user knows a reboot is needed to apply the change.
-    const char* pending_name = g_protocol_pending_ft4 ? "FT4" : "FT8";
-    bool needs_reboot = g_protocol_pending_ft4 != (g_protocol == &kProtocolFT4);
-    lines.push_back(std::string("Mode: ") + pending_name + (needs_reboot ? "*" : ""));
-  }
-#else
-  lines.push_back("WiFi:Status S->2");
+    {
+      // Show the saved (pending) mode.  Add '*' if it differs from the running
+      // boot mode so the user knows a reboot is needed to apply the change.
+      const char* pending_name = g_protocol_pending_ft4 ? "FT4" : "FT8";
+      bool needs_reboot = g_protocol_pending_ft4 != (g_protocol == &kProtocolFT4);
+      lines.push_back(std::string("Mode: ") + pending_name + (needs_reboot ? "*" : ""));
+    }
 #endif
-
-  // Page 2 content (index 12+)
-  lines.push_back(std::string("RxTxLog:") + (g_rxtx_log ? "ON" : "OFF"));
-  lines.push_back(std::string("SkipTX1:") + (g_skip_tx1 ? "ON" : "OFF"));
-  lines.push_back(std::string("ActiveBand:") + head_trim(g_active_band_text, 16));
-  lines.push_back(std::string("GNSS_LoRa:") + (g_gnss_lora_enabled ? "ON" : "OFF"));
-  if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
-    lines.push_back(menu_copy_feedback_text);
-  } else {
-    lines.push_back("End+Export Log SD");
-  }
-  if (menu_edit_idx == 17) {
-    lines.push_back(std::string("Max Retry:") + menu_edit_buf);
-  } else {
-    lines.push_back(std::string("Max Retry:") + std::to_string(g_autoseq_max_retry));
-  }
-
-  // Page 3 content (absolute indices 18-23) — IC-705 WiFi/network settings.
-  // Keys 1-6 on this page map to: 1 SSID, 2 WiFi Pass, 3 Net User, 4 Net Pass,
-  // 5 CI-V Addr, 6 Re-resolve. The edit index equals the row's absolute index.
-  {
-    std::string ssid_disp = g_ic705_wifi_ssid.empty() ? "(not set)" : g_ic705_wifi_ssid;
-    if (menu_edit_idx == 18) ssid_disp = menu_edit_buf;
-    lines.push_back(std::string("WiFi SSID:") + head_trim(ssid_disp, 10));
-  }
-  {
-    // Mask secrets as asterisks unless actively editing.
-    std::string pass_disp;
-    if (menu_edit_idx == 19) {
-      pass_disp = menu_edit_buf;
-    } else {
-      pass_disp = g_ic705_wifi_pass.empty() ? "(not set)" : std::string(g_ic705_wifi_pass.size(), '*');
+  } else if (menu_category == kCatNetwork) {
+    // Keys 1-6: 1 SSID, 2 WiFi Pass, 3 Net User, 4 Net Pass, 5 CI-V Addr,
+    // 6 Re-resolve. menu_edit_idx equals kCatNetwork*MENU_CAT_BASE + local.
+    {
+      std::string ssid_disp = g_ic705_wifi_ssid.empty() ? "(not set)" : g_ic705_wifi_ssid;
+      if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 0) ssid_disp = menu_edit_buf;
+      lines.push_back(std::string("WiFi SSID:") + head_trim(ssid_disp, 10));
     }
-    lines.push_back(std::string("WiFi Pass:") + head_trim(pass_disp, 10));
-  }
-  {
-    std::string user_disp = g_ic705_net_user.empty() ? "(not set)" : g_ic705_net_user;
-    if (menu_edit_idx == 20) user_disp = menu_edit_buf;
-    lines.push_back(std::string("Net User:") + head_trim(user_disp, 10));
-  }
-  {
-    std::string npass_disp;
-    if (menu_edit_idx == 21) {
-      npass_disp = menu_edit_buf;
-    } else {
-      npass_disp = g_ic705_net_pass.empty() ? "(not set)" : std::string(g_ic705_net_pass.size(), '*');
+    {
+      // Mask secrets as asterisks unless actively editing.
+      std::string pass_disp;
+      if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 1) {
+        pass_disp = menu_edit_buf;
+      } else {
+        pass_disp = g_ic705_wifi_pass.empty() ? "(not set)" : std::string(g_ic705_wifi_pass.size(), '*');
+      }
+      lines.push_back(std::string("WiFi Pass:") + head_trim(pass_disp, 10));
     }
-    lines.push_back(std::string("Net Pass:") + head_trim(npass_disp, 10));
-  }
-  {
-    char civ_str[8];
-    if (menu_edit_idx == 22) {
-      snprintf(civ_str, sizeof(civ_str), "%s", menu_edit_buf.c_str());
-    } else {
-      snprintf(civ_str, sizeof(civ_str), "0x%02X", (unsigned)g_ic705_civ_addr);
+    {
+      std::string user_disp = g_ic705_net_user.empty() ? "(not set)" : g_ic705_net_user;
+      if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 2) user_disp = menu_edit_buf;
+      lines.push_back(std::string("Net User:") + head_trim(user_disp, 10));
     }
-    lines.push_back(std::string("CI-V Addr:") + civ_str);
+    {
+      std::string npass_disp;
+      if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 3) {
+        npass_disp = menu_edit_buf;
+      } else {
+        npass_disp = g_ic705_net_pass.empty() ? "(not set)" : std::string(g_ic705_net_pass.size(), '*');
+      }
+      lines.push_back(std::string("Net Pass:") + head_trim(npass_disp, 10));
+    }
+    {
+      char civ_str[8];
+      if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 4) {
+        snprintf(civ_str, sizeof(civ_str), "%s", menu_edit_buf.c_str());
+      } else {
+        snprintf(civ_str, sizeof(civ_str), "0x%02X", (unsigned)g_ic705_civ_addr);
+      }
+      lines.push_back(std::string("CI-V Addr:") + civ_str);
+    }
+  } else if (menu_category == kCatLogging) {
+    if (menu_copy_feedback_deadline > 0 && !menu_copy_feedback_text.empty()) {
+      lines.push_back(menu_copy_feedback_text);
+    } else {
+      lines.push_back("End+Export Log SD");
+    }
+    if (!g_q_clear_feedback.empty()) {
+      lines.push_back(g_q_clear_feedback);
+    } else if (g_q_clear_armed) {
+      lines.push_back("Press 2 again: confirm");
+    } else {
+      lines.push_back("Clear QSO Log: " + std::to_string((unsigned)g_adif_sd_seq));
+    }
+    lines.push_back("Performance");
+  } else if (menu_category == kCatSystem) {
+    lines.push_back(menu_sleep_batt_line());
+    lines.push_back("Sleep Now");
+    lines.push_back("GPS Status");
+    lines.push_back(std::string("Reslv/Conn:") + wifi_mgr_status_string());
+    lines.push_back("Brightness: " + std::to_string(g_brightness_step) + "/10");
   }
-  lines.push_back(std::string("Reslv/Conn:") + wifi_mgr_status_string());  // key 6 = re-resolve; shows live status
 
-  int highlight_abs = -1;
+  int highlight_local = -1;
   if (menu_edit_idx >= 0) {
-    highlight_abs = menu_edit_idx;
+    highlight_local = menu_edit_idx - menu_category * MENU_CAT_BASE;
   } else if (menu_flash_idx >= 0 && now < menu_flash_deadline) {
-    highlight_abs = menu_flash_idx;
+    highlight_local = menu_flash_idx - menu_category * MENU_CAT_BASE;
   } else {
     menu_flash_idx = -1;
   }
-  // Auto-clear flash after timeout
   if (menu_flash_idx >= 0 && now >= menu_flash_deadline) {
     menu_flash_idx = -1;
   }
-  ui_draw_list(lines, menu_page, highlight_abs);
-  // Draw battery icon on visible battery line
-  int battery_abs_idx = 5;
-  if (menu_page == (battery_abs_idx / 6)) {
-    int line_on_page = battery_abs_idx % 6;
-    const int line_h = 19;
-    const int start_y = UI_START_Y;
-    (void)line_on_page;
-    (void)line_h;
-    (void)start_y;
-    //int y = start_y + line_on_page * line_h + 3;
-    //int level = (int)M5.Power.getBatteryLevel();
-    //bool charging = M5.Power.isCharging();
-    //draw_battery_icon(190, y, 24, 12, level, charging);
-  }
+  if (highlight_local < 0 || highlight_local >= (int)lines.size()) highlight_local = -1;
+  ui_draw_list(lines, 0, highlight_local);
 }
 
 static std::string status_sync_line() {
   const bool streaming = audio_source_is_streaming();
   const RadioType radio = canonical_radio_type(g_radio);
-
-  if (is_kh1_radio(radio)) {
-    const char* name = radio_name(radio);
-    if (!g_kh1_connected) {
-      return std::string("Connect ") + name;
-    }
-    const bool cat_ready = radio_control_ready();
-    if (cat_ready && streaming) return std::string("Sync ") + name + " (RX+TX)";
-    if (cat_ready && !streaming) return std::string("Sync ") + name + " (TX)";
-    return std::string("Connect ") + name;
-  }
 
   if (radio == RadioType::IC705) {
     wifi_mgr_state_t ws = wifi_mgr_get_state();
@@ -3590,11 +3336,6 @@ static void refresh_status_view_if_dirty() {
   }
   int cur_sig = audio_source_is_streaming() ? 1 : 0;
   cur_sig |= ((int)canonical_radio_type(g_radio) << 4);
-  if (is_kh1_radio(g_radio)) {
-    cur_sig |= 2;
-    if (g_kh1_connected) cur_sig |= 8;
-    if (g_kh1_connected && radio_control_ready()) cur_sig |= 4;
-  }
   std::string cur_text = status_sync_line();
   if (cur_sig != last_sig || cur_text != last_text) {
     draw_status_view();
@@ -3652,27 +3393,27 @@ static void draw_gps_view(bool force_redraw) {
 
 static void draw_status_view() {
   std::string lines[6];
-  BeaconMode disp_beacon = (ui_mode == UIMode::STATUS) ? g_status_beacon_temp : g_beacon;
-  lines[0] = std::string("Beacon: ") + beacon_name(disp_beacon);
-  lines[1] = status_sync_line();
+  lines[0] = status_sync_line();
   {
     char fbuf[16];
     float f = g_bands[g_band_sel].freq;
     if (f == (int)f) snprintf(fbuf, sizeof(fbuf), "%d", (int)f);
     else             snprintf(fbuf, sizeof(fbuf), "%.1f", f);
-    lines[2] = std::string("Band: ") + std::string(g_bands[g_band_sel].name) + " " + fbuf;
+    lines[1] = std::string("Band: ") + std::string(g_bands[g_band_sel].name) + " " + fbuf;
   }
-  lines[3] = std::string("Tune: ") + (g_tune ? "ON" : "OFF");
+  lines[2] = std::string("Tune: ") + (g_tune ? "ON" : "OFF") +
+             "  G:" + std::to_string(ic705_tx_get_gain_q8());
+  if (status_edit_idx == 3 && !status_edit_buffer.empty()) {
+    lines[3] = std::string("Date: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
+  } else {
+    lines[3] = std::string("Date: ") + g_date;
+  }
   if (status_edit_idx == 4 && !status_edit_buffer.empty()) {
-    lines[4] = std::string("Date: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
+    lines[4] = std::string("Time: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
   } else {
-    lines[4] = std::string("Date: ") + g_date;
+    lines[4] = std::string("Time: ") + g_time + rtc_time_source_suffix();
   }
-  if (status_edit_idx == 5 && !status_edit_buffer.empty()) {
-    lines[5] = std::string("Time: ") + highlight_pos(status_edit_buffer, status_cursor_pos);
-  } else {
-    lines[5] = std::string("Time: ") + g_time + rtc_time_source_suffix();
-  }
+  lines[5] = "Disconnect 705";
   for (int i = 0; i < 6; ++i) {
     bool hl = (status_edit_idx == i);
     draw_status_line(i, lines[i], hl);
@@ -4069,7 +3810,7 @@ static void host_handle_line(const std::string& line_in) {
     send("Heap: " + std::to_string(heap_caps_get_free_size(MALLOC_CAP_DEFAULT)));
     send("OK");
   } else if (cmd_up == "HELP") {
-    for (auto& l : g_msc_lines) send(l);
+    for (auto& l : g_host_help_lines) send(l);
   } else if (cmd_up == "EXIT") {
     send("OK: exit host");
     enter_mode(UIMode::RX);
@@ -4151,7 +3892,7 @@ static void host_process_bytes(const uint8_t* buf, size_t len) {
           memcpy(host_bin_last8, host_bin_buf.data() + payload_len - 8, 8);
         } else {
           // shift existing and append
-          size_t shift = (payload_len + 8 > 8) ? (payload_len) : payload_len;
+          size_t shift = payload_len;
           if (shift > 0) {
             memmove(host_bin_last8, host_bin_last8 + shift, 8 - shift);
             memcpy(host_bin_last8 + (8 - payload_len), host_bin_buf.data(), payload_len);
@@ -4251,6 +3992,41 @@ static bool nvs_load_station(std::string& out) {
   return e == ESP_OK;
 }
 
+// --- Per-band TX gain persistence (NVS) -------------------------------------
+// The clean-TX drive level differs per band, so remember one per band and
+// reload it whenever g_band_sel changes (see apply_band_gain_for_current()'s
+// two call sites in rebuild_active_bands()/advance_active_band()). Matches
+// TD705's "g_<bandname>" key scheme in the same NVS namespace used for the
+// rest of this app's config.
+static void band_gain_save(int band_idx, int gain) {
+  if (band_idx < 0 || band_idx >= (int)g_bands.size()) return;
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READWRITE, &h) != ESP_OK) return;
+  char key[16];
+  snprintf(key, sizeof(key), "g_%s", g_bands[band_idx].name);
+  nvs_set_u8(h, key, (uint8_t)gain);
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+static int band_gain_load(int band_idx) {  // stored gain, or -1 if none saved
+  if (band_idx < 0 || band_idx >= (int)g_bands.size()) return -1;
+  nvs_handle_t h;
+  if (nvs_open(kNvsNamespace, NVS_READONLY, &h) != ESP_OK) return -1;
+  char key[16];
+  snprintf(key, sizeof(key), "g_%s", g_bands[band_idx].name);
+  uint8_t v = 0;
+  esp_err_t e = nvs_get_u8(h, key, &v);
+  nvs_close(h);
+  return (e == ESP_OK) ? (int)v : -1;
+}
+
+static void apply_band_gain_for_current() {
+  int g = band_gain_load(g_band_sel);
+  if (g > 0) ic705_tx_set_gain_q8(g);
+  // else: no saved value for this band yet -- leave the current gain alone.
+}
+
 // ADIF logging (NVS store + verified SD export) now lives in qso_log.cpp.
 
 static void split_into_lines(const std::string& content, std::vector<std::string>& lines) {
@@ -4293,26 +4069,6 @@ static bool read_station_lines(std::vector<std::string>& lines) {
   return !lines.empty();
 }
 
-static RadioType load_station_radio_type_only() {
-  // Runs before the display is initialised, so it must NOT touch the SD card:
-  // SD shares the display's SPI bus and mounting it pre-display risks an SPI
-  // init-ordering crash. Flash-only here (cheap); the full config, including the
-  // radio, is loaded from the SD card later in load_station_data() once the
-  // display is up. (CP705 is IC-705 only, so this default rarely matters.)
-  StorageStream* stream = storage_stream_open(STATION_FILE, StorageOpenMode::READ);
-  if (!stream) return canonical_radio_type(g_radio);
-  char line[128];
-  RadioType radio = canonical_radio_type(g_radio);
-  while (storage_stream_read_line(stream, line, sizeof(line))) {
-    if (strncmp(line, "radio=", 6) == 0) {
-      radio = parse_radio_config_value(line + 6);
-      break;
-    }
-  }
-  storage_stream_close(stream);
-  return canonical_radio_type(radio);
-}
-
 static void load_station_data() {
   // NOTE: do NOT call storage_sync_station_from_sd() here. It mounts the SD then
   // unmounts it (frees the SPI bus) before the SD log-mount is pinned, and the
@@ -4322,8 +4078,8 @@ static void load_station_data() {
   // Load-time defaults for runtime settings.
   g_rtc_comp = kRtcCompFixed;
   g_autoseq_max_retry = AUTOSEQ_MAX_RETRY;
+  g_brightness_step = 10;
   g_gps_baud = 115200;
-  g_gnss_lora_enabled = true;   // hardcoded for now: LoRa-1262 cap GNSS by default
   g_grid_saved_manual = g_grid;
   g_grid_from_gps = false;
   g_grid_gps_display8.clear();
@@ -4387,8 +4143,6 @@ static void load_station_data() {
       if (idx >= 0 && idx < (int)g_bands.size()) {
         g_bands[idx].freq = fval;
       }
-    } else if (sscanf(line, "beacon=%d", &val) == 1) {
-      // beacon persists OFF only; ignore saved value
     } else if (sscanf(line, "offset=%d", &val) == 1) {
       g_offset_hz = val;
     } else if (sscanf(line, "band_sel=%d", &val) == 1) {
@@ -4401,8 +4155,6 @@ static void load_station_data() {
       if (val >= 0 && val <= 5) g_cq_type = (CqType)val;
     } else if (sscanf(line, "offset_src=%d", &val) == 1) {
       if (val >= 0 && val <= 2) g_offset_src = (OffsetSrc)val;
-    } else if (strncmp(line, "radio=", 6) == 0) {
-      g_radio = parse_radio_config_value(line + 6);
     } else if (strncmp(line, "ic705_host=", 11) == 0) {
       std::string h = trim_copy(line + 11);
       if (!h.empty()) g_ic705_hostname = h;
@@ -4428,12 +4180,6 @@ static void load_station_data() {
       g_cq_freetext = trim_upper_copy(line + 6);
     } else if (strncmp(line, "free_text=", 10) == 0) {
       g_free_text = trim_upper_copy(line + 10);
-    } else if (strncmp(line, "comment1=", 9) == 0) {
-      g_comment1 = trim_copy(line + 9);
-    } else if (strncmp(line, "ignore_prefixes=", 16) == 0) {
-      g_ignore_prefix_text = clamp_ignore_prefix_text(trim_upper_copy(line + 16));
-    } else if (sscanf(line, "rxtx_log=%d", &val) == 1) {
-      g_rxtx_log = (val != 0);
     } else if (sscanf(line, "skiptx1=%d", &val) == 1) {
       g_skip_tx1 = (val != 0); autoseq_set_skip_tx1(g_skip_tx1);
     } else if (sscanf(line, "active_band=%d", &val) == 1) { // legacy single value
@@ -4442,6 +4188,8 @@ static void load_station_data() {
       g_active_band_text = trim_upper_copy(line + 13);
     } else if (sscanf(line, "autoseq_max_retry=%d", &val) == 1) {
       if (val >= 0) g_autoseq_max_retry = val;
+    } else if (sscanf(line, "brightness=%d", &val) == 1) {
+      if (val >= 1 && val <= 10) g_brightness_step = val;
     } else if (strncmp(line, "protocol_mode=", 14) == 0) {
       // Already handled in pass 1 above (g_protocol + band defaults set there).
       // Nothing to do here in pass 2.
@@ -4464,8 +4212,7 @@ static void load_station_data() {
     rtc_set_from_strings_source(RtcTimeSource::SAVED);
   }
   rebuild_active_bands();
-  rebuild_ignore_prefixes();
-  g_beacon = BeaconMode::OFF; // force off on load
+  g_cq_running = false; // never resume a running CQ across a reboot
 #if ENABLE_FT4
   g_protocol_pending_ft4 = (g_protocol == &kProtocolFT4);
 #endif
@@ -4487,7 +4234,6 @@ void save_station_data() {
     else             snprintf(fbuf, sizeof(fbuf), "%.1f", f);
     out << band_prefix << (unsigned)i << "=" << fbuf << "\n";
   }
-  // Beacon is not persisted (stays OFF on reload)
   out << "offset=" << g_offset_hz << "\n";
   out << "band_sel=" << g_band_sel << "\n";
   out << "date=" << g_date << "\n";
@@ -4499,7 +4245,6 @@ void save_station_data() {
   out << "call=" << g_call << "\n";
   out << "grid=" << g_grid_saved_manual << "\n";
   out << "offset_src=" << (int)g_offset_src << "\n";
-  out << "radio=" << (int)canonical_radio_type(g_radio) << "\n";
   out << "ic705_wifi_ssid=" << g_ic705_wifi_ssid << "\n";
   out << "ic705_wifi_pass=" << g_ic705_wifi_pass << "\n";
   out << "ic705_net_user=" << g_ic705_net_user << "\n";
@@ -4507,14 +4252,11 @@ void save_station_data() {
   out << "ic705_host=" << g_ic705_hostname << "\n";
   out << "ic705_civ_addr=" << g_ic705_civ_addr << "\n";
   out << "gps_baud=" << normalize_gps_baud_value(g_gps_baud) << "\n";
-  out << "gnss_lora=" << (g_gnss_lora_enabled ? 1 : 0) << "\n";
-  out << "comment1=" << g_comment1 << "\n";
-  out << "ignore_prefixes=" << g_ignore_prefix_text << "\n";
-  out << "rxtx_log=" << (g_rxtx_log ? 1 : 0) << "\n";
   out << "active_bands=" << g_active_band_text << "\n";
   out << "rtc_sleep_epoch=" << (long long)g_rtc_sleep_epoch << "\n";
   out << "rtc_comp=" << g_rtc_comp << "\n";
   out << "autoseq_max_retry=" << g_autoseq_max_retry << "\n";
+  out << "brightness=" << g_brightness_step << "\n";
 #if ENABLE_FT4
   // Save the pending protocol mode (may differ from g_protocol if user toggled
   // Mode in the menu without rebooting yet).
@@ -4541,26 +4283,7 @@ void save_station_data() {
 }
 
 static void enter_mode(UIMode new_mode) {
-  // No special handling needed when leaving TX mode - autoseq manages queue internally
   if (ui_mode == UIMode::STATUS && new_mode != UIMode::STATUS) {
-    if (g_beacon != g_status_beacon_temp) {
-      bool was_off = (g_beacon == BeaconMode::OFF);
-      g_beacon = g_status_beacon_temp;
-      save_station_data();
-      // No need to clear autoseq when beacon is turned off.
-      // Any CQ in queue will transmit once, then tick moves CALLING→IDLE.
-      core_fire_qso_changed();  // propagates to all registered consumers
-
-      // If beacon was just enabled, enqueue CQ and set TX flag
-      // TX will trigger at next slot boundary via check_slot_boundary()
-      if (was_off && g_beacon != BeaconMode::OFF) {
-        enqueue_beacon_cq();
-        AutoseqTxEntry pending;
-        if (autoseq_fetch_pending_tx(pending)) {
-          arm_pending_tx(pending);
-        }
-      }
-    }
     status_edit_idx = -1;
     status_edit_buffer.clear();
 
@@ -4568,8 +4291,7 @@ static void enter_mode(UIMode new_mode) {
     // changes (band advance via S->3, etc.) without needing a manual
     // "Sync to QMX" button press. Idempotent — safe even if the same
     // sync already fired (e.g. from S->3 in-menu push, or from the
-    // initial-connect path for QMX). For KH1 this is the primary sync
-    // path (UART CAT has no discrete "first connect" event).
+    // initial-connect path for QMX).
     sync_radio_to_current_band("STATUS exit");
   }
   ui_mode = new_mode;
@@ -4580,39 +4302,20 @@ static void enter_mode(UIMode new_mode) {
       ui_force_redraw_rx();
       ui_draw_rx();
       break;
-    case UIMode::TX:
-      tx_page = 0;
-      redraw_tx_view();
-      break;
     case UIMode::BAND:
       band_page = 0;
       band_edit_idx = -1;
       draw_band_view();
       break;
     case UIMode::MENU:
-      menu_page = 0;
+      menu_category = -1;
       menu_edit_idx = -1;
       menu_edit_buf.clear();
-      draw_menu_view();
-      break;
-    case UIMode::DEBUG:
-      d_page = 0;
-      delete_load_file_list();
-      ui_draw_list(g_d_lines, d_page, -1);
-      break;
-    case UIMode::MSC:
-      ui_draw_debug(g_msc_lines, 0);
-      break;
-    case UIMode::QSO:
-      g_q_show_entries = false;
-      q_page = 0;
       g_q_clear_armed = false;
       g_q_clear_feedback.clear();
-      qso_load_file_list();
-      qso_draw_page();
+      draw_menu_view();
       break;
     case UIMode::STATUS:
-      g_status_beacon_temp = g_beacon;
       status_edit_idx = -1;
       status_cursor_pos = -1;
       draw_status_view();
@@ -4626,56 +4329,6 @@ static void enter_mode(UIMode new_mode) {
   }
 }
 
-
-static void enter_msc_mode(const char* reason) {
-  ESP_LOGI(TAG, "Entering MSC mode: %s", reason);
-  debug_log_line("Entering MSC mode");
-
-  if (g_config_save_pending) {
-    g_config_save_pending = false;
-    save_station_data();
-  }
-
-  core_cmd_cancel_tx();
-  if (g_tx_active) {
-    tx_tick();
-  }
-  g_tx_cancel_requested = false;
-  g_qso_xmit = false;
-  g_pending_tx_valid = false;
-  g_decode_enabled = false;
-  ui_set_paused(true);
-  audio_source_stop();
-  vTaskDelay(pdMS_TO_TICKS(200));
-
-  const esp_err_t err = storage_service_set_usb_drive_enabled(true);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "USB Drive enable failed: %s", esp_err_to_name(err));
-    debug_log_line(std::string("USB Drive fail: ") + esp_err_to_name(err));
-    return;
-  }
-
-  ESP_LOGI(TAG, "MSC ready: PC will see CP705 as a USB drive");
-  enter_mode(UIMode::MSC);
-}
-
-static void exit_msc_mode() {
-  ESP_LOGI(TAG, "Leaving MSC mode");
-  const esp_err_t err = storage_service_set_usb_drive_enabled(false);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "USB Drive disable failed: %s", esp_err_to_name(err));
-    debug_log_line(std::string("USB Drive off fail: ") + esp_err_to_name(err));
-    if (storage_service_owner() == StorageOwner::UNAVAILABLE) {
-      enter_mode(UIMode::RX);
-      ui_force_redraw_rx();
-      ui_draw_rx();
-    }
-    return;
-  }
-  enter_mode(UIMode::RX);
-  ui_force_redraw_rx();
-  ui_draw_rx();
-}
 
 // Once WiFi reaches IC-705 once a manual '2' press has gotten WiFi up,
 // automatically kick off (and retry) the CAT network login — without this,
@@ -4802,12 +4455,12 @@ static void auto_start_ic705_audio_once_cat_ready() {
   g_ic705_initial_sync_pending = true;
 }
 
-// Perform the STATUS -> '2' action: connect IC-705 (WiFi + audio + CAT),
-// or connect KH1 over serial CAT. Syncs the selected band to the radio.
+// Perform the STATUS -> '1' action: connect IC-705 (WiFi + audio + CAT).
+// Syncs the selected band to the radio.
 static void begin_usb_host_mode() {
   const bool on_status_page = (ui_mode == UIMode::STATUS);
   if (on_status_page) {
-    status_edit_idx = 1;
+    status_edit_idx = 0;  // highlight the sync-status row while connecting
     draw_status_view();
   }
 
@@ -4844,16 +4497,6 @@ static void begin_usb_host_mode() {
     if (!radio_control_ready()) {
       notify_radio_control_audio_start_if_allowed("status key 2");
     }
-  } else if (is_kh1_radio(radio)) {
-    if (!g_kh1_connected) {
-      g_kh1_connected = true;
-      apply_radio_profile_binding();
-    }
-    if (!audio_source_is_streaming()) {
-      start_rx_audio_for_current_radio("status key 2", true);
-    } else {
-      notify_radio_control_audio_start_if_allowed("status key 2");
-    }
   }
 
   int freq_hz = (int)(g_bands[g_band_sel].freq * 1000.0f);
@@ -4882,7 +4525,9 @@ static void app_task_core0(void* /*param*/) {
     storage_sync_station_from_sd();
   }
   board_power_init();
-  g_radio = load_station_radio_type_only();
+  // Radio selection is no longer user-exposed (menu toggle removed) — cp705
+  // is IC-705 only.
+  g_radio = RadioType::IC705;
   ui_init(radio_type_uses_display_only(g_radio));
   // Mount + pin the SD card now — AFTER display init (SPI-ordering safe) but
   // BEFORE load_station_data() reads Station.txt from it, and before WiFi/audio
@@ -4908,10 +4553,12 @@ static void app_task_core0(void* /*param*/) {
   // the existing dirty flags — the UI main loop drains them on each tick.
   // Trivial handlers only (spec in docs/NATIVE_CLIENT_ARCHITECTURE.md).
   core_on_rx_changed    ([]{ g_rx_dirty = true; });
-  core_on_qso_changed   ([]{ g_tx_view_dirty = true; });
+  // Also mark RX dirty: the hero card (shown in place of the decode list
+  // while a QSO/CQ is active) needs to redraw on every QSO state change,
+  // not just on new decodes.
+  core_on_qso_changed   ([]{ g_rx_dirty = true; });
   // config changes redraw whatever view is showing them (MENU/STATUS);
-  // set both dirty flags so the next UI tick re-evaluates.
-  core_on_config_changed([]{ g_rx_dirty = true; g_tx_view_dirty = true; });
+  core_on_config_changed([]{ g_rx_dirty = true; });
   
 autoseq_set_adif_callback(log_adif_entry);
 autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
@@ -4919,6 +4566,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
   ui_mode = UIMode::RX;
   load_station_data();
+  apply_brightness();
   // Seed the on-screen QSO counter from the durable NVS log so it reflects the
   // real logged count instead of resetting to 0 on every power-on.
   g_adif_sd_seq = (uint32_t)qso_log_count_nvs();
@@ -4934,7 +4582,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   ui_set_rx_list(empty);
 
   if (g_startup_active) {
-    ui_draw_debug(g_startup_lines, 0);
+    ui_draw_splash(g_call, kAppVersion);
   } else {
     ui_force_redraw_rx();
     ui_draw_rx();
@@ -4991,23 +4639,33 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // how we learn whether it was a panic/exception, a watchdog, a brownout
   // (WiFi-TX current spike), etc. — plus the heap we have to work with.
   {
+    const esp_reset_reason_t rr_code = esp_reset_reason();
     const char* rr = "?";
-    switch (esp_reset_reason()) {
-      case ESP_RST_POWERON:   rr = "POWERON";   break;
-      case ESP_RST_SW:        rr = "SW";        break;
-      case ESP_RST_PANIC:     rr = "PANIC";     break;
-      case ESP_RST_INT_WDT:   rr = "INT_WDT";   break;
-      case ESP_RST_TASK_WDT:  rr = "TASK_WDT";  break;
-      case ESP_RST_WDT:       rr = "WDT";       break;
-      case ESP_RST_BROWNOUT:  rr = "BROWNOUT";  break;
-      case ESP_RST_DEEPSLEEP: rr = "DEEPSLEEP"; break;
-      case ESP_RST_EXT:       rr = "EXT";       break;
-      default:                rr = "OTHER";     break;
+    switch (rr_code) {
+      case ESP_RST_POWERON:    rr = "POWERON";    break;
+      case ESP_RST_SW:         rr = "SW";         break;
+      case ESP_RST_PANIC:      rr = "PANIC";      break;
+      case ESP_RST_INT_WDT:    rr = "INT_WDT";    break;
+      case ESP_RST_TASK_WDT:   rr = "TASK_WDT";   break;
+      case ESP_RST_WDT:        rr = "WDT";        break;
+      case ESP_RST_BROWNOUT:   rr = "BROWNOUT";   break;
+      case ESP_RST_DEEPSLEEP:  rr = "DEEPSLEEP";  break;
+      case ESP_RST_EXT:        rr = "EXT";        break;
+      // Previously all lumped into "OTHER", which hid the actual cause of the
+      // dozens of mystery reboots in the log. Name the ones that matter here:
+      case ESP_RST_USB:        rr = "USB";        break;  // USB peripheral reset (host re-enumerate)
+      case ESP_RST_JTAG:       rr = "JTAG";       break;
+      case ESP_RST_CPU_LOCKUP: rr = "CPU_LOCKUP"; break;  // interrupt-disabled hang -> lockup reset
+      case ESP_RST_PWR_GLITCH: rr = "PWR_GLITCH"; break;  // supply glitch (TX current spike, bad cable)
+      case ESP_RST_UNKNOWN:    rr = "UNKNOWN";    break;
+      default:                 rr = "OTHER";      break;
     }
+    // Keep the raw enum value too, so anything still landing on OTHER is
+    // identifiable without a firmware change.
     char buf[200];
     snprintf(buf, sizeof(buf),
-             "BOOT reset=%s heap8=%u heapInt=%u heapDMA=%u dmaLargest=%u PSRAM=%u\n",
-             rr,
+             "BOOT reset=%s(%d) heap8=%u heapInt=%u heapDMA=%u dmaLargest=%u PSRAM=%u\n",
+             rr, (int)rr_code,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
@@ -5079,8 +4737,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         draw_perf_view(false);
       }
     }
-    // Startup splash: show briefly, then remain in RX. Radio connection is
-    // explicit through STATUS -> 2; direct-mode keys still work immediately.
+    // Startup splash: show briefly, then land on STATUS by default. Radio
+    // connection is explicit through STATUS -> 2; direct-mode keys still
+    // work immediately.
     if (g_startup_active) {
       if (g_startup_start_ms == 0) {
         g_startup_start_ms = esp_timer_get_time() / 1000;
@@ -5090,11 +4749,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         const bool direct_mode_entry = is_startup_direct_mode_key(c);
         g_startup_active = false;
         save_station_data();
+        // The splash paints its own full-screen graphic (red/blue Icom bars,
+        // title). Nothing else on exit does a full clear -- STATUS's own
+        // draw only touches rows below UI_START_Y, and the top waterfall/
+        // countdown strip is normally kept fresh by the running RX loop,
+        // which hasn't executed yet here -- so blank once at the real exit
+        // point, before any subsequent mode (STATUS or a direct-mode key) draws.
+        M5.Display.fillScreen(TFT_BLACK);
         if (!direct_mode_entry) {
-          // Non-mode key: dismiss, show RX, consume the key.
+          // Non-mode key: dismiss, land on STATUS, consume the key.
           last_key = c;
-          ui_force_redraw_rx();
-          ui_draw_rx();
+          enter_mode(UIMode::STATUS);
           vTaskDelay(pdMS_TO_TICKS(10));
           continue;
         }
@@ -5103,12 +4768,11 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       } else {
         const int64_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - g_startup_start_ms >= kStartupAutoDismissMs) {
-          // No key within the window: dismiss the splash and remain in RX.
+          // No key within the window: dismiss the splash and land on STATUS.
           g_startup_active = false;
           save_station_data();
-          enter_mode(UIMode::RX);
-          ui_force_redraw_rx();
-          ui_draw_rx();
+          M5.Display.fillScreen(TFT_BLACK);
+          enter_mode(UIMode::STATUS);
           last_key = 0;
           vTaskDelay(pdMS_TO_TICKS(10));
           continue;
@@ -5119,20 +4783,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       }
     }
 
-    if (ui_mode == UIMode::MSC) {
-      if ((c == 'c' || c == 'C') && c != last_key) {
-        exit_msc_mode();
-      }
-      last_key = c;
-      vTaskDelay(pdMS_TO_TICKS(20));
-      continue;
-    }
 
     rtc_tick();
     update_countdown();
     consume_cdc_initial_sync();  // auto-sync VFO on first QMX connect (every iter)
     check_slot_boundary();  // TX trigger at slot boundary (matching reference architecture)
     tx_tick();              // Process TX state machine (single-threaded, non-blocking)
+    tune_tick();            // Auto-stop the tune burst once its window elapses
 
     // Drain deferred config saves requested by core commands.
     if (g_config_save_pending && storage_service_firmware_available()) {
@@ -5140,11 +4797,30 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       save_station_data();
     }
 
-    // Global TX cancel (Esc/` in RX/TX/Status when not editing)
+    // Must run every iteration (not just once we already know !g_tx_active)
+    // so it can actually latch the hold while TX is still active -- see
+    // rx_redraw_should_hold()'s comment.
+    const bool redraw_holding = rx_redraw_should_hold();
+
+    // Global TX cancel (Esc/` in RX/TX/Status when not editing). This runs
+    // BEFORE the per-mode key dispatch below and continues the loop, so it's
+    // the only place that actually sees backtick while the hero card is up
+    // (any per-mode '`' handling under case UIMode::RX would never be
+    // reached). ESC is the ONLY key that dismisses the hero card, at any
+    // point -- including mid-TX: stop the TX, drop the QSO/CQ context, and
+    // always land back on the plain RX list.
     if (c == '`' &&
-        (ui_mode == UIMode::RX || ui_mode == UIMode::TX || ui_mode == UIMode::STATUS) &&
+        (ui_mode == UIMode::RX || ui_mode == UIMode::STATUS) &&
         status_edit_idx == -1) {
       core_cmd_cancel_tx();
+      if (ui_mode == UIMode::RX && g_hero_locked) {
+        core_cmd_drop_qso(0);
+        g_hero_locked = false;
+        g_cq_running = false;  // explicit stop
+        g_qso_done_active = false;  // dismiss the completion/give-up hold immediately too
+        g_qso_done_gave_up = false;
+        render_rx_or_hero();
+      }
       debug_log_line("TX cancel requested");
       last_key = c;
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -5152,26 +4828,32 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
 
     if (c == 0) {
-      if (g_rx_dirty && ui_mode == UIMode::RX) {
-        // decode_monitor_results already called ui_set_rx_list_static(),
-        // so UI's internal list is current. Just redraw.
-        ui_draw_rx(rx_flash_idx);
-        g_rx_dirty = false;
-      }
-      if (ui_mode == UIMode::TX && g_tx_view_dirty) {
-        g_tx_view_dirty = false;
-        redraw_tx_view();
-      }
-      // NOTE: Beacon scheduling moved to decode_monitor_results() to match
-      // reference architecture - beacon CQ is only added after decodes processed
+      // NOTE: running-CQ re-scheduling lives in decode_monitor_results() -- a
+      // fresh CQ is only re-enqueued after decodes are processed.
       // Hold ALL LCD updates during TX/tune — screen SPI/DMA contends with the
       // WiFi DMA on the S3 and stalls the outgoing audio (root cause of the 1Hz
-      // carrier pulse). Resume normally the moment TX/tune ends.
+      // carrier pulse). Resume normally the moment TX/tune ends. This also
+      // covers the RX-dirty redraw below: a decode for the *other* slot parity
+      // can land (and set g_rx_dirty) well before TX finishes, and rendering
+      // it then — hero card or plain list — is the same forbidden mid-TX
+      // redraw, just triggered by a decode instead of a keypress. Leaving
+      // g_rx_dirty set here defers the redraw to the first idle tick after
+      // TX/tune actually ends, instead of dropping it.
       if (!(g_tx_active || g_tune)) {
-        ui_draw_waterfall_if_dirty();
+        if (g_rx_dirty && ui_mode == UIMode::RX && !redraw_holding) {
+          // decode_monitor_results already called ui_set_rx_list_static(),
+          // so UI's internal list is current. Just redraw (list or hero card).
+          render_rx_or_hero();
+          g_rx_dirty = false;
+        }
+        // Waterfall stays off the hero card entirely (Dean's preference) --
+        // the timer/countdown bar (update_countdown(), unaffected here) is
+        // still shown there.
+        if (!(ui_mode == UIMode::RX && g_hero_locked)) ui_draw_waterfall_if_dirty();
         menu_flash_tick();
         rx_flash_tick();
         qso_clear_tick();
+        qso_done_tick();
         refresh_status_view_if_dirty();
       }
       last_key = 0;
@@ -5180,13 +4862,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     }
   if (c == last_key) {
     // No new keypress - still need to refresh dirty views
-    if (ui_mode == UIMode::TX && g_tx_view_dirty) {
-      g_tx_view_dirty = false;
-      redraw_tx_view();
-    }
-    // NOTE: Beacon scheduling moved to decode_monitor_results()
+    // NOTE: running-CQ re-scheduling lives in decode_monitor_results()
     if (!(g_tx_active || g_tune)) {
-      ui_draw_waterfall_if_dirty();
+      if (!(ui_mode == UIMode::RX && g_hero_locked)) ui_draw_waterfall_if_dirty();
       refresh_status_view_if_dirty();
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -5203,18 +4881,13 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   menu_flash_tick();
   rx_flash_tick();
   qso_clear_tick();
+  qso_done_tick();
   apply_pending_sync();
 
   // NOTE: TX scheduling now follows reference architecture:
   // 1. decode_monitor_results() sets g_qso_xmit flag after processing
   // 2. check_slot_boundary() triggers TX at slot boundary when parity matches
   // 3. autoseq_tick() is called at slot boundary AFTER TX slot ends
-
-  // Refresh TX view if autoseq state changed
-  if (ui_mode == UIMode::TX && g_tx_view_dirty) {
-    g_tx_view_dirty = false;
-    redraw_tx_view();
-  }
 
   refresh_status_view_if_dirty();
 
@@ -5224,12 +4897,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     ui_set_paused(false);
   }
 
-  if (g_rx_dirty && ui_mode == UIMode::RX) {
-      // decode already populated ui.cpp's internal list via ui_set_rx_list_static
-      ui_draw_rx(rx_flash_idx);
-      g_rx_dirty = false;
+  // Same TX/tune hold as the c==0 idle branch above -- a keypress landing
+  // mid-TX (e.g. gain +/- from the hero card, which IS allowed while locked)
+  // must not trigger a decode-driven redraw here either.
+  if (!(g_tx_active || g_tune)) {
+    if (g_rx_dirty && ui_mode == UIMode::RX && !redraw_holding) {
+        // decode already populated ui.cpp's internal list via ui_set_rx_list_static
+        render_rx_or_hero();
+        g_rx_dirty = false;
+    }
+    if (!(ui_mode == UIMode::RX && g_hero_locked)) ui_draw_waterfall_if_dirty();
   }
-  ui_draw_waterfall_if_dirty();
 
   bool switched = false;
   auto cancel_status_edit = []() {
@@ -5239,123 +4917,132 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
       status_cursor_pos = -1;
     }
   };
-  if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit))) {
+  // Disabled while editing in MENU, and disabled entirely while the hero
+  // card is locked on screen -- ESC (handled earlier, globally) and gain
+  // +/- (handled below, under case UIMode::RX) are the only keys that
+  // should do anything while it's up. Without this, these otherwise-global
+  // mode-switch keys (S, M, N, O, B, Q, D, G, P, T, R) would jump straight
+  // to their target mode and silently take the hero card down.
+  if (!(ui_mode == UIMode::MENU && (menu_edit_idx >= 0 || menu_long_edit)) &&
+      !(ui_mode == UIMode::RX && g_hero_locked)) {
       // Mode switch keys (disabled while editing in MENU)
       if (c == 'r' || c == 'R') { cancel_status_edit(); enter_mode(UIMode::RX); ui_force_redraw_rx(); ui_draw_rx(); switched = true; }
-      else if (c == 't' || c == 'T') { cancel_status_edit(); enter_mode(ui_mode == UIMode::TX ? UIMode::RX : UIMode::TX); switched = true; }
-      else if (c == 'b' || c == 'B') { cancel_status_edit(); enter_mode(ui_mode == UIMode::BAND ? UIMode::RX : UIMode::BAND); switched = true; }
-      else if (c == 'm' || c == 'M') {
-        cancel_status_edit();
-        if (ui_mode == UIMode::MENU) {
-          if (menu_page == 0) {
-            enter_mode(UIMode::RX);
-          } else {
-            menu_page = 0;
-            draw_menu_view();
-          }
-        } else {
-          enter_mode(UIMode::MENU);
-        }
-        switched = true;
-      }
-      else if (c == 'n' || c == 'N') {
-        cancel_status_edit();
-        if (ui_mode == UIMode::MENU) {
-          if (menu_page == 1) {
-            enter_mode(UIMode::RX);
-          } else {
-            menu_page = 1;
-            draw_menu_view();
-          }
-        } else {
-          menu_page = 0;
-          enter_mode(UIMode::MENU);
-          if (menu_page < 2) menu_page++;  // one "." press
-          draw_menu_view();
-        }
-        switched = true;
-      }
-      else if (c == 'o' || c == 'O') {
-        cancel_status_edit();
-        if (ui_mode == UIMode::MENU) {
-          if (menu_page == 2) {
-            enter_mode(UIMode::RX);
-          } else {
-            menu_page = 2;
-            draw_menu_view();
-          }
-        } else {
-          menu_page = 0;
-          enter_mode(UIMode::MENU);
-          if (menu_page < 2) menu_page++;  // first "."
-          if (menu_page < 2) menu_page++;  // second "."
-          draw_menu_view();
-        }
-        switched = true;
-      }
-      else if (c == 'q' || c == 'Q') { cancel_status_edit(); enter_mode(ui_mode == UIMode::QSO ? UIMode::RX : UIMode::QSO); switched = true; }
       else if (c == 'c' || c == 'C') {
-        {
-          cancel_status_edit();
-          if (ui_mode != UIMode::MSC) {
-            enter_msc_mode("user pressed C");
-          }
-          switched = true;
-        }
+        // Call CQ works from any mode now, same as the other global
+        // mode-switch keys -- no need to back out of STATUS/MENU/etc first
+        // (Dean's report: could jump straight to R from S, but not C).
+        // Always re-opens with the default text, cursor right after "CQ "
+        // so a prefix (e.g. POTA) can be typed immediately -- doesn't
+        // remember a previous CQ's edit.
+        cancel_status_edit();
+        menu_long_edit = true;
+        menu_long_kind = LONG_FT;
+        menu_long_buf = "CQ " + g_call + " " + grid_ft8_4(g_grid);
+        menu_long_backup = menu_long_buf;
+        menu_long_cursor_pos = 3;
+        enter_mode(UIMode::MENU);
+        switched = true;
       }
-      else if (c == 'd' || c == 'D') { cancel_status_edit(); enter_mode(ui_mode == UIMode::DEBUG ? UIMode::RX : UIMode::DEBUG); switched = true; }
+      else if (c == 'm' || c == 'M') {
+        // M opens the category picker; from inside a category it goes back
+        // up to the picker; from the picker it exits to RX (matches the old
+        // "press again to exit" toggle convention).
+        cancel_status_edit();
+        if (ui_mode == UIMode::MENU) {
+          if (menu_category < 0) {
+            enter_mode(UIMode::RX);
+          } else {
+            menu_category = -1;
+            draw_menu_view();
+          }
+        } else {
+          enter_mode(UIMode::MENU);
+        }
+        switched = true;
+      }
       else if (c == 's' || c == 'S') { cancel_status_edit(); enter_mode(ui_mode == UIMode::STATUS ? UIMode::RX : UIMode::STATUS); switched = true; }
-      else if (c == 'g' || c == 'G') { cancel_status_edit(); enter_mode(ui_mode == UIMode::GPS ? UIMode::RX : UIMode::GPS); switched = true; }
-      else if (c == 'p' || c == 'P') { cancel_status_edit(); enter_mode(ui_mode == UIMode::PERF ? UIMode::RX : UIMode::PERF); switched = true; }
     }
 
   if (!switched && c) {
     // Mode-specific handling
     switch (ui_mode) {
-      case UIMode::GPS: break;
-      case UIMode::PERF: break;
-      case UIMode::RX: {
-        int sel = ui_handle_rx_key(c);
-        if (sel >= 0 && core_cmd_tap_rx(sel)) {
-          // TX-state arming lives inside core_cmd_tap_rx for every UI path.
-          rx_flash_idx = sel;
-          rx_flash_deadline = rtc_now_ms() + 500;
-          ui_draw_rx(rx_flash_idx);
+      case UIMode::GPS: {
+        // GPS is only reachable via the System category now -- backtick
+        // returns to it (there's no standalone G hotkey anymore).
+        if (c == '`') {
+          enter_mode(UIMode::MENU);
+          menu_category = kCatSystem;
+          draw_menu_view();
         }
         break;
       }
-      case UIMode::TX: {
-        // TX view shows QSO states from autoseq
-        // Pagination through QSO list (max 9 QSOs)
-        int qso_count = autoseq_queue_size();
-        int start_idx = tx_page * 5;
-        if (c == ';') {
-          if (tx_page > 0) { tx_page--; redraw_tx_view(); }
-        } else if (c == '.') {
-          if (start_idx + 5 < qso_count) { tx_page++; redraw_tx_view(); }
-        } else if (c >= '2' && c <= '6') {
-          int idx = start_idx + (c - '2');
-          if (core_cmd_drop_qso(idx)) {  // routes through core_api (fires qso_changed)
-            g_pending_tx_valid = false;
-            redraw_tx_view();
-            // Re-evaluate TX after queue change
-            AutoseqTxEntry pending;
-            if (autoseq_fetch_pending_tx(pending)) {
-              arm_pending_tx(pending);
-            }
+      case UIMode::PERF: {
+        // Performance monitor is only reachable via the Logging category --
+        // backtick returns to it (there's no standalone P hotkey anymore).
+        if (c == '`') {
+          enter_mode(UIMode::MENU);
+          menu_category = kCatLogging;
+          draw_menu_view();
+        }
+        break;
+      }
+      case UIMode::RX: {
+        if (g_hero_locked) {
+          // Hero card locked on screen: ESC (handled earlier, globally) and
+          // gain +/- are the ONLY keys that do anything. Everything else
+          // here -- tap-to-reply, Call CQ -- is a legitimate RX-mode action
+          // that would otherwise still fire even though the decode list
+          // isn't the thing on screen right now, so skip straight to the
+          // gain-only handling instead of falling into the normal RX logic.
+          if (c == '+' || c == '=') {
+            ic705_tx_set_gain_q8(ic705_tx_get_gain_q8() + 8);
+            band_gain_save(g_band_sel, ic705_tx_get_gain_q8());
+            // Gain itself applies immediately either way; only the redraw is
+            // held during TX/tune (same reason as everywhere else in this
+            // file) -- the hero card will show the new value the moment
+            // TX/tune ends.
+            if (!(g_tx_active || g_tune)) render_rx_or_hero();
+          } else if (c == '-' || c == '_') {
+            ic705_tx_set_gain_q8(ic705_tx_get_gain_q8() - 8);
+            band_gain_save(g_band_sel, ic705_tx_get_gain_q8());
+            if (!(g_tx_active || g_tune)) render_rx_or_hero();
           }
-        } else if (c == '1') {
-          if (autoseq_rotate_same_parity()) {
-            g_pending_tx_valid = false;
-            redraw_tx_view();
-            // Re-evaluate TX after queue change
-            AutoseqTxEntry pending;
-            if (autoseq_fetch_pending_tx(pending)) {
-              arm_pending_tx(pending);
-            }
+          break;
+        }
+        int sel = ui_handle_rx_key(c);
+        if (sel >= 0 && core_cmd_tap_rx(sel)) {
+          // TX-state arming lives inside core_cmd_tap_rx for every UI path.
+          // Answering someone else's CQ means we're no longer running our
+          // own -- stop the auto-repeat.
+          g_cq_running = false;
+          rx_flash_idx = sel;
+          rx_flash_deadline = rtc_now_ms() + 500;
+          // Show the hero card NOW, synchronously, instead of just flashing
+          // the list and waiting for the next g_rx_dirty-driven render.
+          // core_cmd_tap_rx() just created an active autoseq context, so
+          // autoseq_active_count() is already >0 here -- render_rx_or_hero()
+          // will lock the hero card on immediately. This matters because
+          // check_slot_boundary() runs earlier in the main loop than this key
+          // dispatch; if the reply's TX happens to fire on parity within the
+          // next iteration or two (tapping right after a TX slot begins), a
+          // deferred render would stay stuck on the plain list for the whole
+          // transmission (redraws are held during TX) -- looking broken even
+          // though the radio is transmitting correctly. Rendering here, one
+          // full loop iteration ahead of the next check_slot_boundary() call,
+          // guarantees the hero card is already up before that can happen.
+          if (!(g_tx_active || g_tune)) {
+            render_rx_or_hero();
+            g_rx_dirty = false;
           }
-        } else if (c == 'e' || c == 'E') {
-          encode_and_log_pending_tx();
+        } else if (c == '+' || c == '=') {
+          // Live TX drive level, same as the STATUS screen's +/-.
+          ic705_tx_set_gain_q8(ic705_tx_get_gain_q8() + 8);
+          band_gain_save(g_band_sel, ic705_tx_get_gain_q8());
+          if (!(g_tx_active || g_tune)) render_rx_or_hero();
+        } else if (c == '-' || c == '_') {
+          ic705_tx_set_gain_q8(ic705_tx_get_gain_q8() - 8);
+          band_gain_save(g_band_sel, ic705_tx_get_gain_q8());
+          if (!(g_tx_active || g_tune)) render_rx_or_hero();
         }
         break;
       }
@@ -5392,19 +5079,26 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 }
                 draw_band_view();
               }
+            } else if (c == '`') {
+              // Band editing is only reachable via the Station category now
+              // -- backtick returns there (no standalone B hotkey anymore).
+              enter_mode(UIMode::MENU);
+              menu_category = kCatStation;
+              draw_menu_view();
             }
           }
           break;
         }
         case UIMode::STATUS: {
         if (status_edit_idx == -1) {
-          if (handle_kh1_diag_key(c)) { draw_status_view(); }
-          else if (c == '1') { g_status_beacon_temp = (BeaconMode)(((int)g_status_beacon_temp + 1) % 3); draw_status_view(); }
-          else if (c == '2') {
+          if (c == '1') {
             begin_usb_host_mode();
           }
-          else if (c == '3') {
-            advance_active_band(1);
+          else if (c == '2') {
+            // Active band list is stored low-to-high (e.g. 40/20/15/10);
+            // step with delta=-1 so pressing 2 goes high-to-low instead
+            // (Dean's operating preference: start on the high bands).
+            advance_active_band(-1);
             save_station_data();
             draw_status_view();
             debug_log_line("Band changed");
@@ -5413,59 +5107,72 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             //   - QMX initial-connect (consume_cdc_initial_sync reads
             //     current g_band_sel at sync time, so band edits made
             //     while QMX was still enumerating get picked up).
-            // Why deferred: KH1 band change engages a physical antenna
-            // relay, and we don't want to click it on every S->3 press.
+            // Why deferred: don't spam the radio with a CAT command on
+            // every S->2 press.
           }
-              else if (c == '4') {
+              else if (c == '3') {
                 // Audio-carrier tune (debugging the carrier pump into the dummy
-                // load). Held toggle: keys PTT + streams a continuous tone.
-                bool want_tune = !g_tune;
-                if (radio_control_ready()) {
+                // load). Brief automatic trigger, not a toggle: keys PTT +
+                // streams a short tone burst, then tune_tick() auto-stops it
+                // after kTuneAutoStopMs. Pressing again while already tuning
+                // is treated as an early manual stop (safety escape hatch).
+                if (g_tune) {
+                  radio_control_set_tune(false, 0, 0);
+                  g_tune = false;
+                  g_decode_enabled = true;
+                  debug_log_line("CAT tune: RX");
+                } else if (radio_control_ready()) {
                   int freq_hz = (int)(g_bands[g_band_sel].freq * 1000.0f);
                   int tune_hz = (g_offset_src == OffsetSrc::CURSOR) ? g_offset_hz : 1500;
-                  if (want_tune) g_decode_enabled = false;
-                  if (radio_control_set_tune(want_tune, freq_hz, tune_hz) == ESP_OK) {
-                    g_tune = want_tune;
-                    debug_log_line(g_tune ? "CAT tune: TX" : "CAT tune: RX");
+                  g_decode_enabled = false;
+                  if (radio_control_set_tune(true, freq_hz, tune_hz) == ESP_OK) {
+                    g_tune = true;
+                    g_tune_stop_at_ms = rtc_now_ms() + kTuneAutoStopMs;
+                    debug_log_line("CAT tune: TX");
                   } else {
+                    g_decode_enabled = true;
                     ESP_LOGW(TAG, "CAT tune command failed");
                     debug_log_line("CAT tune failed");
                   }
-                  if (!g_tune) g_decode_enabled = true;
                 } else {
                   ESP_LOGW(TAG, "CAT not ready; tune skipped");
                 }
                 draw_status_view();
               }
+              else if (c == '4') {
+                status_edit_idx = 3; status_edit_buffer = g_date; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == '-')) status_cursor_pos++; draw_status_view();
+              }
               else if (c == '5') {
-                status_edit_idx = 4; status_edit_buffer = g_date; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == '-')) status_cursor_pos++; draw_status_view();
+                status_edit_idx = 4; status_edit_buffer = g_time; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == ':')) status_cursor_pos++; draw_status_view();
               }
               else if (c == '6') {
-                status_edit_idx = 5; status_edit_buffer = g_time; status_cursor_pos = 0; while (status_cursor_pos < (int)status_edit_buffer.size() && (status_edit_buffer[status_cursor_pos] == ':')) status_cursor_pos++; draw_status_view();
-              }
-              else if (c == '7') {
                 // Gracefully disconnect the IC-705 so the radio releases its
                 // session immediately (protocol disconnect, type 0x05) instead
                 // of holding it until timeout — lets you flash/power-cycle the
-                // Cardputer without rebooting the radio. Press 2 to reconnect.
+                // Cardputer without rebooting the radio. Press 1 to reconnect.
                 if (canonical_radio_type(g_radio) == RadioType::IC705) {
-                  ESP_LOGI(TAG, "STATUS key 7: graceful IC-705 disconnect");
-                  debug_log_line("Disconnected 705 — press 2 to reconnect");
+                  ESP_LOGI(TAG, "STATUS key 6: graceful IC-705 disconnect");
+                  debug_log_line("Disconnected 705 — press 1 to reconnect");
                   g_ic705_manual_disconnect = true;  // keep auto-reconnect OFF
                   audio_source_stop();      // stop RX/TX audio tasks first
                   ic705_cat_disconnect();   // send 0x05 disconnect, then close
                   draw_status_view();
                 }
               }
+              else if (c == '+' || c == '=') {
+                // Live TX drive level, like TD705. Saved per-band so each
+                // band keeps its own clean-drive level across band changes.
+                ic705_tx_set_gain_q8(ic705_tx_get_gain_q8() + 8);
+                band_gain_save(g_band_sel, ic705_tx_get_gain_q8());
+                draw_status_view();
+              }
+              else if (c == '-' || c == '_') {
+                ic705_tx_set_gain_q8(ic705_tx_get_gain_q8() - 8);
+                band_gain_save(g_band_sel, ic705_tx_get_gain_q8());
+                draw_status_view();
+              }
             } else {
-              if (status_edit_idx == 1) {
-                if (c == '`') { status_edit_idx = -1; status_edit_buffer.clear(); draw_status_view(); }
-                if (c == ';') { g_offset_hz += 100; draw_status_view(); }
-                else if (c == '.') { g_offset_hz -= 100; draw_status_view(); }
-                else if (c == ',') { g_offset_hz -= 10; draw_status_view(); }
-                else if (c == '/') { g_offset_hz += 10; draw_status_view(); }
-                else if (c == '\n') { save_station_data(); status_edit_idx = -1; draw_status_view(); }
-              } else if (status_edit_idx == 4 || status_edit_idx == 5) {
+              if (status_edit_idx == 3 || status_edit_idx == 4) {
                 if (c == '`') { status_edit_idx = -1; status_edit_buffer.clear(); status_cursor_pos = -1; draw_status_view(); }
                 else if (c == ',') { // left
                   int pos = status_cursor_pos - 1;
@@ -5486,7 +5193,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   }
                   draw_status_view();
                 } else if (c == '\n') {
-                  if (status_edit_idx == 4) g_date = status_edit_buffer;
+                  if (status_edit_idx == 3) g_date = status_edit_buffer;
                   else g_time = normalize_time_hms(status_edit_buffer);
                   if (rtc_apply_manual_time_from_strings()) {
                     save_station_data();
@@ -5505,147 +5212,93 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             }
             break;
           }
-        case UIMode::DEBUG: {
-          if (c == ';') {
-            if (d_page > 0) { d_page--; ui_draw_list(g_d_lines, d_page, -1); }
-          } else if (c == '.') {
-            if ((d_page + 1) * 6 < (int)g_d_lines.size()) { d_page++; ui_draw_list(g_d_lines, d_page, -1); }
-          } else if (c >= '1' && c <= '6') {
-            int idx = d_page * 6 + (c - '1');
-            if (idx >= 0 && idx < (int)g_d_files.size()) {
-              std::string deleted = g_d_files[idx];
-              bool reload_list = true;
-              if (storage_reject_active_log_user_mutation(deleted)) {
-                debug_log_line(std::string("Active log protected: ") + deleted);
-                if (idx < (int)g_d_lines.size()) g_d_lines[idx] = std::string("LOCK ") + deleted;
-                reload_list = false;
-              } else if (storage_file_remove(deleted)) {
-                debug_log_line(std::string("Deleted: ") + deleted);
-              } else {
-                debug_log_line(std::string("Delete failed: ") + deleted);
-                if (idx < (int)g_d_lines.size()) g_d_lines[idx] = std::string("FAIL ") + deleted;
-                reload_list = false;
-              }
-              if (reload_list) {
-                delete_load_file_list();
-                int max_page = 0;
-                if (!g_d_lines.empty()) {
-                  max_page = ((int)g_d_lines.size() - 1) / 6;
-                }
-                if (d_page > max_page) d_page = max_page;
-              }
-              ui_draw_list(g_d_lines, d_page, -1);
-            }
-          }
-          break;
-        }
-        case UIMode::QSO: {
-          if (!g_q_show_entries) {
-            if (c == ';') {
-              if (q_page > 0) { q_page--; qso_draw_page(); }
-            } else if (c == '.') {
-              if ((q_page + 1) * 6 < (int)g_q_lines.size()) { q_page++; qso_draw_page(); }
-            } else if (c >= '1' && c <= '6') {
-              int idx = q_page * 6 + (c - '1');
-              if (idx >= 0 && idx < (int)g_q_files.size()) {
-                const std::string selected_file = g_q_files[idx];
-                if (selected_file != g_q_current_file) {
-                  g_q_page_view = QPageView::Default;
-                }
-                g_q_current_file = selected_file;
-                g_q_show_entries = true;
-                q_page = 0;
-                qso_load_entries(g_q_current_file);
-                qso_draw_page();
-              } else if (idx == g_q_clear_row_idx) {
-                // "Clear QSO log" row: its own number doubles as the confirm
-                // button. First press arms it (row re-labels itself "Press N
-                // again: confirm"); the SAME number again within kQClearArmMs
-                // clears the durable NVS log. Export first if you want a copy —
-                // this does not touch the SD card.
-                const int64_t now = rtc_now_ms();
-                if (g_q_clear_armed && now < g_q_clear_arm_deadline) {
-                  qso_log_clear_nvs();
-                  g_adif_sd_seq = 0;
-                  g_q_clear_armed = false;
-                  g_q_clear_feedback = "Log cleared";
-                  g_q_clear_feedback_deadline = now + 1500;
-                } else {
-                  g_q_clear_armed = true;
-                  g_q_clear_arm_deadline = now + kQClearArmMs;
-                }
-                qso_load_file_list();
-                qso_draw_page();
-              }
-            }
-          } else {
-            if (c == ',') {  // left: default view (time / band / call)
-              if (g_q_page_view != QPageView::Default) {
-                g_q_page_view = QPageView::Default;
-                qso_rebuild_entry_lines();
-                qso_draw_page();
-              }
-            } else if (c == '/') {  // right: alternate view (call / R-SNR / S-SNR)
-              if (g_q_page_view != QPageView::Alternate) {
-                g_q_page_view = QPageView::Alternate;
-                qso_rebuild_entry_lines();
-                qso_draw_page();
-              }
-            } else if (c == ';') {
-              if (q_page > 0) { q_page--; qso_load_entries(g_q_current_file); qso_draw_page(); }
-            } else if (c == '.') {
-              if (g_q_entries_have_next_page) { q_page++; qso_load_entries(g_q_current_file); qso_draw_page(); }
-            } else if (c == '`') {
-              // back to file list
-              g_q_show_entries = false;
-              q_page = 0;
-              qso_load_file_list();
-              qso_draw_page();
-            }
-          }
-          break;
-        }
-        case UIMode::MSC:
-          break;
         case UIMode::MENU: {
           if (ui_mode == UIMode::MENU) {
             if (menu_long_edit) {
               if (c == '\n' || c == '\r') {
                 if (menu_long_kind == LONG_FT) {
-                  g_free_text = menu_long_buf;
-                  if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
+                  // Only remaining caller of LONG_FT: the CQ text prompt
+                  // (F:/Send FreeText as standalone menu items are gone).
+                  // Confirming sends the (possibly edited) text as a CQ,
+                  // reusing the existing FREETEXT CQ-type machinery so
+                  // running-CQ repeats keep reusing this same text.
+                  g_cq_freetext = menu_long_buf;
+                  g_cq_type = CqType::CQFREETEXT;
                   update_autoseq_cq_type();
-                } else if (menu_long_kind == LONG_COMMENT) {
-                  g_comment1 = menu_long_buf;
+                  const int64_t now_ms = rtc_now_ms();
+                  const int slot_period = g_protocol->slot_time_ms;
+                  const int next_parity = (int)(((now_ms / slot_period) + 1) & 1);
+                  autoseq_start_cq(next_parity);
+                  // Calling CQ IS the beacon trigger now -- keep re-issuing
+                  // this same CQ every idle cycle until answered or stopped.
+                  g_cq_running = true;
+                  AutoseqTxEntry pending;
+                  if (autoseq_fetch_pending_tx(pending)) {
+                    arm_pending_tx(pending);
+                  }
+                  core_fire_qso_changed();
+                  menu_long_edit = false;
+                  menu_long_kind = LONG_NONE;
+                  menu_long_buf.clear();
+                  menu_long_backup.clear();
+                  menu_long_cursor_pos = -1;
+                  // enter_mode(RX) unconditionally draws the PLAIN list (it
+                  // calls ui_draw_rx() directly, not render_rx_or_hero()) --
+                  // it has no idea a CQ just went active. Left alone, the
+                  // screen shows the wrong view until some LATER g_rx_dirty
+                  // tick happens to land on a moment when TX isn't active and
+                  // redraw_holding has cleared, which could be several TX
+                  // cycles away. Mirror the tap-to-reply fix: render the hero
+                  // card synchronously, right now, one full loop iteration
+                  // ahead of the next check_slot_boundary() call -- guarantees
+                  // it's already showing before the armed CQ can ever fire.
+                  enter_mode(UIMode::RX);
+                  if (!(g_tx_active || g_tune)) {
+                    render_rx_or_hero();
+                    g_rx_dirty = false;
+                  }
                 } else if (menu_long_kind == LONG_ACTIVE) {
                   g_active_band_text = menu_long_buf;
                   rebuild_active_bands();
-                } else if (menu_long_kind == LONG_IGNORE) {
-                  g_ignore_prefix_text = clamp_ignore_prefix_text(menu_long_buf);
-                  rebuild_ignore_prefixes();
+                  save_station_data();
+                  menu_long_edit = false;
+                  menu_long_kind = LONG_NONE;
+                  menu_long_buf.clear();
+                  menu_long_backup.clear();
+                  menu_long_cursor_pos = -1;
+                  draw_menu_view();
                 }
-                save_station_data();
-                menu_long_edit = false;
-                menu_long_kind = LONG_NONE;
-                menu_long_buf.clear();
-                menu_long_backup.clear();
-                draw_menu_view();
               } else if (c == '`') {
+                bool was_ft = (menu_long_kind == LONG_FT);
                 menu_long_edit = false;
                 menu_long_kind = LONG_NONE;
                 menu_long_buf.clear();
                 menu_long_backup.clear();
-                draw_menu_view();
+                menu_long_cursor_pos = -1;
+                if (was_ft) {
+                  enter_mode(UIMode::RX);
+                } else {
+                  draw_menu_view();
+                }
               } else if (c == 0x08 || c == 0x7f) {
-                if (!menu_long_buf.empty()) menu_long_buf.pop_back();
+                if (menu_long_cursor_pos >= 0) {
+                  if (menu_long_cursor_pos > 0) {
+                    menu_long_buf.erase((size_t)(menu_long_cursor_pos - 1), 1);
+                    menu_long_cursor_pos--;
+                  }
+                } else if (!menu_long_buf.empty()) {
+                  menu_long_buf.pop_back();
+                }
                 draw_menu_view();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
-                if (menu_long_kind == LONG_FT || menu_long_kind == LONG_IGNORE) {
+                if (menu_long_kind == LONG_FT) {
                   ch = toupper((unsigned char)ch);
                 }
-                if (!(menu_long_kind == LONG_IGNORE &&
-                      menu_long_buf.size() >= kIgnorePrefixTextMaxLen)) {
+                if (menu_long_cursor_pos >= 0) {
+                  menu_long_buf.insert((size_t)menu_long_cursor_pos, 1, ch);
+                  menu_long_cursor_pos++;
+                } else {
                   menu_long_buf.push_back(ch);
                 }
                 draw_menu_view();
@@ -5654,9 +5307,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
             } else if (menu_edit_idx >= 0) {
               if (c == '\n' || c == '\r') {
                 bool should_save = true;
-                // Absolute indices across pages
-                if (menu_edit_idx == 3) { g_call = menu_edit_buf; autoseq_set_station(g_call, grid_ft8_4(g_grid)); }
-                else if (menu_edit_idx == 4) {
+                // Global indices: category*MENU_CAT_BASE + local row (0-based).
+                if (menu_edit_idx == kCatStation * MENU_CAT_BASE + 0) {
+                  g_call = menu_edit_buf; autoseq_set_station(g_call, grid_ft8_4(g_grid));
+                } else if (menu_edit_idx == kCatStation * MENU_CAT_BASE + 1) {
                   const std::string norm_grid = normalize_grid_maidenhead(menu_edit_buf);
                   if (!norm_grid.empty()) {
                     g_grid = norm_grid;
@@ -5667,16 +5321,9 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                     should_save = false;
                     debug_log_line("Grid format: AA00/AA00aa/AA00aa00");
                   }
-                }
-                else if (menu_edit_idx == 7) { g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now(); }
-                else if (menu_edit_idx == 10) { g_comment1 = menu_edit_buf; }
-                else if (menu_edit_idx == 15) {
-                  char* end = nullptr;
-                  long v = std::strtol(menu_edit_buf.c_str(), &end, 10);
-                  if (end != menu_edit_buf.c_str() && end && *end == '\0') {
-                    g_rtc_comp = clamp_rtc_comp_value((int)v);
-                  }
-                } else if (menu_edit_idx == 17) {
+                } else if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 1) {
+                  g_offset_hz = atoi(menu_edit_buf.c_str()); redraw_countdown_now();
+                } else if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 3) {
                   char* end = nullptr;
                   long v = std::strtol(menu_edit_buf.c_str(), &end, 10);
                   if (end != menu_edit_buf.c_str() && end && *end == '\0') {
@@ -5684,17 +5331,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                     g_autoseq_max_retry = (int)v;
                     autoseq_set_max_retry(g_autoseq_max_retry);
                   }
-                } else if (menu_edit_idx == 18) {
+                } else if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 0) {
                   g_ic705_wifi_ssid = menu_edit_buf;
-                } else if (menu_edit_idx == 19) {
+                } else if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 1) {
                   g_ic705_wifi_pass = menu_edit_buf;
-                } else if (menu_edit_idx == 20) {
+                } else if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 2) {
                   g_ic705_net_user = menu_edit_buf;
                   ic705_net_set_credentials(g_ic705_net_user.c_str(), g_ic705_net_pass.c_str());
-                } else if (menu_edit_idx == 21) {
+                } else if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 3) {
                   g_ic705_net_pass = menu_edit_buf;
                   ic705_net_set_credentials(g_ic705_net_user.c_str(), g_ic705_net_pass.c_str());
-                } else if (menu_edit_idx == 22) {
+                } else if (menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 4) {
                   // Accept decimal or "0xNN" hex
                   char* end = nullptr;
                   long v = std::strtol(menu_edit_buf.c_str(), &end, 0);
@@ -5711,19 +5358,20 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               } else if (c == 0x08 || c == 0x7f) {
                 if (!menu_edit_buf.empty()) menu_edit_buf.pop_back();
                 draw_menu_view();
-                if (menu_edit_idx == 7) {
+                if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 1) {
                   g_offset_hz = atoi(menu_edit_buf.c_str());
                   redraw_countdown_now();
                 }
               } else if (c == '`') {
-                if (menu_edit_idx == 7) {
+                if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 1) {
                   g_offset_hz = menu_cursor_edit_original;
                   redraw_countdown_now();
                 }
                 menu_edit_idx = -1;
                 menu_edit_buf.clear();
                 draw_menu_view();
-              } else if (menu_edit_idx == 7 && (c == ';' || c == '.' || c == ',' || c == '/')) {
+              } else if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 1 &&
+                         (c == ';' || c == '.' || c == ',' || c == '/')) {
                 // Arrow mode starts from the currently shown edit value.
                 int cursor_val = g_offset_hz;
                 if (!menu_edit_buf.empty()) {
@@ -5742,29 +5390,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 redraw_countdown_now();
               } else if (c >= 32 && c < 127) {
                 char ch = c;
-                if (menu_edit_idx == 15) {
-                  const bool is_sign = (ch == '+' || ch == '-');
-                  const bool is_digit = (ch >= '0' && ch <= '9');
-                  if (is_sign) {
-                    if (!menu_edit_buf.empty()) break;
-                  } else if (!is_digit) {
-                    break;
-                  }
-                  if (menu_edit_buf.size() >= 11) break;
-                } else if (menu_edit_idx == 17) {
+                if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 3) {
                   if (ch < '0' || ch > '9') break;
                   if (menu_edit_buf.size() >= 10) break;
                 }
-                // Force uppercase only where it's correct: callsign (3), grid (4),
-                // and the CI-V hex address (22). Credentials (WiFi SSID/pass, net
-                // user/pass = indices 18-21) are case-sensitive and must NOT be
-                // uppercased. (The old `idx % 6` test wrongly caught Net Pass=21.)
-                if (menu_edit_idx == 3 || menu_edit_idx == 4 || menu_edit_idx == 22) {
+                // Force uppercase only where it's correct: callsign, grid, and
+                // the CI-V hex address. Credentials (WiFi SSID/pass, net
+                // user/pass) are case-sensitive and must NOT be uppercased.
+                if (menu_edit_idx == kCatStation * MENU_CAT_BASE + 0 ||
+                    menu_edit_idx == kCatStation * MENU_CAT_BASE + 1 ||
+                    menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 4) {
                   ch = toupper((unsigned char)ch);
                 }
                 menu_edit_buf.push_back(ch);
                 draw_menu_view();
-                if (menu_edit_idx == 7) {
+                if (menu_edit_idx == kCatOperating * MENU_CAT_BASE + 1) {
                   g_offset_hz = atoi(menu_edit_buf.c_str());
                   redraw_countdown_now();
                 }
@@ -5772,57 +5412,123 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
               break;
             }
 
-        if (c == ';') {
-          if (menu_page > 0) { menu_page--; draw_menu_view(); }
-        } else if (c == '.') {
-          if (menu_page < 3) { menu_page++; draw_menu_view(); }
-        } else if (menu_page == 0) {
+        if (menu_category < 0) {
+          // Category picker.
+          if (c == '1') { menu_category = kCatStation; draw_menu_view(); }
+          else if (c == '2') { menu_category = kCatOperating; draw_menu_view(); }
+          else if (c == '3') { menu_category = kCatNetwork; draw_menu_view(); }
+          else if (c == '4') { menu_category = kCatLogging; draw_menu_view(); }
+          else if (c == '5') { menu_category = kCatSystem; draw_menu_view(); }
+        } else if (c == '`') {
+          // Back up to the picker from any category.
+          menu_category = -1;
+          draw_menu_view();
+        } else if (menu_category == kCatStation) {
               if (c == '1') {
-                g_cq_type = (CqType)(((int)g_cq_type + 1) % 6);
-                if (g_cq_type == CqType::CQFREETEXT) g_cq_freetext = g_free_text;
-                save_station_data();
-                update_autoseq_cq_type();
-                draw_menu_view();
-              } else if (c == '2') {
-                // Send Free Text via autoseq queue. FT is a one-shot entry
-                // that sorts to the FRONT of the active queue — guarantees
-                // the next TX is the FT, preempting any active QSO. The QSO
-                // ctx is preserved (FT is one-shot, popped after TX) and
-                // resumes on the slot after FT fires.
-                // Slot parity: inherits from queue[0] if non-empty (joins
-                // the current activation period); uses next-slot fallback
-                // if empty.
-                int64_t now_slot = rtc_now_ms() / g_protocol->slot_time_ms;
-                int fallback_parity = (int)((now_slot + 1) & 1);
-                if (autoseq_schedule_freetext(g_free_text, fallback_parity)) {
-                  // Re-fetch and update g_pending_tx so the FT replaces any
-                  // previously-scheduled QSO TX. Without this, a QSO TX
-                  // that was already armed by a prior decode cycle would
-                  // still fire instead of the FT.
-                  AutoseqTxEntry pending;
-                  if (autoseq_fetch_pending_tx(pending)) {
-                    arm_pending_tx(pending);
-                  }
-                  menu_flash_idx = 1; // absolute index of "Send FreeText"
-                  menu_flash_deadline = rtc_now_ms() + 500;
-                  draw_menu_view();
-                  debug_log_line(std::string("Queued: ") + g_free_text);
-                }
-              } else if (c == '3') {
-                menu_long_edit = true;
-                menu_long_kind = LONG_FT;
-                menu_long_buf = g_free_text;
-                menu_long_backup = g_free_text;
-                draw_menu_view();
-              } else if (c == '4') {
-                menu_edit_idx = 3; // Call (line index 3)
+                menu_edit_idx = kCatStation * MENU_CAT_BASE + 0; // Call
                 menu_edit_buf = g_call;
                 draw_menu_view();
-              } else if (c == '5') {
-                menu_edit_idx = 4; // Grid (line index 4)
+              } else if (c == '2') {
+                menu_edit_idx = kCatStation * MENU_CAT_BASE + 1; // Grid
                 menu_edit_buf = g_grid;
                 draw_menu_view();
-              } else if (c == '6') {
+              } else if (c == '3') {
+                menu_long_edit = true;
+                menu_long_kind = LONG_ACTIVE;
+                menu_long_buf = g_active_band_text;
+                menu_long_backup = g_active_band_text;
+                draw_menu_view();
+              } else if (c == '4') {
+                enter_mode(UIMode::BAND);
+              }
+            } else if (menu_category == kCatOperating) {
+                if (c == '1') {
+                  g_offset_src = (OffsetSrc)(((int)g_offset_src + 1) % 3);
+                  save_station_data();
+                  draw_menu_view();
+                } else if (c == '2') {
+                  menu_edit_idx = kCatOperating * MENU_CAT_BASE + 1; // Fixed
+                  menu_cursor_edit_original = g_offset_hz;
+                  menu_edit_buf = std::to_string(g_offset_hz);
+                  draw_menu_view();
+                } else if (c == '3') {
+                  g_skip_tx1 = !g_skip_tx1;
+                  autoseq_set_skip_tx1(g_skip_tx1);
+                  save_station_data();
+                  draw_menu_view();
+                } else if (c == '4') {
+                  menu_edit_idx = kCatOperating * MENU_CAT_BASE + 3; // Max Retry
+                  menu_edit_buf = std::to_string(g_autoseq_max_retry);
+                  draw_menu_view();
+                } else if (c == '5') {
+#if ENABLE_FT4
+                  // Toggle the pending protocol mode (FT8 <-> FT4).
+                  // g_protocol stays as-is for this boot session; the change
+                  // takes effect on next reboot.
+                  g_protocol_pending_ft4 = !g_protocol_pending_ft4;
+                  save_station_data();
+                  draw_menu_view();
+#endif
+                }
+            } else if (menu_category == kCatNetwork) {
+              if (c == '1') {
+                menu_edit_idx = kCatNetwork * MENU_CAT_BASE + 0; // WiFi SSID
+                menu_edit_buf = g_ic705_wifi_ssid;
+                draw_menu_view();
+              } else if (c == '2') {
+                menu_edit_idx = kCatNetwork * MENU_CAT_BASE + 1; // WiFi Pass
+                menu_edit_buf = g_ic705_wifi_pass;
+                draw_menu_view();
+              } else if (c == '3') {
+                menu_edit_idx = kCatNetwork * MENU_CAT_BASE + 2; // Net User
+                menu_edit_buf = g_ic705_net_user;
+                draw_menu_view();
+              } else if (c == '4') {
+                menu_edit_idx = kCatNetwork * MENU_CAT_BASE + 3; // Net Pass
+                menu_edit_buf = g_ic705_net_pass;
+                draw_menu_view();
+              } else if (c == '5') {
+                menu_edit_idx = kCatNetwork * MENU_CAT_BASE + 4; // CI-V Addr
+                char civ_str[8];
+                snprintf(civ_str, sizeof(civ_str), "0x%02X", (unsigned)g_ic705_civ_addr);
+                menu_edit_buf = civ_str;
+                draw_menu_view();
+              }
+            } else if (menu_category == kCatLogging) {
+              if (c == '1') {
+                // Export the accumulated NVS ADIF log to the SD card in one
+                // shot. Best done while idle — that's when SD writes work.
+                menu_copy_feedback_text = end_session_export_to_sd();
+                menu_flash_idx = kCatLogging * MENU_CAT_BASE + 0;
+                menu_flash_deadline = rtc_now_ms() + 500;
+                if (menu_copy_feedback_text.size() > 19) {
+                  menu_copy_feedback_text.resize(19);
+                }
+                menu_copy_feedback_deadline = rtc_now_ms() + kMenuCopyFeedbackMs;
+                debug_log_line(std::string("Export log: ") + menu_copy_feedback_text);
+                draw_menu_view();
+              } else if (c == '2') {
+                // "Clear QSO Log": its own number ('2') doubles as the confirm
+                // button. First press arms it; the same number again within
+                // kQClearArmMs clears the durable NVS log. Export first (above)
+                // if you want a copy — this does not touch the SD card.
+                const int64_t now2 = rtc_now_ms();
+                if (g_q_clear_armed && now2 < g_q_clear_arm_deadline) {
+                  qso_log_clear_nvs();
+                  g_adif_sd_seq = 0;
+                  g_q_clear_armed = false;
+                  g_q_clear_feedback = "Log cleared";
+                  g_q_clear_feedback_deadline = now2 + 1500;
+                } else {
+                  g_q_clear_armed = true;
+                  g_q_clear_arm_deadline = now2 + kQClearArmMs;
+                }
+                draw_menu_view();
+              } else if (c == '3') {
+                enter_mode(UIMode::PERF);
+              }
+            } else if (menu_category == kCatSystem) {
+              if (c == '2') {
                 ESP_LOGI(TAG, "Entering deep sleep (GPIO0 wake)");
                 // Save current accurate time for compensation after wake-up
                 if (rtc_valid) {
@@ -5838,138 +5544,17 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                 // Configure GPIO0 as wake-up source (active low)
                 esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
                 esp_deep_sleep_start();
-              }
-            } else if (menu_page == 1) {
-                if (c == '1') {
-                  g_offset_src = (OffsetSrc)(((int)g_offset_src + 1) % 3);
-                  save_station_data();
-                  draw_menu_view();
-                } else if (c == '2') {
-                  menu_edit_idx = 7; // Cursor line
-                  menu_cursor_edit_original = g_offset_hz;
-                  menu_edit_buf = std::to_string(g_offset_hz);
-                  draw_menu_view();
-                } else if (c == '3') {
-                  RadioType old_radio = canonical_radio_type(g_radio);
-                  audio_source_backend_t old_audio = get_radio_profile_binding(old_radio).audio_backend;
-                  bool was_streaming = audio_source_is_streaming();
-                  switch (canonical_radio_type(g_radio)) {
-                    case RadioType::IC705:
-                      g_radio = RadioType::KH1_MIC;
-                      break;
-                    case RadioType::KH1_MIC:
-                    default:
-                      g_radio = RadioType::IC705;
-                      break;
-                  }
-                  RadioType new_radio = canonical_radio_type(g_radio);
-                  audio_source_backend_t new_audio = get_radio_profile_binding(new_radio).audio_backend;
-                  if (was_streaming && old_audio != new_audio) {
-                    ESP_LOGI(TAG, "Stopping audio for radio change %s/%s -> %s/%s",
-                             radio_name(old_radio),
-                             audio_source_backend_name(old_audio),
-                             radio_name(new_radio),
-                             audio_source_backend_name(new_audio));
-                    debug_log_line(std::string("Audio stop ") + radio_name(old_radio));
-                    audio_source_stop();
-                  }
-                  apply_radio_profile_binding();
-                  save_station_data();
-                  draw_menu_view();
-                } else if (c == '4') {
-                  menu_long_edit = true;
-                  menu_long_kind = LONG_IGNORE;
-                  menu_long_buf = g_ignore_prefix_text;
-                  menu_long_backup = g_ignore_prefix_text;
-                  draw_menu_view();
-                } else if (c == '5') {
-                  menu_long_edit = true;
-                  menu_long_kind = LONG_COMMENT;
-                  menu_long_buf = g_comment1;
-                  menu_long_backup = g_comment1;
-                  draw_menu_view();
-                } else if (c == '6') {
-#if ENABLE_FT4
-                  // Toggle the pending protocol mode (FT8 <-> FT4).
-                  // g_protocol stays as-is for this boot session; the change
-                  // takes effect on next reboot.
-                  g_protocol_pending_ft4 = !g_protocol_pending_ft4;
-                  save_station_data();
-                  draw_menu_view();
-#endif
-                }
-            } else if (menu_page == 2) {
-              if (c == '1') {
-                g_rxtx_log = !g_rxtx_log;
-                save_station_data();
-                draw_menu_view();
-              } else if (c == '2') {
-                g_skip_tx1 = !g_skip_tx1;
-                autoseq_set_skip_tx1(g_skip_tx1);
-                save_station_data();
-                draw_menu_view();
               } else if (c == '3') {
-                menu_long_edit = true;
-                menu_long_kind = LONG_ACTIVE;
-                menu_long_buf = g_active_band_text;
-                menu_long_backup = g_active_band_text;
-                draw_menu_view();
+                enter_mode(UIMode::GPS);
               } else if (c == '4') {
-                gps_stop();
-                g_gnss_lora_enabled = !g_gnss_lora_enabled;
-                apply_debug_uart_pin_policy();
-                save_station_data();
-                apply_radio_profile_binding();
-                draw_menu_view();
-              } else if (c == '5') {
-                // Export the accumulated NVS ADIF log to the SD card (YYYYMMDD.adi)
-                // in one shot. Best done while idle — that's when SD writes work.
-                menu_copy_feedback_text = end_session_export_to_sd();
-                menu_flash_idx = 16; // abs index of page 2 line 5
-                menu_flash_deadline = rtc_now_ms() + 500;
-                if (menu_copy_feedback_text.size() > 19) {
-                  menu_copy_feedback_text.resize(19);
-                }
-                menu_copy_feedback_deadline = rtc_now_ms() + kMenuCopyFeedbackMs;
-                debug_log_line(std::string("Export log: ") + menu_copy_feedback_text);
-                draw_menu_view();
-              } else if (c == '6') {
-                menu_edit_idx = 17; // Max Retry line
-                menu_edit_buf = std::to_string(g_autoseq_max_retry);
-                draw_menu_view();
-              }
-            } else if (menu_page == 3) {
-              // Page 3: IC-705 WiFi/network settings (absolute indices 18-23)
-              if (c == '1') {
-                // Edit WiFi SSID
-                menu_edit_idx = 18;
-                menu_edit_buf = g_ic705_wifi_ssid;
-                draw_menu_view();
-              } else if (c == '2') {
-                // Edit WiFi Password
-                menu_edit_idx = 19;
-                menu_edit_buf = g_ic705_wifi_pass;
-                draw_menu_view();
-              } else if (c == '3') {
-                // Edit network-login user
-                menu_edit_idx = 20;
-                menu_edit_buf = g_ic705_net_user;
-                draw_menu_view();
-              } else if (c == '4') {
-                // Edit network-login password
-                menu_edit_idx = 21;
-                menu_edit_buf = g_ic705_net_pass;
-                draw_menu_view();
-              } else if (c == '5') {
-                // Edit CI-V address
-                menu_edit_idx = 22;
-                char civ_str[8];
-                snprintf(civ_str, sizeof(civ_str), "0x%02X", (unsigned)g_ic705_civ_addr);
-                menu_edit_buf = civ_str;
-                draw_menu_view();
-              } else if (c == '6') {
                 // Re-resolve IC-705 target IP
                 wifi_mgr_resolve_now();
+                draw_menu_view();
+              } else if (c == '5') {
+                // Cycle 1..10 (10%..100%), wrapping back to 1 after 10.
+                g_brightness_step = (g_brightness_step % 10) + 1;
+                apply_brightness();
+                save_station_data();
                 draw_menu_view();
               }
             }

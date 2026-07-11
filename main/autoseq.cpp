@@ -154,27 +154,6 @@ bool autoseq_drop_index(int idx) {
     return true;
 }
 
-bool autoseq_rotate_same_parity() {
-    if (s_active_count < 2) return false;
-
-    int parity = s_queue[0].slot_id & 1;
-
-    int last = -1;
-    for (int i = 1; i < s_active_count; ++i) {
-        if ((s_queue[i].slot_id & 1) == parity) last = i;
-        else break; // optional: only rotate within the front same-parity run
-    }
-    if (last == -1) return false;
-
-    QsoContext head = s_queue[0];
-    for (int i = 0; i < last; ++i) {
-        s_queue[i] = s_queue[i + 1];
-    }
-    s_queue[last] = head;
-    refresh_tx_msg_buffer();
-    return true;
-}
-
 // Shared helper for injecting one-shot CALLING entries (CQ and Free Text).
 // Both types are single-transmission: emit once, tick moves CALLING → IDLE → pop.
 // Returns the appended ctx, or nullptr if no room.
@@ -366,7 +345,7 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
             }
             break;
         }
-        case AutoseqState::CALLING:  // CQ only once (controlled by beacon)
+        case AutoseqState::CALLING:  // CQ only once (re-issuing it again, if wanted, is the caller's job)
             // CQ with no response — safe to evict (dxcall is "CQ")
             ctx->state = AutoseqState::IDLE;
             ctx->next_tx = TxMsgType::TX_NONE;
@@ -398,17 +377,20 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
              s_active_count > 0 ? s_queue[0].retry_limit : 0);
 }
 
-// Pure reads of the singleton s_tx_msg_buffer. No inspection of next_tx.
-// The invariant "queue empty ⇔ buffer empty" is maintained by
-// refresh_tx_msg_buffer() being called at the end of every public API
-// that may change queue[0]'s identity or text source.
-bool autoseq_get_next_tx(std::string& out_text) {
-    out_text = s_tx_msg_buffer;
-    return !out_text.empty();
-}
-
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
-    if (s_tx_msg_buffer.empty()) return false;
+    if (s_tx_msg_buffer.empty()) {
+        // An active context with nothing pending is abnormal -- every state
+        // that isn't IDLE should have text queued via refresh_tx_msg_buffer().
+        // Flag it so a real-world stall (retry armed but never actually
+        // re-fires) leaves a trace, instead of just silently going quiet.
+        if (s_active_count > 0) {
+            ESP_LOGW(TAG, "Fetch TX: empty buffer with active ctx! dxcall=%s state=%d "
+                     "next_tx=%d retry=%d/%d",
+                     s_queue[0].dxcall.c_str(), (int)s_queue[0].state,
+                     (int)s_queue[0].next_tx, s_queue[0].retry_counter, s_queue[0].retry_limit);
+        }
+        return false;
+    }
     // Queue must be non-empty for the buffer to be non-empty (invariant).
     QsoContext* ctx = &s_queue[0];
     out.text = s_tx_msg_buffer;
@@ -453,25 +435,6 @@ void autoseq_on_tx_starting() {
     }
 }
 
-void autoseq_get_qso_states(std::vector<std::string>& out) {
-    out.clear();
-    static const char* state_names[] = {
-        "CALL", "RPLY", "RPRT", "RRPT", "RGRS", "SOFF", "", "ZZZ"
-    };
-
-    for (int i = 0; i < s_active_count; ++i) {
-        const QsoContext* ctx = &s_queue[i];
-        if (ctx->state == AutoseqState::IDLE) continue;
-
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%-8.8s %.4s %d/%d",
-                 ctx->dxcall.c_str(),
-                 state_names[(int)ctx->state],
-                 ctx->retry_counter, ctx->retry_limit);
-        out.push_back(buf);
-    }
-}
-
 bool autoseq_has_active_qso() {
     for (int i = 0; i < s_active_count; ++i) {
         if (s_queue[i].state != AutoseqState::IDLE &&
@@ -480,10 +443,6 @@ bool autoseq_has_active_qso() {
         }
     }
     return false;
-}
-
-int autoseq_queue_size() {
-    return s_active_count;
 }
 
 void autoseq_get_active_contexts(std::vector<QsoContext>& out) {

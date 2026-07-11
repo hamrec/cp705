@@ -151,7 +151,7 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
     (void)slot_start_ms;
 
     while (!cfg->should_stop(cfg->ctx)) {
-        // Fully idle the RX pipeline while decode is disabled (TX/tune/MSC). This
+        // Fully idle the RX pipeline while decode is disabled (TX/tune). This
         // skips not just the final decode but the per-block FFT/waterfall work
         // too, freeing core 1 for the TX writer task — FT8 is half-duplex and the
         // radio sends no RX audio while we transmit anyway.
