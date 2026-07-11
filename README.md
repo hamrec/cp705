@@ -270,9 +270,8 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 
 ## Known Issues
 
-These are the reasons this build is still tagged **beta** rather than a clean
-3.0 — both are real, both have been chased hard, and neither has a confirmed
-root cause yet:
+Two open issues, both real and both chased hard without a confirmed root
+cause yet:
 
 - **Cold-boot Tune sometimes fires no real RF.** If the radio and CP705 are
   both freshly rebooted on the same band and you press `3` to Tune, CP705's
