@@ -346,7 +346,7 @@ hotkeys — they're actions inside the `M` menu (see the table below) and
 |  | `3` | Edit active bands (Long Edit) — the ordered list cycled by STATUS `2`. |
 |  | `4` | Edit Band Freqs — a paged list of all 12 band slots; `1..6` picks a slot to edit in place, `▲`/`▼` pages, `` ` `` returns to this category. |
 |  | (display) | Current UTC time + source (`G`=GPS, `R`=DS3231 RTC, blank=other). |
-| `M` → **Operating** | `1` | Select offset source: Random / RX / Fixed. Random values are within 500-2500 Hz. |
+| `M` → **Operating** | `1` | Select offset source: Random / RX / Fixed. Random values are within 1500-2000 Hz. |
 |  | `2` | Edit fixed cursor offset (in place). Enter directly or use `▲` `▼` `◀` `▶`. |
 |  | `3` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report directly — useful for contest/pileup speed; leave off for normal grid-exchange QSOs. |
 |  | `4` | Edit max retry (in place). Accepts any natural number or `0`. |

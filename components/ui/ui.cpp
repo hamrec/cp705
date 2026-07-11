@@ -292,6 +292,11 @@ int ui_get_rx_count() {
 void ui_force_redraw_rx() {
     last_drawn_count = 0;
     last_page = -1;
+    // "The RX screen needs a full repaint" implies something drew over it
+    // (mode entry, a full clear). The hero card shares that screen, so drop
+    // its diff cache too -- otherwise a return to an active QSO from the menu
+    // would leave the card only partially painted.
+    ui_hero_invalidate();
 }
 
 static void draw_rx_line(int y, const RxDecodeEntry& l, int line_no, bool selected, bool cyan_index_marker) {
@@ -376,13 +381,23 @@ void ui_draw_rx(int flash_index) {
 }
 
 // --- QSO hero card -----------------------------------------------------
-// Full-screen QSO/CQ progress view, replaces the waterfall + decode list
-// while autoseq has an active context. Always a full repaint (QSO state
-// changes every ~15s at most, so there's no need for the RX list's
-// diff/cache machinery) — fillScreen on every call, not just the
-// transition in, since whatever mode was on screen before (menu, RX list,
-// waterfall) doesn't share this layout and can leave stale pixels in the
-// gaps between the hero card's row bands otherwise.
+// QSO/CQ progress view, replaces the waterfall + decode list while autoseq
+// has an active context. DIFF-AWARE: each of the card's five row bands is
+// repainted only when its own inputs changed since the last call, so a
+// routine redraw touches a few hundred bytes of SPI instead of blasting the
+// full ~65KB screen. That matters for the radio link, not just speed: a
+// full-screen SPI/DMA burst contends with the WiFi DMA on the S3 (see the
+// note in main.cpp's update_countdown()), and unlike TX-time draws these
+// hero redraws land during the RX window where the burst can perturb the
+// incoming audio stream and the timing of our outgoing keepalives. A full
+// repaint still happens on the first draw and after ui_hero_invalidate()
+// (called whenever something else -- menu, status, a full clear -- has
+// painted over the card), which also covers the between-band gaps (y19-32,
+// y60-73, y100-102) that the per-row fillRects don't touch.
+static QsoHeroInfo s_hero_prev;
+static bool s_hero_prev_valid = false;
+
+void ui_hero_invalidate() { s_hero_prev_valid = false; }
 
 static void hero_draw_stage_box(int x, int y, int w, int h, const char* label, int box_state) {
     // box_state: 0 = pending (dim outline), 1 = current (navy fill, white
@@ -412,96 +427,129 @@ static void hero_draw_stage_box(int x, int y, int w, int h, const char* label, i
 
 void ui_draw_qso_hero(const QsoHeroInfo& info) {
     DispGuard guard;
+    const bool full = !s_hero_prev_valid;
+    const QsoHeroInfo& p = s_hero_prev;
+
+    // Which row bands changed? On a full repaint everything is "changed".
+    const bool row0_ch = full ||
+        info.qso_done != p.qso_done || info.qso_gave_up != p.qso_gave_up ||
+        info.calling_cq != p.calling_cq || info.cq_text != p.cq_text ||
+        info.clock_hm != p.clock_hm;
+    const bool row1_ch = full ||
+        info.dxcall != p.dxcall || info.dxgrid != p.dxgrid;
+    const bool row2_ch = full || info.stage != p.stage;
+    const bool row3_ch = full ||
+        info.freq_band != p.freq_band || info.snr != p.snr;
+    const bool row4_ch = full ||
+        info.qso_done != p.qso_done || info.qso_gave_up != p.qso_gave_up ||
+        info.qso_count != p.qso_count;
+
+    if (!(row0_ch || row1_ch || row2_ch || row3_ch || row4_ch)) return;
+
     M5.Display.startWrite();
-    M5.Display.fillScreen(TFT_BLACK);
+    // Full repaint: clear the whole screen once so the between-band gaps
+    // (y19-32, y60-73, y100-102) that no per-row fillRect covers start black.
+    // Incremental repaints skip this -- each changed row clears its own band.
+    if (full) M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setTextWrap(false);
 
     // Row 0: status label + clock, y 0-19
-    M5.Display.fillRect(0, 0, SCREEN_W, 19, TFT_BLACK);
-    M5.Display.setTextSize(1);
-    M5.Display.setCursor(4, 3);
-    if (info.qso_done) {
-        M5.Display.setTextColor(rgb565(0, 220, 0), TFT_BLACK);
-        M5.Display.print("QSO COMPLETE");
-    } else if (info.qso_gave_up) {
-        M5.Display.setTextColor(rgb565(230, 160, 0), TFT_BLACK);
-        M5.Display.print("NO REPLY");
-    } else if (info.calling_cq) {
-        // Show the actual outgoing CQ text (incl. any POTA/SOTA/QRP prefix)
-        // instead of a generic label, so it's visible at a glance that the
-        // right message is armed -- falls back to the label if unavailable.
-        M5.Display.setTextColor(rgb565(120, 170, 255), TFT_BLACK);
-        M5.Display.print(info.cq_text.empty() ? "CALLING CQ" : info.cq_text.c_str());
-    } else {
-        M5.Display.setTextColor(rgb565(120, 170, 255), TFT_BLACK);
-        M5.Display.print("WORKING");
+    if (row0_ch) {
+        M5.Display.fillRect(0, 0, SCREEN_W, 19, TFT_BLACK);
+        M5.Display.setTextSize(1);
+        M5.Display.setCursor(4, 3);
+        if (info.qso_done) {
+            M5.Display.setTextColor(rgb565(0, 220, 0), TFT_BLACK);
+            M5.Display.print("QSO COMPLETE");
+        } else if (info.qso_gave_up) {
+            M5.Display.setTextColor(rgb565(230, 160, 0), TFT_BLACK);
+            M5.Display.print("NO REPLY");
+        } else if (info.calling_cq) {
+            // Show the actual outgoing CQ text (incl. any POTA/SOTA/QRP prefix)
+            // instead of a generic label, so it's visible at a glance that the
+            // right message is armed -- falls back to the label if unavailable.
+            M5.Display.setTextColor(rgb565(120, 170, 255), TFT_BLACK);
+            M5.Display.print(info.cq_text.empty() ? "CALLING CQ" : info.cq_text.c_str());
+        } else {
+            M5.Display.setTextColor(rgb565(120, 170, 255), TFT_BLACK);
+            M5.Display.print("WORKING");
+        }
+        if (!info.clock_hm.empty()) {
+            int tw = (int)info.clock_hm.size() * 6;
+            M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
+            M5.Display.setCursor(SCREEN_W - tw - 4, 3);
+            M5.Display.print(info.clock_hm.c_str());
+        }
     }
-    if (!info.clock_hm.empty()) {
-        int tw = (int)info.clock_hm.size() * 6;
-        M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
-        M5.Display.setCursor(SCREEN_W - tw - 4, 3);
-        M5.Display.print(info.clock_hm.c_str());
-    }
+
     // Row 1: callsign + grid, y 32-60. Cursor at y=35 centers the size-3
     // glyph (24px tall) on y=47 -- the midpoint between the countdown bar's
     // bottom edge (UI_START_Y=21) and the tracker's top edge (box_y=73).
-    M5.Display.fillRect(0, 32, SCREEN_W, 28, TFT_BLACK);
-    M5.Display.setTextSize(3);
-    M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5.Display.setCursor(4, 35);
-    M5.Display.print(info.dxcall.empty() ? "--" : info.dxcall.c_str());
-    if (!info.dxgrid.empty()) {
-        M5.Display.setTextSize(2);
-        M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
-        int gx = SCREEN_W - (int)info.dxgrid.size() * 12 - 4;
-        M5.Display.setCursor(gx, 39);
-        M5.Display.print(info.dxgrid.c_str());
+    if (row1_ch) {
+        M5.Display.fillRect(0, 32, SCREEN_W, 28, TFT_BLACK);
+        M5.Display.setTextSize(3);
+        M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5.Display.setCursor(4, 35);
+        M5.Display.print(info.dxcall.empty() ? "--" : info.dxcall.c_str());
+        if (!info.dxgrid.empty()) {
+            M5.Display.setTextSize(2);
+            M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
+            int gx = SCREEN_W - (int)info.dxgrid.size() * 12 - 4;
+            M5.Display.setCursor(gx, 39);
+            M5.Display.print(info.dxgrid.c_str());
+        }
+        M5.Display.setTextSize(1);
     }
-    M5.Display.setTextSize(1);
 
     // Row 2: six-stage tracker, y 73-100. Shifted +22px down from the
     // original y=51 (as a block with rows 3/4 below, spacing between the
     // three unchanged) so the footer's bottom gap matches row 0's top gap.
-    static const char* kStageLabels[6] = { "CQ", "GR", "RP", "R", "RR73", "73" };
-    const int box_y = 73, box_h = 28, gap = 4;
-    const int box_w = (SCREEN_W - gap * 5) / 6;
-    for (int i = 0; i < 6; ++i) {
-        int box_state = (i < info.stage) ? 2 : (i == info.stage ? 1 : 0);
-        hero_draw_stage_box(i * (box_w + gap), box_y, box_w, box_h, kStageLabels[i], box_state);
+    if (row2_ch) {
+        static const char* kStageLabels[6] = { "CQ", "GR", "RP", "R", "RR73", "73" };
+        const int box_y = 73, box_h = 28, gap = 4;
+        const int box_w = (SCREEN_W - gap * 5) / 6;
+        for (int i = 0; i < 6; ++i) {
+            int box_state = (i < info.stage) ? 2 : (i == info.stage ? 1 : 0);
+            hero_draw_stage_box(i * (box_w + gap), box_y, box_w, box_h, kStageLabels[i], box_state);
+        }
     }
 
     // Row 3: freq/band + SNR/DT, y 102-121 (TX line row removed -- redundant
     // with the CQ text now shown up in row 0 / the tracker's own state).
-    M5.Display.fillRect(0, 102, SCREEN_W, 19, TFT_BLACK);
-    M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
-    M5.Display.setCursor(4, 105);
-    M5.Display.print(info.freq_band.c_str());
-    if (info.snr > -99) {
-        char buf[24];
-        snprintf(buf, sizeof(buf), "SNR %+d", info.snr);
-        int tw = (int)strlen(buf) * 6;
-        M5.Display.setCursor(SCREEN_W - tw - 4, 105);
-        M5.Display.print(buf);
+    if (row3_ch) {
+        M5.Display.fillRect(0, 102, SCREEN_W, 19, TFT_BLACK);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
+        M5.Display.setCursor(4, 105);
+        M5.Display.print(info.freq_band.c_str());
+        if (info.snr > -99) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "SNR %+d", info.snr);
+            int tw = (int)strlen(buf) * 6;
+            M5.Display.setCursor(SCREEN_W - tw - 4, 105);
+            M5.Display.print(buf);
+        }
     }
 
     // Row 4: footer legend, y 121-135. Text at y=124 puts its bottom edge
     // (~132, 8px glyph) 3px above the screen bottom (135), matching row 0's
     // 3px top gap (its text sits at y=3).
-    M5.Display.fillRect(0, 121, SCREEN_W, SCREEN_H - 121, TFT_BLACK);
-    if (info.qso_done) {
-        M5.Display.setTextColor(rgb565(0, 220, 0), TFT_BLACK);
-        M5.Display.setCursor(4, 124);
-        M5.Display.print("Logged - ESC to dismiss");
-    } else if (info.qso_gave_up) {
-        M5.Display.setTextColor(rgb565(230, 160, 0), TFT_BLACK);
-        M5.Display.setCursor(4, 124);
-        M5.Display.print("Clearing...");
-    } else {
-        M5.Display.setTextColor(rgb565(0, 255, 255), TFT_BLACK);
-        M5.Display.setCursor(4, 124);
-        M5.Display.print("ESC to Stop");
-    }
-    {
+    if (row4_ch) {
+        M5.Display.fillRect(0, 121, SCREEN_W, SCREEN_H - 121, TFT_BLACK);
+        M5.Display.setTextSize(1);
+        if (info.qso_done) {
+            M5.Display.setTextColor(rgb565(0, 220, 0), TFT_BLACK);
+            M5.Display.setCursor(4, 124);
+            M5.Display.print("Logged - ESC to dismiss");
+        } else if (info.qso_gave_up) {
+            M5.Display.setTextColor(rgb565(230, 160, 0), TFT_BLACK);
+            M5.Display.setCursor(4, 124);
+            M5.Display.print("Clearing...");
+        } else {
+            M5.Display.setTextColor(rgb565(0, 255, 255), TFT_BLACK);
+            M5.Display.setCursor(4, 124);
+            M5.Display.print("ESC to Stop");
+        }
         char qbuf[24];
         snprintf(qbuf, sizeof(qbuf), "QSOs: %d", info.qso_count);
         int tw = (int)strlen(qbuf) * 6;
@@ -512,6 +560,9 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
 
     M5.Display.setTextWrap(true);
     M5.Display.endWrite();
+
+    s_hero_prev = info;
+    s_hero_prev_valid = true;
 }
 
 // --- Boot splash ---------------------------------------------------------

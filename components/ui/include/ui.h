@@ -105,10 +105,21 @@ void ui_set_paused(bool paused);
 bool ui_is_paused();
 void ui_draw_rx(int flash_index = -1);
 void ui_force_redraw_rx();
-// Full-screen QSO progress card, replaces the decode list while a QSO/CQ is
-// active. Fully blanks the screen on every call (covers the waterfall/menu/
-// RX list, whatever was on screen before, so must repaint cleanly).
+// QSO progress card, replaces the decode list while a QSO/CQ is active.
+// Diff-aware: only the regions whose content actually changed since the last
+// call are repainted, so a routine redraw (e.g. just the clock digit) is a
+// few hundred bytes of SPI instead of a full ~65KB screen blast. A full-screen
+// blast contends with the WiFi DMA on the S3 (documented in main.cpp) and,
+// during the RX window, can perturb the radio link / keepalive timing -- so
+// keeping each redraw small directly protects the connection. Call
+// ui_hero_invalidate() to force the next call to do a full repaint (needed
+// whenever something else -- menu, status, a full clear -- has painted over
+// the card since it was last shown).
 void ui_draw_qso_hero(const QsoHeroInfo& info);
+// Force the next ui_draw_qso_hero() call to fully repaint the card (drops the
+// diff cache). Call when transitioning into the hero view or after anything
+// else has drawn over the screen.
+void ui_hero_invalidate();
 // Returns selected absolute index or -1 if none
 int ui_handle_rx_key(char c);
 // Generic list draw (6 lines per page)

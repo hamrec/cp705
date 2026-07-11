@@ -478,7 +478,7 @@ static std::vector<std::string> g_host_help_lines = {
     "INFO/HELP/EXIT",
 };
 
-static const char* kAppVersion = "3.0-beta3";
+static const char* kAppVersion = "3.0-beta4";
 
 // Runtime latch: when true, we're still showing the startup screen. Either
 // a keypress or the 5 s auto-dismiss timer (g_startup_start_ms) takes us
@@ -1188,6 +1188,11 @@ static void render_rx_or_hero() {
       // the next tick or two via their existing dirty-tracked redraws.
       M5.Display.fillScreen(TFT_BLACK);
       ui_force_redraw_rx();
+    } else {
+      // Entering the hero view: the decode list / waterfall were on screen,
+      // so force the first hero draw to be a full repaint (its diff cache is
+      // stale relative to what's actually on the glass).
+      ui_hero_invalidate();
     }
     s_hero_was_active = hero_now;
   }
@@ -2008,8 +2013,9 @@ static int resolve_tx_offset(const AutoseqTxEntry& e) {
       e.text.rfind("CQ ", 0) != 0) {
     return e.offset_hz;
   }
-  // RANDOM, or RX mode + CQ: roll a fresh offset in [500, 2500] Hz.
-  return 500 + (int)(esp_random() % 2001);
+  // RANDOM, or RX mode + CQ: roll a fresh offset in [1500, 2000] Hz -- kept
+  // tight (Dean) rather than spanning the full audio passband.
+  return 1500 + (int)(esp_random() % 501);
 }
 
 // Single point of truth for arming the next TX. Replaces the 4-line
@@ -2081,21 +2087,51 @@ static void check_slot_boundary() {
   // TX trigger: check if we should start TX in this slot
   // Conditions: qso_xmit flag set, correct parity, early enough in slot, not already TXing,
   // and decode must be complete (TX is always triggered by decode results).
-  // Additional guard (g_decode_applied_slot_idx): enforces that decode for the
-  // previous RX slot (slot_idx - 1) has been fully applied to autoseq state before
-  // we fire TX. Without this, a slot boundary that arrives before audio capture
-  // has completed (FT8: ~12.6s of 15s slot; FT4: ~5.0s of 7.5s slot) could fire
-  // TX based on a prior cycle's state. See AUTOSEQ_INACTIVE_QUEUE.md.
+  // Additional guard (g_decode_applied_slot_idx): enforces that a recent-enough
+  // decode has been fully applied to autoseq state before we fire TX, so we
+  // never act on a stale prior cycle's state.
+  //
+  // Bound is slot_idx - 2, NOT slot_idx - 1. This board's audio pipeline only
+  // decodes every OTHER slot (the synchronous ~2.7-2.8s LDPC pass overruns the
+  // slot boundary, so it re-anchors to the NEXT one and the slot in between is
+  // dead air -- see ft8_audio_pipeline.cpp). That means g_decode_applied_slot_idx
+  // only ever advances by 2 at a time, so for HALF of all slot parities it is
+  // structurally impossible for it to ever reach slot_idx - 1 -- requiring that
+  // bound didn't just add a safety margin, it permanently blocked TX on
+  // whichever parity happened to line up with the actively-decoded slot instead
+  // of the skipped one, forcing a full extra 30s cycle (or more) every time a
+  // reply's target parity landed there. slot_idx - 2 is the freshest bound that
+  // can actually be satisfied given the every-other-slot cadence, for both
+  // parities, while still rejecting a genuinely stalled/hung decode.
+  // See AUTOSEQ_INACTIVE_QUEUE.md.
   // Window = 4/15 of slot_time_ms (~26.7%): FT8=4000ms, FT4=2000ms.
   const bool parity_ok = (g_target_slot_parity == slot_parity);
   const bool window_ok = (slot_ms < (g_protocol->slot_time_ms * 4 / 15));
-  const bool decode_ok = (g_decode_applied_slot_idx >= slot_idx - 1);
+  const bool decode_ok = (g_decode_applied_slot_idx >= slot_idx - 2);
+
+  // A CQ transmits a fixed, self-originated message -- it depends on NOTHING we
+  // decoded, so it must NOT sit behind the decode-completion guards the way a
+  // QSO reply does. This board decodes only one parity (it decodes a slot,
+  // overruns ~2.7s into the next, re-anchors forward, and keeps landing on the
+  // same parity), so g_decode_in_progress is true for the first ~2.7s of every
+  // decoded-parity slot. The running CQ is re-armed from inside
+  // decode_monitor_results, so its target parity ((now/slot)+1) lands on
+  // exactly that decoded parity -- meaning the CQ could only ever squeeze
+  // through the ~1.3s gap between the decode finishing and the ~4s TX window
+  // closing. On a busy-enough band the decode runs long, the CQ misses that
+  // gap, and it waits a full extra same-parity cycle (+30s) -- the "sat through
+  // a whole green+red and fired on the next green" bug. Gate the CQ on window +
+  // parity only; a reply still honors both decode guards (it genuinely must
+  // decode the other station before it can answer).
+  const bool is_cq_tx = (g_pending_tx.text.rfind("CQ ", 0) == 0) ||
+                        (g_pending_tx.text == "CQ");
+  const bool decode_gate_ok = is_cq_tx || (!g_decode_in_progress && decode_ok);
+
   if (g_qso_xmit &&
       parity_ok &&
       window_ok &&
       !g_tx_active &&
-      !g_decode_in_progress &&
-      decode_ok) {
+      decode_gate_ok) {
 
     ESP_LOGI(TAG, "TX trigger: starting TX in slot %lld (parity %d)",
              (long long)slot_idx, slot_parity);
@@ -2123,10 +2159,10 @@ static void check_slot_boundary() {
     static int64_t s_last_xmit_stall_log_ms = 0;
     if (now_ms - s_last_xmit_stall_log_ms >= 1000) {
       s_last_xmit_stall_log_ms = now_ms;
-      ESP_LOGW(TAG, "TX armed but not firing: parity_ok=%d(target=%d,slot=%d) "
+      ESP_LOGW(TAG, "TX armed but not firing: is_cq=%d parity_ok=%d(target=%d,slot=%d) "
                "window_ok=%d(slot_ms=%d) tx_active=%d decode_in_progress=%d "
                "decode_ok=%d(applied=%lld,slot_idx=%lld)",
-               (int)parity_ok, g_target_slot_parity, slot_parity,
+               (int)is_cq_tx, (int)parity_ok, g_target_slot_parity, slot_parity,
                (int)window_ok, slot_ms, (int)g_tx_active, (int)g_decode_in_progress,
                (int)decode_ok, (long long)g_decode_applied_slot_idx, (long long)slot_idx);
     }
@@ -2739,7 +2775,15 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   // ---- Auto sync soft RTC from decode timing (this cycle's samples only --
   // s_dec[] holds decodes from many cycles back now, so it can't be used
   // directly here without syncing against stale timing) ----
-  if (this_cycle_n > 3) {
+  //
+  // NEVER shift the clock while transmitting. tx_start() latches the TX tone
+  // schedule off rtc_now_ms() at the top of the slot; a CQ can now fire (see
+  // check_slot_boundary's is_cq_tx path) while the previous slot's decode is
+  // still overrunning, so this soft-sync can complete DURING our TX. A ±320ms
+  // shift under the running tone schedule would jump us ~2 FT8 symbols and
+  // corrupt the transmission. Skipping one sync opportunity is harmless -- the
+  // next RX cycle re-syncs.
+  if (this_cycle_n > 3 && !g_tx_active) {
     // Simple insertion sort to find median of time_s values
     float sorted_t[DEC_MAX];
     int nt = this_cycle_n;
@@ -4595,23 +4639,33 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // how we learn whether it was a panic/exception, a watchdog, a brownout
   // (WiFi-TX current spike), etc. — plus the heap we have to work with.
   {
+    const esp_reset_reason_t rr_code = esp_reset_reason();
     const char* rr = "?";
-    switch (esp_reset_reason()) {
-      case ESP_RST_POWERON:   rr = "POWERON";   break;
-      case ESP_RST_SW:        rr = "SW";        break;
-      case ESP_RST_PANIC:     rr = "PANIC";     break;
-      case ESP_RST_INT_WDT:   rr = "INT_WDT";   break;
-      case ESP_RST_TASK_WDT:  rr = "TASK_WDT";  break;
-      case ESP_RST_WDT:       rr = "WDT";       break;
-      case ESP_RST_BROWNOUT:  rr = "BROWNOUT";  break;
-      case ESP_RST_DEEPSLEEP: rr = "DEEPSLEEP"; break;
-      case ESP_RST_EXT:       rr = "EXT";       break;
-      default:                rr = "OTHER";     break;
+    switch (rr_code) {
+      case ESP_RST_POWERON:    rr = "POWERON";    break;
+      case ESP_RST_SW:         rr = "SW";         break;
+      case ESP_RST_PANIC:      rr = "PANIC";      break;
+      case ESP_RST_INT_WDT:    rr = "INT_WDT";    break;
+      case ESP_RST_TASK_WDT:   rr = "TASK_WDT";   break;
+      case ESP_RST_WDT:        rr = "WDT";        break;
+      case ESP_RST_BROWNOUT:   rr = "BROWNOUT";   break;
+      case ESP_RST_DEEPSLEEP:  rr = "DEEPSLEEP";  break;
+      case ESP_RST_EXT:        rr = "EXT";        break;
+      // Previously all lumped into "OTHER", which hid the actual cause of the
+      // dozens of mystery reboots in the log. Name the ones that matter here:
+      case ESP_RST_USB:        rr = "USB";        break;  // USB peripheral reset (host re-enumerate)
+      case ESP_RST_JTAG:       rr = "JTAG";       break;
+      case ESP_RST_CPU_LOCKUP: rr = "CPU_LOCKUP"; break;  // interrupt-disabled hang -> lockup reset
+      case ESP_RST_PWR_GLITCH: rr = "PWR_GLITCH"; break;  // supply glitch (TX current spike, bad cable)
+      case ESP_RST_UNKNOWN:    rr = "UNKNOWN";    break;
+      default:                 rr = "OTHER";      break;
     }
+    // Keep the raw enum value too, so anything still landing on OTHER is
+    // identifiable without a firmware change.
     char buf[200];
     snprintf(buf, sizeof(buf),
-             "BOOT reset=%s heap8=%u heapInt=%u heapDMA=%u dmaLargest=%u PSRAM=%u\n",
-             rr,
+             "BOOT reset=%s(%d) heap8=%u heapInt=%u heapDMA=%u dmaLargest=%u PSRAM=%u\n",
+             rr, (int)rr_code,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
@@ -5188,7 +5242,21 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
                   menu_long_buf.clear();
                   menu_long_backup.clear();
                   menu_long_cursor_pos = -1;
+                  // enter_mode(RX) unconditionally draws the PLAIN list (it
+                  // calls ui_draw_rx() directly, not render_rx_or_hero()) --
+                  // it has no idea a CQ just went active. Left alone, the
+                  // screen shows the wrong view until some LATER g_rx_dirty
+                  // tick happens to land on a moment when TX isn't active and
+                  // redraw_holding has cleared, which could be several TX
+                  // cycles away. Mirror the tap-to-reply fix: render the hero
+                  // card synchronously, right now, one full loop iteration
+                  // ahead of the next check_slot_boundary() call -- guarantees
+                  // it's already showing before the armed CQ can ever fire.
                   enter_mode(UIMode::RX);
+                  if (!(g_tx_active || g_tune)) {
+                    render_rx_or_hero();
+                    g_rx_dirty = false;
+                  }
                 } else if (menu_long_kind == LONG_ACTIVE) {
                   g_active_band_text = menu_long_buf;
                   rebuild_active_bands();

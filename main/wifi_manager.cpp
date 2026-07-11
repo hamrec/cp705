@@ -11,8 +11,11 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 // (mdns.h removed — mDNS no longer used; see wifi_mgr_start)
 #include "lwip/ip4_addr.h"
+
+#include "storage_service.h"
 
 static const char* TAG = "WIFI_MGR";
 
@@ -66,6 +69,27 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         esp_wifi_connect();
 
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        // Durable, timestamped record of every link-layer drop with its 802.11
+        // reason code, straight to the SD card. This is the single most useful
+        // fact for the "WiFi drops mid-QSO" investigation: the reason code tells
+        // us WHY the AP/link went away, and the uptime lets us line the event up
+        // against what the operator was doing (a QSO redraw, a TX, or nothing).
+        //   reason 4  = ASSOC_EXPIRE / 8 = ASSOC_LEAVE  -> radio/AP kicked us
+        //   reason 200 = BEACON_TIMEOUT / 201 = NO_AP_FOUND -> we lost the AP
+        //   reason 2  = AUTH_EXPIRE / 15 = 4WAY_TIMEOUT  -> auth/key issue
+        // A drop here means WiFi itself dropped; if the operator sees "lost the
+        // radio" with NO line added here, it was the UDP session, not the link.
+        {
+            uint8_t reason = 0;
+            if (event_data) reason = ((wifi_event_sta_disconnected_t*)event_data)->reason;
+            int64_t up_ms = esp_timer_get_time() / 1000;
+            char buf[128];
+            snprintf(buf, sizeof(buf),
+                     "WIFI DISCONNECT up=%lld.%03llds reason=%u retry=%d/%d\n",
+                     (long long)(up_ms / 1000), (long long)(up_ms % 1000),
+                     (unsigned)reason, s_retry_count, MAX_RETRIES);
+            storage_sd_log_append("IC705DBG.txt", buf);
+        }
         if (s_state == WIFI_MGR_IDLE) return;  // intentional stop
         if (s_retry_count < MAX_RETRIES) {
             s_retry_count++;
