@@ -12,9 +12,6 @@
 
 #include <string>
 
-// Beacon (automatic CQ) mode.
-enum class BeaconMode { OFF = 0, EVEN, ODD };
-
 // CQ prefix variants.
 enum class CqType { CQ, CQSOTA, CQPOTA, CQQRP, CQFD, CQFREETEXT };
 

@@ -751,7 +751,7 @@ esp_err_t ic705_net_send_audio_pcm(const uint8_t* pcm, size_t len) {
     // on s_audio is fine.
     s_last_audio_tx_us = esp_timer_get_time();
     esp_err_t r = audio_send_pcm_now(pcm, (uint16_t)len);
-    if (r == ESP_OK) s_audio_tx_ok++; else s_audio_tx_fail++;
+    if (r == ESP_OK) s_audio_tx_ok = s_audio_tx_ok + 1; else s_audio_tx_fail = s_audio_tx_fail + 1;
     return r;
 }
 
@@ -1087,14 +1087,14 @@ static void handle_audio_rx(const uint8_t* r, int n) {
     if (is_pkt7(r, n)) {
         uint16_t seq = (uint16_t)r[6] | ((uint16_t)r[7] << 8);
         if (r[16] == 0x00) send_pkt7_reply(&s_audio, r + 17, seq);
-        s_audio_rx_other++;
+        s_audio_rx_other = s_audio_rx_other + 1;
         return;
     }
     if (n >= 16 && memcmp(r, "\x10\x00\x00\x00\x01\x00", 6) == 0) {
         uint16_t seq = (uint16_t)r[6] | ((uint16_t)r[7] << 8);
         send_pkt0_idle_at_seq(&s_audio, seq);
-        s_audio_rx_other++;
-        s_audio_rexmit++;
+        s_audio_rx_other = s_audio_rx_other + 1;
+        s_audio_rexmit = s_audio_rexmit + 1;
         return;
     }
     // Real audio data: per wfview, type(offset 0x04, u16 LE) != 1 and
@@ -1107,7 +1107,7 @@ static void handle_audio_rx(const uint8_t* r, int n) {
         if (type != 0x01 && s_audio_in_q) {
             int pcm_len = n - 24;
             if (pcm_len > AUDIO_RX_PCM_MAX) pcm_len = AUDIO_RX_PCM_MAX;
-            s_audio_rx_pkts++;
+            s_audio_rx_pkts = s_audio_rx_pkts + 1;
             s_audio_rx_bytes += (uint32_t)(pcm_len > 0 ? pcm_len : 0);
             if (pcm_len > 0) {  // accumulate the radio sample-clock measurement
                 int64_t now = esp_timer_get_time();
@@ -1132,7 +1132,7 @@ static void handle_audio_rx(const uint8_t* r, int n) {
                 buf[0] = (uint8_t)(pcm_len & 0xFF);
                 buf[1] = (uint8_t)((pcm_len >> 8) & 0xFF);
                 memcpy(buf + 2, r + 24, pcm_len);
-                if (xQueueSend(s_audio_in_q, buf, 0) != pdTRUE) s_audio_rx_drops++;  // queue full
+                if (xQueueSend(s_audio_in_q, buf, 0) != pdTRUE) s_audio_rx_drops = s_audio_rx_drops + 1;  // queue full
             }
         }
     }

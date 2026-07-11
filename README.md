@@ -91,19 +91,36 @@ full radio-side configuration.
   address, bands, and the ADIF QSO log all persist in NVS across reboots (no
   dependence on the SD card or an internal FATFS partition).
 - **Categorized settings menu** — `M` opens a category picker (Station,
-  Operating, IC-705/Network, Logging) instead of a flat run of numbered pages;
-  `N`/`O` still jump straight to Operating/IC-705 Network as shortcuts.
+  Operating, IC-705/Network, Logging, System) instead of a flat run of
+  numbered pages. Band frequency editing, GPS telemetry, the performance
+  monitor, and display brightness all live inside this menu too (Station,
+  System, and Logging) — there's no separate top-level hotkey for any of them.
+- **Display brightness** (System category → `5`) — 10 steps from dim to full,
+  persisted across reboots.
 - **On-device network login editor** — WiFi SSID/password and IC-705 network
   user/password are editable under **IC-705/Network**.
 - **Editable CQ prompt** — pressing `C` opens the CQ message pre-filled with
   `CQ <call> <grid>`, cursor placed right after `CQ ` so a prefix (e.g. `POTA`)
-  can be typed immediately; confirming sends it, and repeats (manual or
-  beacon) keep reusing that same text until you press `C` again for a fresh
+  can be typed immediately; confirming sends it and automatically re-calls the
+  same CQ every idle cycle (no separate Beacon toggle — calling CQ *is* the
+  beacon) until you answer someone, press ESC, or start a fresh `C` for a new
   default.
+- **Persistent, recency-sorted decode list** — decoded lines no longer blank
+  out every 15s cycle. Anything addressed to you stays pinned at the top no
+  matter how old it is; everything else is sorted newest-heard-first, and a
+  station repeating (or advancing to its next message) refreshes its existing
+  line in place instead of spawning a duplicate.
+- **Auto-contrast waterfall** — each frame is auto-scaled and gamma-corrected
+  against its own noise floor, then rendered on a black→dark-blue→light-blue
+  ramp so quiet band segments stay genuinely black and only real signals light
+  up, closer to the IC-705's own spectrum scope.
 - **Icom-styled hero card** — the moment a CQ or QSO is active, the decode list
   is replaced by a full-screen card: callsign/grid, a 6-stage exchange
-  tracker, the current TX line, and frequency/SNR. `` ` `` bails out of the
-  QSO at will and returns to the decode list.
+  tracker, the current TX line, and frequency/SNR. A completed QSO turns the
+  card fully green ("QSO COMPLETE — Logged") and an exchange that runs out of
+  retries with no reply shows an amber "NO REPLY" instead — both auto-return
+  to CQ or the decode list after a few seconds, and `` ` `` bails out of the
+  QSO at will at any time.
 - **End+Export Log SD** (Logging category → `1`) — writes the accumulated NVS
   ADIF log to the card as a verified, uniquely-named `.adi` file for import
   into logging software (see **Logging and Download** below).
@@ -113,6 +130,10 @@ full radio-side configuration.
   removed to keep the build focused on the wireless IC-705 use case, and
   several settings inherited from Mini-FT8 (ignore list, QSO comment template,
   RX/TX text log, PORTA GPS wiring) were dropped as dead weight on this board.
+- **Fewer top-level keys** — the manual TX-queue view is gone (autoseq manages
+  the queue on its own; the hero card and ESC cover everything you actually
+  need to see or drop), and the Mass Storage toggle is gone too (it needed a
+  FATFS partition this board doesn't have, so it was always inert here).
 
 > CP705 is an experimental, boundary-pushing build. Huge thanks again to the
 > Mini-FT8 authors — this project exists only because of the foundation they
@@ -178,7 +199,7 @@ transmit audio over three UDP ports.
 ## Step 2 — Configure CP705
 
 All connection settings live in the **IC-705/Network** settings category:
-press **`O`** to jump there directly (or `M` for the category picker, then `3`).
+press **`M`** for the category picker, then **`3`**.
 
 | Key | Setting | Notes |
 |---|---|---|
@@ -216,8 +237,8 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 5. Logging is automatic: each completed QSO is appended to the ADIF log in **NVS**
    (survives power-off) and best-effort to the SD card. To get an importable
    `.adi`, export to the card from the **Logging** category, item `1`
-   (see **Logging and Download**). The QSO view (**`Q`**) shows the session
-   log status.
+   (see **Logging and Download**). The Logging category's Clear-Log row also
+   shows a running QSO count (`Clear QSO Log: N`).
 
 ## Quick reference
 
@@ -238,14 +259,38 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 - **WiFi connects but no decodes / no CAT:** check `Network Control` is ON, the
   `Network User1` is an **Administrator**, and the three UDP ports are at their
   defaults (50001/50002/50003). Re-resolve from the **IC-705/Network** category,
-  item `6`, or reconnect with `S → 2`.
+  item `6`, or reconnect with `S → 1`.
 - **Login rejected:** the CP705 network user/password must match `Network User1`
   on the radio. Only one client can use the radio's remote server at a time, so
   make sure wfview/RS-BA1/SDR-Control isn't already connected.
 - **Transmits but no RF / no modulation:** set `MOD Input → DATA MOD = WLAN` and
   operate in a **data mode (USB-D)**.
 - **No decodes despite strong signals:** time isn't UTC-locked — connect a GPS or
-  DS3231 and confirm the time source shows `G` (GPS) or `R` (RTC) on `S → 6`.
+  DS3231 and confirm the time source shows `G` (GPS) or `R` (RTC) on `S → 5`.
+
+## Known Issues
+
+These are the reasons this build is still tagged **beta** rather than a clean
+3.0 — both are real, both have been chased hard, and neither has a confirmed
+root cause yet:
+
+- **Cold-boot Tune sometimes fires no real RF.** If the radio and CP705 are
+  both freshly rebooted on the same band and you press `3` to Tune, CP705's
+  display shows the tune running but the radio's SWR reads infinity — no
+  actual carrier goes out. Switching bands and back (or tuning on a different
+  band first) reliably clears it. A theory involving the WLAN audio session
+  not being fully ready yet was tested twice (fail fast, then wait up to
+  1.5s) and disproved — waiting longer doesn't help, so that fix was reverted
+  rather than shipping dead code. Root cause unknown.
+- **A QSO's TX can occasionally stall out with no further activity.** Once,
+  after a retry counter exhausted, the expected give-up transmission never
+  fired and the context just sat there — no crash, no further log lines, no
+  RF. A separate QSO with the same retry-exhaustion path resolved cleanly
+  minutes later, so the underlying retry/give-up logic is not universally
+  broken — this looks like a genuine, intermittent edge case. Diagnostic
+  logging is now in place (an empty-TX-buffer warning and a throttled dump of
+  every TX-trigger guard condition) to capture the exact state next time it
+  happens, but no fix exists yet.
 
 ---
 
@@ -260,26 +305,21 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 | `R` | RX | Idle: numbered list of decoded/CQ traffic. Active: full-screen QSO hero card. |
 | `C` | Call CQ | Opens an editable CQ prompt (from RX); confirming sends it. |
 | `` ` `` | Bail | From the hero card, drops the in-progress QSO and returns to the decode list. |
-| `T` | TX Queue | View and manage the transmit queue. |
-| `S` | STATUS | Access beacon, connect/sync, band step, tune, and date/time functions. |
-| `G` | GPS | View GPS telemetry and synchronization status. |
-| `M` | MENU | Opens the settings category picker: Station, Operating, IC-705/Network, Logging. |
-| `N` | MENU (Operating) | Shortcut straight into the Operating category. |
-| `O` | MENU (IC-705/Network) | Shortcut straight into the IC-705/Network category. |
-| `Q` | QSO | View the session QSO count / logging status (full log is in NVS). |
-| `D` | Mass Storage | Toggle internal FATFS ownership between CP705 and the PC (needs a FATFS partition; inert on this board). |
-| `B` | BAND | Edit per-band frequencies. |
-| `P` | Performance | View A Simple Performance Monitor. (added in V2.0.4)|
+| `S` | STATUS | Access connect/sync, band step, tune, gain, and date/time functions. |
+| `M` | MENU | Opens the settings category picker: Station, Operating, IC-705/Network, Logging, System. |
+
+BAND editing, GPS telemetry, and the performance monitor don't have standalone
+hotkeys — they're actions inside the `M` menu (see the table below) and
+`` ` `` returns you to the category you launched them from.
 
 ## Global Keys and Navigation
 
-- `R` / `T` / `B` / `S` / `G` / `Q` / `D`: switch to the selected mode. Press the same mode key again to return to `RX`.
+- `R` / `S`: switch to the selected mode. Press the same mode key again to return to `RX`.
 - `M`: open the settings category picker; press again from the picker to return to `RX`, or from inside a category to go back up to the picker.
-- `N` / `O`: jump straight into the Operating / IC-705/Network category; press again to return to `RX`.
 - `C`: from `RX`, opens the editable CQ prompt.
-- `` ` ``: in `RX`, bails out of the active QSO/CQ (hero card); in a settings category, goes back to the picker; cancels TX globally in `TX` and `STATUS` when not editing; cancels an in-progress text edit elsewhere.
-- `▲` / `▼`: page up / page down in `RX`, `TX`, `BAND`, and `QSO`. Settings categories each fit on one screen, so there's no in-category paging.
-- `◀` / `▶`: move left / right in `QSO-SNR` and `STATUS` date/time.
+- `` ` ``: in `RX`, bails out of the active QSO/CQ (hero card); in a settings category, goes back to the picker; in BAND/GPS/PERF (all reached via `M`), returns to the category that launched it; cancels TX globally in `RX`/`STATUS` when not editing; cancels an in-progress text edit elsewhere.
+- `▲` / `▼`: page up / page down in `RX` and `BAND`. Settings categories each fit on one screen, so there's no in-category paging.
+- `◀` / `▶`: move left / right in `STATUS` date/time.
 - `1`..`6`: always select the currently visible row in the active mode.
 
 ## Per-Mode Controls
@@ -289,43 +329,41 @@ network login once. You can also pre-load `Station.txt` from the SD card.
 
 | Mode | Item | Notes |
 |---|---|---|
-| `R` (RX, idle) | `1..6` | Select a decoded line to reply to. CQ messages are sorted from strongest to weakest. |
+| `R` (RX, idle) | `1..6` | Select a decoded line to reply to. The list persists across cycles instead of resetting every 15s: messages addressed to you are pinned at the top regardless of age, everything else is newest-heard-first, and a station repeating (or advancing to its next message) refreshes its existing line in place rather than adding a duplicate. |
 |  | `C` | Open the CQ prompt, pre-filled `CQ <call> <grid>`, cursor right after `CQ `. Enter sends it, `` ` `` cancels with no TX. |
 |  | `▲` `▼` | Page up/down is available when line 1 or line 6 is cyan. |
-| `R` (RX, hero card) |  | Shows the worked station's callsign/grid, a 6-stage exchange tracker (CQ/GRID/RPT/R/RR73/73), the current TX line, and frequency/SNR. Appears automatically the moment a CQ or QSO is active. |
-|  | `` ` `` | Bail out of the QSO and return to the decode list. |
-| `T` (TX Queue) | `1` | Rotate the queue to the next same-parity entry. |
-|  | `2..6` | Drop the queue item on the current page. |
-|  | `` ` `` | Cancel TX immediately. |
-| `G` (GPS) |  | View live GPS telemetry: 3D fix, satellites, UTC time, grid square, and last synchronization age (LoRa-1262 cap GNSS is the only source). |
-| `S` (STATUS) | `1` | Cycle Beacon mode. Applies when leaving STATUS mode. |
-|  | `2` | Run connect/sync now; starts audio and follows the CAT sync path. |
-|  | `3` | Step to the next active band. Applies after key 2 is pressed or when leaving STATUS. |
-|  | `4` | Toggle Tune. |
-|  | `5` | Edit Date (in place). On the Time line, `G` means GPS time and `R` means DS3231 RTC time. |
-|  | `6` | Edit Time (in place). |
+| `R` (RX, hero card) |  | Shows the worked station's callsign/grid, a 6-stage exchange tracker (CQ/GRID/RPT/R/RR73/73), the current TX line, frequency/SNR, and a running QSO count bottom-right. Appears automatically the moment a CQ or QSO is active. On a genuine sign-off, it goes fully green ("QSO COMPLETE — Logged") for a few seconds before auto-continuing; if an exchange stalls out and retries run out with no reply ever heard, it shows an amber "NO REPLY" instead (tracker frozen at whatever stage it actually reached) on the same auto-continue timing — either way you're never stuck waiting on ESC. |
+|  | `` ` `` | Bail out of the QSO and return to the decode list immediately, any time. |
+| `S` (STATUS) | `1` | Run connect/sync now; starts audio and follows the CAT sync path. Press again after `6` to reconnect. |
+|  | `2` | Step to the next active band, high-to-low. Applies after key 1 is pressed or when leaving STATUS. |
+|  | `3` | Brief automatic tune burst (~5s), not a toggle — keys PTT and streams a test tone, then auto-stops. Press again mid-burst to stop early. |
+|  | `4` | Edit Date (in place). On the Time line, `G` means GPS time and `R` means DS3231 RTC time. |
+|  | `5` | Edit Time (in place). |
+|  | `6` | Gracefully disconnect the IC-705 (releases the radio's session immediately instead of waiting out a timeout — lets you flash/power-cycle the Cardputer without rebooting the radio). Press `1` to reconnect. |
+|  | `+` / `-` | Adjust live TX drive level (gain), saved per-band. Also works from the hero card in RX mode, not just here. |
 | `M` → **Station** | `1` | Edit Call (in place). |
 |  | `2` | Edit Grid (in place). Supports 4/6/8-character grid. If GPS is available, the GPS grid is shown and used, but not saved. |
-|  | (display) | Sleep/Batt %, and current UTC time + source (`G`=GPS, `R`=DS3231 RTC, blank=other). |
-|  | `5` | Enter deep sleep now. |
+|  | `3` | Edit active bands (Long Edit) — the ordered list cycled by STATUS `2`. |
+|  | `4` | Edit Band Freqs — a paged list of all 12 band slots; `1..6` picks a slot to edit in place, `▲`/`▼` pages, `` ` `` returns to this category. |
+|  | (display) | Current UTC time + source (`G`=GPS, `R`=DS3231 RTC, blank=other). |
 | `M` → **Operating** | `1` | Select offset source: Random / RX / Fixed. Random values are within 500-2500 Hz. |
 |  | `2` | Edit fixed cursor offset (in place). Enter directly or use `▲` `▼` `◀` `▶`. |
 |  | `3` | Turn SkipTX1 on/off. Skips `dxcall mycall mygrid` and replies with the SNR report directly — useful for contest/pileup speed; leave off for normal grid-exchange QSOs. |
 |  | `4` | Edit max retry (in place). Accepts any natural number or `0`. |
-|  | `5` | Edit active bands (Long Edit). Used by STATUS -> Band. |
-|  | `6` | Select FT8 / FT4 protocol. Reboot to apply the change. |
+|  | `5` | Select FT8 / FT4 protocol. Reboot to apply the change. |
 | `M` → **IC-705/Network** | `1` | Edit WiFi SSID (in place). |
 |  | `2` | Edit WiFi Password (in place, masked). |
 |  | `3` | Edit Net User (in place). |
 |  | `4` | Edit Net Password (in place, masked). |
 |  | `5` | Edit CI-V Address (in place). Accepts decimal or `0xNN` hex. |
-|  | `6` | Re-resolve / reconnect. Re-points CP705 at the radio's IP even if WiFi is already up (STATUS `2` skips this when already connected) — the row shows live WiFi status. |
 | `M` → **Logging** | `1` | Export Log to SD. Writes the NVS ADIF log to a unique file, then reads it back and byte-verifies it. Feedback: `Verified N QSOs` / `SD write failed` / `Verify FAILED` / `No log yet`. |
-|  | `2` | Clear QSO Log: press once to arm (`Press 2 again: confirm`), press `2` again within 3 s to wipe the NVS log and reset the QSO count. Any other key or letting it lapse cancels with no change. Export first if you want a copy — this never touches the SD card. |
-| `Q` (QSO) |  | Shows session QSO count and logging status. The full ADIF log lives in NVS / on the SD card (export via MENU → Logging → `1`); the internal-flash file browser is unavailable on this board. |
-| `B` (BAND) | `1..6` | Choose a band slot to edit. |
-| `D` (Mass Storage) |  | Stop radio audio and expose FATFS to the PC, then eject and press `D` to return to RX. Requires a FATFS partition — inert on this board (config/logs live in NVS instead). |
-| `P` (PERFORMANCE) | | A Simple Performance Monitor. (added in V2.0.4) |
+|  | `2` | Clear QSO Log: press once to arm (`Press 2 again: confirm`), press `2` again within 3 s to wipe the NVS log and reset the QSO count. Any other key or letting it lapse cancels with no change. Export first if you want a copy — this never touches the SD card. The row shows the running count (`Clear QSO Log: N`) when not armed. |
+|  | `3` | Performance Monitor — CPU/heap diagnostics. `` ` `` returns to this category. |
+| `M` → **System** | (display) | Sleep/Batt %. |
+|  | `2` | Enter deep sleep now. |
+|  | `3` | GPS Status — live telemetry: 3D fix, satellites, UTC time, grid square, and last synchronization age (LoRa-1262 cap GNSS is the only source). `` ` `` returns to this category. |
+|  | `4` | Re-resolve / reconnect. Re-points CP705 at the radio's IP even if WiFi is already up (STATUS `2` skips this when already connected) — the row shows live WiFi status. |
+|  | `5` | Display brightness: cycles 1-10 (10%-100%), wraps back to 1 after 10. Persists across reboots. |
 
 ## Logging and Download
 
@@ -341,7 +379,7 @@ network login once. You can also pre-load `Station.txt` from the SD card.
   2. Press `M` for the settings menu, then `4` for **Logging**, then `1`
      (**End+Export Log SD**). This is a **one-way, end-of-session action**: it
      stops RX/TX, releases the IC-705 connection, and drops WiFi before
-     writing the card (press `2` to reconnect afterward, or reboot). The full
+     writing the card (press `S → 1` to reconnect afterward, or reboot). The full
      NVS log is written to a unique `MMDDHHMM.adi` file, then read back and
      byte-verified.
   3. On `Verified N QSOs`, pull the card and import the `.adi` into your logging
@@ -380,8 +418,8 @@ The physical G4/G5 debug UART path is disabled and the pins are left as
 floating inputs to avoid conflicts with the cap. USB Serial/JTAG host commands
 still work.
 
-The GPS view (`G`) shows the active source, 3D fix, satellites, UTC time, grid
-square, and last synchronization age.
+The GPS view (`M` → System → `3`) shows the active source, 3D fix, satellites,
+UTC time, grid square, and last synchronization age.
 
 ## DS3231 RTC Connections
 

@@ -36,7 +36,6 @@ const char* core_api_version();   // "major.minor.patch"
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
-enum class CoreBeaconMode : uint8_t { OFF = 0, EVEN = 1, ODD = 2 };
 enum class CoreCqType     : uint8_t { CQ = 0, SOTA, POTA, QRP, FD, FREETEXT };
 enum class CoreOffsetSrc  : uint8_t { RX = 0, CURSOR = 1, RANDOM = 2 };
 enum class CoreRadioType  : uint8_t { QMX = 0, QDX = 2 };
@@ -95,10 +94,9 @@ struct StationConfig {
   std::vector<uint32_t> bands_hz;   // band frequencies in Hz
   int                   band_idx;
 
-  // CQ / beacon
+  // CQ
   CoreCqType       cq_type;
   std::string      cq_freetext;
-  CoreBeaconMode   beacon;
 
   // Offset
   CoreOffsetSrc    offset_src;
@@ -195,10 +193,9 @@ bool core_cmd_set_radio(CoreRadioType r);
 bool core_cmd_set_call(const std::string& call);
 bool core_cmd_set_grid(const std::string& grid);
 
-// CQ / beacon
+// CQ
 bool core_cmd_set_cq_type(CoreCqType t);
 bool core_cmd_set_cq_freetext(const std::string& text);
-bool core_cmd_set_beacon(CoreBeaconMode m);
 
 // Offset
 bool core_cmd_set_offset_src(CoreOffsetSrc s);

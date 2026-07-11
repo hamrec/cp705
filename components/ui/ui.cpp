@@ -67,52 +67,6 @@ void ui_set_rx_waterfall_muted(bool muted) { s_rx_waterfall_muted = muted; }
 bool ui_waterfall_dirty() { return waterfall_dirty; }
 void ui_draw_waterfall_if_dirty() { if (waterfall_dirty) ui_draw_waterfall(); }
 
-// Draw TX view: line 1 = next, lines 2-6 from queue/page
-// slot_colors: optional per-line slot parity (0 even, 1 odd) for coloring text
-void ui_draw_tx(const std::string& next, const std::vector<std::string>& queue, int page, int selected, const std::vector<bool>& mark_delete, const std::vector<int>& slot_colors) {
-    const int line_h = 19; // 16 text + 3 gap
-    const int start_y = UI_START_Y;
-
-    DispGuard guard;
-    M5.Display.startWrite();
-    M5.Display.setTextSize(2);
-    // Line 1: next (always)
-    M5.Display.fillRect(0, start_y, SCREEN_W, line_h, TFT_BLACK);
-    uint16_t next_color = TFT_WHITE;
-    if (slot_colors.size() >= 1) {
-        next_color = (slot_colors[0] & 1) ? TFT_RED : TFT_GREEN;
-    }
-    M5.Display.setTextColor(next_color, TFT_BLACK);
-    M5.Display.setCursor(0, start_y);
-    M5.Display.printf("1 %s", next.c_str());
-    g_visible_rows[0] = std::string("1 ") + next;
-
-    // Lines 2-6: queue items based on page
-    int start_idx = page * 5; // show up to 5 items after next
-    for (int i = 0; i < 5; ++i) {
-        int idx = start_idx + i;
-        int y = start_y + (i + 1) * line_h;
-        M5.Display.fillRect(0, y, SCREEN_W, line_h, TFT_BLACK);
-        if (idx < (int)queue.size()) {
-            bool del = (idx < (int)mark_delete.size() && mark_delete[idx]);
-            bool sel = (idx == selected);
-            uint16_t bg = sel ? rgb565(30, 30, 60) : (del ? rgb565(60, 30, 30) : TFT_BLACK);
-            M5.Display.fillRect(0, y, SCREEN_W, line_h, bg);
-            uint16_t fg = TFT_WHITE;
-            if (slot_colors.size() > (size_t)(idx + 1)) {
-                fg = (slot_colors[idx + 1] & 1) ? TFT_RED : TFT_GREEN;
-            }
-            M5.Display.setTextColor(fg, bg);
-            M5.Display.setCursor(0, y);
-            M5.Display.printf("%d %s", i + 2, queue[idx].c_str());
-            g_visible_rows[i + 1] = std::to_string(i + 2) + " " + queue[idx];
-        } else {
-            g_visible_rows[i + 1].clear();
-        }
-    }
-    M5.Display.endWrite();
-}
-
 void ui_init(bool display_only) {
     g_disp_mutex = xSemaphoreCreateMutex();
 
@@ -199,15 +153,62 @@ void ui_draw_waterfall() {
     // when storing; without the swap SPI sends the byte-reversed value and
     // the hue comes out wrong.
     //
-    // Dark navy floor (noise) fading up to light blue (decode signal peaks),
-    // linearly interpolated by intensity v (0..255).
+    // Raw bin intensity is a dB-scaled value tuned for decode sensitivity
+    // (ft8_lib's monitor.c spans ~127 dB across 0..255), so the ambient noise
+    // floor typically sits well above 0 -- rendering it directly leaves no
+    // room for black. Auto-scale each frame to whatever's actually on screen
+    // (like the IC-705's own auto-ranging spectrum scope) so the current
+    // noise floor maps to black and the current peak maps to full brightness.
+    uint8_t vmin = 255, vmax = 0;
+    for (int i = 0; i < WATERFALL_H; ++i) {
+        for (int x = 0; x < SCREEN_W; ++x) {
+            uint8_t v = waterfall[i][x];
+            if (v < vmin) vmin = v;
+            if (v > vmax) vmax = v;
+        }
+    }
+    // Guard against a near-flat frame (silence, or right after boot) -- floor
+    // the spread so tiny fluctuations don't get stretched into full contrast.
+    int spread = vmax - vmin;
+    if (spread < 20) {
+        int widened = vmin + 20;
+        vmax = (uint8_t)(widened > 255 ? 255 : widened);
+        spread = vmax - vmin;
+    }
+
+    // Black floor (current noise level) fading up through dark blue to light
+    // blue (current peak), by normalized intensity. Noise fluctuates *around*
+    // the floor, not pinned to it, so a plain linear stretch still leaves the
+    // typical noise pixel visibly lit (roughly half of it sits above the
+    // floor). Squaring the normalized value pushes that whole noise band much
+    // closer to black while leaving the true peak (norm=255) untouched --
+    // same effect as the "gamma" control on an SDR waterfall.
+    //
+    // The R/G/B ramp is split into two explicit legs rather than one blended
+    // lerp: at low brightness, R and G stay pinned at 0 (pure blue, only B
+    // rises) so dim pixels can only ever read as black-to-navy. A single
+    // shared lerp put tiny near-equal R/G/B values at the low end, which
+    // RGB565's limited bit depth crushes into a visible grey instead of blue.
+    // R/G only start opening up in the upper half, giving the light-blue
+    // highlight on genuine signal peaks.
     for (int i = 0; i < WATERFALL_H; ++i) {
         int src = (waterfall_head + i) % WATERFALL_H;
         for (int x = 0; x < SCREEN_W; ++x) {
-            uint8_t v = waterfall[src][x];
-            uint8_t r = (uint8_t)((8   * (255 - v) + 140 * v) / 255);
-            uint8_t g = (uint8_t)((8   * (255 - v) + 190 * v) / 255);
-            uint8_t b = (uint8_t)((60  * (255 - v) + 255 * v) / 255);
+            int raw = waterfall[src][x];
+            int norm = ((raw - vmin) * 255) / spread;
+            if (norm < 0) norm = 0; else if (norm > 255) norm = 255;
+            uint8_t v = (uint8_t)((norm * norm) / 255);
+            uint8_t r, g, b;
+            if (v <= 128) {
+                r = 0;
+                g = 0;
+                b = (uint8_t)(150 * v / 128);
+            } else {
+                int t = v - 128;  // 0..127
+                r = (uint8_t)(120 * t / 127);
+                g = (uint8_t)(170 * t / 127);
+                b = (uint8_t)(150 + (255 - 150) * t / 127);
+            }
             wf_fb[i * SCREEN_W + x] = __builtin_bswap16(rgb565(r, g, b));
         }
     }
@@ -230,6 +231,11 @@ void ui_draw_countdown(float fraction, bool even_slot) {
         uint16_t color = even_slot ? rgb565(0, 180, 0) : rgb565(180, 0, 0);
         M5.Display.fillRect(0, y, filled, COUNTDOWN_H, color);
     }
+}
+
+void ui_clear_countdown() {
+    DispGuard guard;
+    M5.Display.fillRect(0, WATERFALL_H, SCREEN_W, COUNTDOWN_H, TFT_BLACK);
 }
 
 // Helper: copy a UiRxLine into a RxDecodeEntry with bounded string copies
@@ -415,10 +421,11 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
     M5.Display.setTextSize(1);
     M5.Display.setCursor(4, 3);
     if (info.qso_done) {
-        // Brief green success overlay after a genuine completion (SIGNOFF
-        // reached) -- same green as the tracker's "done" boxes below.
         M5.Display.setTextColor(rgb565(0, 220, 0), TFT_BLACK);
         M5.Display.print("QSO COMPLETE");
+    } else if (info.qso_gave_up) {
+        M5.Display.setTextColor(rgb565(230, 160, 0), TFT_BLACK);
+        M5.Display.print("NO REPLY");
     } else if (info.calling_cq) {
         // Show the actual outgoing CQ text (incl. any POTA/SOTA/QRP prefix)
         // instead of a generic label, so it's visible at a glance that the
@@ -435,13 +442,6 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
         M5.Display.setCursor(SCREEN_W - tw - 4, 3);
         M5.Display.print(info.clock_hm.c_str());
     }
-    // Fixed-position RX/TX indicator, left of the clock (clock_hm is always
-    // "HH:MM" -- 5 chars, 30px -- so its cursor always lands at SCREEN_W-34;
-    // this sits 12px plus a 16px gap (2 extra char-widths) to the left of that).
-    M5.Display.setTextColor(info.is_tx ? TFT_RED : rgb565(120, 170, 255), TFT_BLACK);
-    M5.Display.setCursor(SCREEN_W - 34 - 16 - 12, 3);
-    M5.Display.print(info.is_tx ? "TX" : "RX");
-
     // Row 1: callsign + grid, y 32-60. Cursor at y=35 centers the size-3
     // glyph (24px tall) on y=47 -- the midpoint between the countdown bar's
     // bottom edge (UI_START_Y=21) and the tracker's top edge (box_y=73).
@@ -466,10 +466,7 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
     const int box_y = 73, box_h = 28, gap = 4;
     const int box_w = (SCREEN_W - gap * 5) / 6;
     for (int i = 0; i < 6; ++i) {
-        // qso_done: every box (including the final "73") shows fully done/
-        // green -- otherwise the last-reached stage would sit at state 1
-        // (navy "current") forever even though it's actually complete.
-        int box_state = info.qso_done ? 2 : (i < info.stage) ? 2 : (i == info.stage ? 1 : 0);
+        int box_state = (i < info.stage) ? 2 : (i == info.stage ? 1 : 0);
         hero_draw_stage_box(i * (box_w + gap), box_y, box_w, box_h, kStageLabels[i], box_state);
     }
 
@@ -491,9 +488,27 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
     // (~132, 8px glyph) 3px above the screen bottom (135), matching row 0's
     // 3px top gap (its text sits at y=3).
     M5.Display.fillRect(0, 121, SCREEN_W, SCREEN_H - 121, TFT_BLACK);
-    M5.Display.setTextColor(rgb565(0, 255, 255), TFT_BLACK);
-    M5.Display.setCursor(4, 124);
-    M5.Display.print("ESC to Stop");
+    if (info.qso_done) {
+        M5.Display.setTextColor(rgb565(0, 220, 0), TFT_BLACK);
+        M5.Display.setCursor(4, 124);
+        M5.Display.print("Logged - ESC to dismiss");
+    } else if (info.qso_gave_up) {
+        M5.Display.setTextColor(rgb565(230, 160, 0), TFT_BLACK);
+        M5.Display.setCursor(4, 124);
+        M5.Display.print("Clearing...");
+    } else {
+        M5.Display.setTextColor(rgb565(0, 255, 255), TFT_BLACK);
+        M5.Display.setCursor(4, 124);
+        M5.Display.print("ESC to Stop");
+    }
+    {
+        char qbuf[24];
+        snprintf(qbuf, sizeof(qbuf), "QSOs: %d", info.qso_count);
+        int tw = (int)strlen(qbuf) * 6;
+        M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
+        M5.Display.setCursor(SCREEN_W - tw - 4, 124);
+        M5.Display.print(qbuf);
+    }
 
     M5.Display.setTextWrap(true);
     M5.Display.endWrite();

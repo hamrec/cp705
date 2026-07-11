@@ -33,7 +33,6 @@ extern std::vector<BandItem> g_bands;
 extern int               g_band_sel;
 extern CqType            g_cq_type;
 extern std::string       g_cq_freetext;
-extern BeaconMode        g_beacon;
 extern OffsetSrc         g_offset_src;
 extern int               g_offset_hz;
 extern bool              g_skip_tx1;
@@ -88,23 +87,6 @@ struct ConfigGuard {
 // ---------------------------------------------------------------------------
 // Enum mapping helpers (core_api.h <-> station_types.h)
 // ---------------------------------------------------------------------------
-
-CoreBeaconMode map_out(BeaconMode m) {
-  switch (m) {
-    case BeaconMode::OFF:  return CoreBeaconMode::OFF;
-    case BeaconMode::EVEN: return CoreBeaconMode::EVEN;
-    case BeaconMode::ODD:  return CoreBeaconMode::ODD;
-  }
-  return CoreBeaconMode::OFF;
-}
-BeaconMode map_in(CoreBeaconMode m) {
-  switch (m) {
-    case CoreBeaconMode::OFF:  return BeaconMode::OFF;
-    case CoreBeaconMode::EVEN: return BeaconMode::EVEN;
-    case CoreBeaconMode::ODD:  return BeaconMode::ODD;
-  }
-  return BeaconMode::OFF;
-}
 
 CoreCqType map_out(CqType t) {
   switch (t) {
@@ -295,7 +277,6 @@ void core_get_config(StationConfig& out) {
 
   out.cq_type     = map_out(g_cq_type);
   out.cq_freetext = g_cq_freetext;
-  out.beacon      = map_out(g_beacon);
 
   out.offset_src  = map_out(g_offset_src);
   out.offset_hz   = g_offset_hz;
@@ -507,10 +488,6 @@ bool core_cmd_set_cq_freetext(const std::string& text) {
   core_fire_config_changed();
   return true;
 }
-bool core_cmd_set_beacon(CoreBeaconMode m) {
-  return apply_config_write([&]{ g_beacon = map_in(m); });
-}
-
 bool core_cmd_set_offset_src(CoreOffsetSrc s) {
   return apply_config_write([&]{ g_offset_src = map_in(s); });
 }
