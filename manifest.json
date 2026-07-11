@@ -1,6 +1,6 @@
 {
   "name": "CP705 — IC-705 WiFi FT8 (Cardputer ADV)",
-  "version": "2.4",
+  "version": "3.0",
   "new_install_prompt_erase": true,
   "builds": [
     {
