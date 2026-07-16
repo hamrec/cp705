@@ -478,7 +478,7 @@ static std::vector<std::string> g_host_help_lines = {
     "INFO/HELP/EXIT",
 };
 
-static const char* kAppVersion = "3.0";
+static const char* kAppVersion = "3.0.1";
 
 // Runtime latch: when true, we're still showing the startup screen. Either
 // a keypress or the 5 s auto-dismiss timer (g_startup_start_ms) takes us

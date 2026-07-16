@@ -155,6 +155,25 @@ static void tx_writer_task(void* /*arg*/) {
                 ESP_LOGW(TAG, "TXDONE ok=%u fail=%u rexmit=%u | frames=%d underruns=%d worstGap=%lldus worstRender=%lldus",
                          (unsigned)ok, (unsigned)fail, (unsigned)rexmit,
                          frames, underruns, (long long)worst_gap_us, (long long)worst_render_us);
+                // Same summary to the SD card -- this is the number that actually
+                // answers "did TX go silent, and for how long": each underrun tick
+                // is one ~10ms period where the pacing timer fired but no audio was
+                // ready to send (ring empty), and worstGap is the longest gap between
+                // two consecutive sends in this transmission. A reported ~1s dropout
+                // should show up here as either a large underrun count or a
+                // worstGap in the hundreds-of-ms-to-seconds range. Without a serial
+                // monitor this data was previously invisible on this board.
+                {
+                    int64_t up_ms = esp_timer_get_time() / 1000;
+                    char buf[176];
+                    snprintf(buf, sizeof(buf),
+                             "TXDONE up=%lld.%03llds ok=%u fail=%u rexmit=%u frames=%d "
+                             "underruns=%d worstGap=%lldus worstRender=%lldus\n",
+                             (long long)(up_ms / 1000), (long long)(up_ms % 1000),
+                             (unsigned)ok, (unsigned)fail, (unsigned)rexmit,
+                             frames, underruns, (long long)worst_gap_us, (long long)worst_render_us);
+                    storage_sd_log_append("IC705DBG.txt", buf);
+                }
             }
             was_running = false;
             vTaskDelay(pdMS_TO_TICKS(20));
