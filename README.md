@@ -267,20 +267,16 @@ network login once. You can also pre-load `Station.txt` from the SD card.
   operate in a **data mode (USB-D)**.
 - **No decodes despite strong signals:** time isn't UTC-locked — connect a GPS or
   DS3231 and confirm the time source shows `G` (GPS) or `R` (RTC) on `S → 5`.
+- **Brief TX audio dropouts (radio's power output dips to zero, then resumes):**
+  RF getting into the ESP32's WiFi front-end from a nearby transmitting
+  antenna, confirmed by per-transmission diagnostics (`TXDONE` lines in
+  `IC705DBG.TXT` on the SD card) and cleared by physically repositioning the
+  radio/antenna relative to the Cardputer. Give them more separation; a USB
+  tether cable can also act as an antenna and make it worse.
 
 ## Known Issues
 
 Open issues, all real and all chased hard without a confirmed root cause yet:
-
-- **Brief TX audio dropouts on some setups.** Occasional 0.1–1s gaps in the
-  transmitted audio (the radio's power output dips to zero, then resumes).
-  Per-transmission diagnostics (written to `IC705DBG.TXT` on the SD card as
-  `TXDONE` lines) show these are WiFi send failures in bursts, not an audio
-  timing problem — the leading suspect is RF ingress into the ESP32's WiFi
-  front-end while the radio is transmitting at close range (a USB tether
-  cable can make it worse). A dummy-load A/B test to confirm is pending. If
-  you see this, try more separation between the Cardputer and the antenna,
-  ferrites on any USB cable, or battery operation.
 
 - **Cold-boot Tune sometimes fires no real RF.** If the radio and CP705 are
   both freshly rebooted on the same band and you press `3` to Tune, CP705's
