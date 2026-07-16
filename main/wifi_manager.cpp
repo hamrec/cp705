@@ -12,10 +12,14 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 // (mdns.h removed — mDNS no longer used; see wifi_mgr_start)
 #include "lwip/ip4_addr.h"
 
 #include "storage_service.h"
+#include "ic705_netctrl.h"
+
+extern volatile bool g_decode_in_progress;
 
 static const char* TAG = "WIFI_MGR";
 
@@ -83,11 +87,26 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             uint8_t reason = 0;
             if (event_data) reason = ((wifi_event_sta_disconnected_t*)event_data)->reason;
             int64_t up_ms = esp_timer_get_time() / 1000;
-            char buf[128];
+            // A driver-reported reason (BEACON_TIMEOUT/NO_AP_FOUND, etc.) is only
+            // as trustworthy as the driver's own state -- on this no-PSRAM board
+            // the WiFi stack's buffers live in the SAME heap as everything else,
+            // so heap corruption elsewhere can produce a bogus "lost the AP"
+            // report even with the AP sitting right there broadcasting fine
+            // (confirmed once: SSID visible on a phone, radio awake, 10" away,
+            // and the driver still reported BEACON_TIMEOUT then NO_AP_FOUND on
+            // every retry). Log free heap + what the app was doing at the exact
+            // moment of the drop so a recurrence is actually diagnosable instead
+            // of just re-confirming the bare reason code.
+            char buf[220];
             snprintf(buf, sizeof(buf),
-                     "WIFI DISCONNECT up=%lld.%03llds reason=%u retry=%d/%d\n",
+                     "WIFI DISCONNECT up=%lld.%03llds reason=%u retry=%d/%d "
+                     "heap8=%u heapInt=%u decode_in_progress=%d cat_ready=%d audio_ready=%d\n",
                      (long long)(up_ms / 1000), (long long)(up_ms % 1000),
-                     (unsigned)reason, s_retry_count, MAX_RETRIES);
+                     (unsigned)reason, s_retry_count, MAX_RETRIES,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (int)g_decode_in_progress,
+                     (int)ic705_net_is_ready(), (int)ic705_net_audio_is_ready());
             storage_sd_log_append("IC705DBG.txt", buf);
         }
         if (s_state == WIFI_MGR_IDLE) return;  // intentional stop
