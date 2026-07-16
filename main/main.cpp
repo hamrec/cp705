@@ -2109,29 +2109,25 @@ static void check_slot_boundary() {
   const bool window_ok = (slot_ms < (g_protocol->slot_time_ms * 4 / 15));
   const bool decode_ok = (g_decode_applied_slot_idx >= slot_idx - 2);
 
-  // A CQ transmits a fixed, self-originated message -- it depends on NOTHING we
-  // decoded, so it must NOT sit behind the decode-completion guards the way a
-  // QSO reply does. This board decodes only one parity (it decodes a slot,
-  // overruns ~2.7s into the next, re-anchors forward, and keeps landing on the
-  // same parity), so g_decode_in_progress is true for the first ~2.7s of every
-  // decoded-parity slot. The running CQ is re-armed from inside
-  // decode_monitor_results, so its target parity ((now/slot)+1) lands on
-  // exactly that decoded parity -- meaning the CQ could only ever squeeze
-  // through the ~1.3s gap between the decode finishing and the ~4s TX window
-  // closing. On a busy-enough band the decode runs long, the CQ misses that
-  // gap, and it waits a full extra same-parity cycle (+30s) -- the "sat through
-  // a whole green+red and fired on the next green" bug. Gate the CQ on window +
-  // parity only; a reply still honors both decode guards (it genuinely must
-  // decode the other station before it can answer).
-  const bool is_cq_tx = (g_pending_tx.text.rfind("CQ ", 0) == 0) ||
-                        (g_pending_tx.text == "CQ");
-  const bool decode_gate_ok = is_cq_tx || (!g_decode_in_progress && decode_ok);
-
+  // !g_decode_in_progress is LOAD-BEARING CROSS-CORE SYNCHRONIZATION, not just
+  // a data-freshness check. decode_monitor_results (core 1) ends with a block
+  // that mutates autoseq state and writes g_pending_tx (std::strings, heap) via
+  // arm_pending_tx; the fire path below (and tx_start) reads g_pending_tx and
+  // mutates autoseq from core 0. Neither side takes a lock -- the ONLY thing
+  // keeping the two cores out of each other's way is that TX never fires while
+  // the decode is running. A "CQ doesn't need decode results" exemption was
+  // tried here (v3.0, reverted same night): functionally reasonable, but it let
+  // tx_start run concurrently with the decode tail AND read g_pending_tx.text
+  // ungated at ~100Hz -- torn std::strings and corrupted autoseq state on a
+  // no-PSRAM board (crashes/stalls that presented as WiFi drops and armed-but-
+  // never-firing TX). Do not exempt ANY path from this guard without first
+  // putting a real mutex around autoseq + g_pending_tx.
   if (g_qso_xmit &&
       parity_ok &&
       window_ok &&
       !g_tx_active &&
-      decode_gate_ok) {
+      !g_decode_in_progress &&
+      decode_ok) {
 
     ESP_LOGI(TAG, "TX trigger: starting TX in slot %lld (parity %d)",
              (long long)slot_idx, slot_parity);
@@ -2159,10 +2155,10 @@ static void check_slot_boundary() {
     static int64_t s_last_xmit_stall_log_ms = 0;
     if (now_ms - s_last_xmit_stall_log_ms >= 1000) {
       s_last_xmit_stall_log_ms = now_ms;
-      ESP_LOGW(TAG, "TX armed but not firing: is_cq=%d parity_ok=%d(target=%d,slot=%d) "
+      ESP_LOGW(TAG, "TX armed but not firing: parity_ok=%d(target=%d,slot=%d) "
                "window_ok=%d(slot_ms=%d) tx_active=%d decode_in_progress=%d "
                "decode_ok=%d(applied=%lld,slot_idx=%lld)",
-               (int)is_cq_tx, (int)parity_ok, g_target_slot_parity, slot_parity,
+               (int)parity_ok, g_target_slot_parity, slot_parity,
                (int)window_ok, slot_ms, (int)g_tx_active, (int)g_decode_in_progress,
                (int)decode_ok, (long long)g_decode_applied_slot_idx, (long long)slot_idx);
     }
@@ -2777,12 +2773,12 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
   // directly here without syncing against stale timing) ----
   //
   // NEVER shift the clock while transmitting. tx_start() latches the TX tone
-  // schedule off rtc_now_ms() at the top of the slot; a CQ can now fire (see
-  // check_slot_boundary's is_cq_tx path) while the previous slot's decode is
-  // still overrunning, so this soft-sync can complete DURING our TX. A ±320ms
-  // shift under the running tone schedule would jump us ~2 FT8 symbols and
-  // corrupt the transmission. Skipping one sync opportunity is harmless -- the
-  // next RX cycle re-syncs.
+  // schedule off rtc_now_ms() at the top of the slot; a ±320ms shift under the
+  // running tone schedule would jump us ~2 FT8 symbols and corrupt the
+  // transmission. With the TX-fire guard requiring !g_decode_in_progress this
+  // overlap shouldn't be reachable today -- this is cheap insurance so a future
+  // change to the fire guards can't silently reintroduce it. Skipping one sync
+  // opportunity is harmless; the next RX cycle re-syncs.
   if (this_cycle_n > 3 && !g_tx_active) {
     // Simple insertion sort to find median of time_s values
     float sorted_t[DEC_MAX];
