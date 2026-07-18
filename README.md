@@ -274,6 +274,39 @@ network login once. You can also pre-load `Station.txt` from the SD card.
   radio/antenna relative to the Cardputer. Give them more separation; a USB
   tether cable can also act as an antenna and make it worse.
 
+## Decode sensitivity — a hardware limit, not a bug
+
+CP705 runs the FT8 decoder at **time oversampling ratio 1 (`time_osr=1`)**, and
+this is the ceiling on the Cardputer ADV. You will see fewer decodes than a
+PC-class client (WSJT-X, SDR-Control) hears on the same band at the same time.
+That is expected, and here is the honest reason:
+
+- **No PSRAM.** The Cardputer ADV has no external RAM. The FT8 decoder's
+  waterfall magnitude buffer is the single largest working allocation, and at
+  `time_osr=2` (the sensitivity level a desktop uses) it needs ~40 KB more than
+  at `time_osr=1` — roughly the board's entire steady-state free-heap margin.
+  Measured: with `time_osr=1` the firmware runs with ~41 KB free heap under full
+  RX/TX load; `time_osr=2` drops that to ~1 KB and the board panics on the first
+  transient allocation the moment decode spins up. There is no framebuffer or
+  other large buffer left to reclaim to make room (the UI draws directly to the
+  panel — it holds no canvas in RAM), and the WiFi stack is already trimmed to
+  the bone. So `time_osr=1` is genuinely the best this hardware can do.
+- **Lighter decoder than WSJT-X.** The DSP core is
+  [ft8_lib](https://github.com/kgoba/ft8_lib), a clean C implementation. It does
+  a single decode pass; WSJT-X's Fortran decoder does multi-pass decoding with
+  signal subtraction and a-priori decoding, which pulls out more (and weaker)
+  signals — but assumes desktop CPU and RAM.
+- **The radio's waterfall is not a decoder.** The IC-705's on-screen waterfall
+  shows *RF energy* — including signals too weak or off-timing to decode, plus
+  non-FT8 activity — so it will always look busier than any decode list, on any
+  hardware. A crowded radio waterfall is not by itself evidence of missed
+  decodes.
+
+Full-sensitivity FT8 (`time_osr=2`, multi-pass) is a **PSRAM-hardware feature**
+— see the T-Deck Plus (TD705) or an M5Stack CoreS3 port. CP705's strengths are
+its self-contained WiFi operation, connection resilience, and TX stability, not
+raw weak-signal decode count.
+
 ## Known Issues
 
 Open issues, all real and all chased hard without a confirmed root cause yet:
