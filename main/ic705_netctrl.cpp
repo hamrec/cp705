@@ -48,6 +48,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "storage_service.h"
+#include "diag_log.h"
 #include "freertos/queue.h"
 
 #include "esp_log.h"
@@ -190,10 +191,6 @@ static esp_err_t udp_sess_open_lr(udp_sess_t* s, uint32_t ip_be, uint16_t local_
     return ESP_OK;
 }
 
-static esp_err_t udp_sess_open(udp_sess_t* s, uint32_t ip_be, uint16_t port) {
-    return udp_sess_open_lr(s, ip_be, port, port);
-}
-
 static void udp_sess_close(udp_sess_t* s) {
     if (s->sock >= 0) { close(s->sock); s->sock = -1; }
 }
@@ -271,7 +268,7 @@ static void dbg_log(const char* fmt, ...) {
     if (n > (int)sizeof(buf) - 2) n = (int)sizeof(buf) - 2;
     buf[n] = '\n';
     buf[n + 1] = '\0';
-    if (storage_sd_log_append("IC705DBG.txt", buf)) {
+    if (storage_sd_log_append(kDiagLogFile, buf)) {
         s_sd_log_ever_succeeded = true;
     } else {
         s_sd_log_ever_failed = true;
@@ -543,6 +540,33 @@ static void build_request_serial_audio_pkt(uint8_t out[144], uint16_t civ_local_
     out[136] = 0x01;
 }
 
+// Diagnostic counters for the CTRL/SERIAL keepalive path (pkt0-idle,
+// pkt7-ping, and the 60s reauth). Audio TX packets already have their own
+// ok/fail/rexmit tracking (s_audio_tx_ok etc.) and audio DATA loss is what
+// causes the dropouts investigated so far -- but a session where the radio
+// drops us with NO WiFi-layer disconnect logged (WIFI_MGR's
+// WIFI_EVENT_STA_DISCONNECTED never fires) can only be explained by the
+// RADIO deciding we've gone quiet and closing the session on ITS side,
+// which happens if these keepalives -- not the audio stream -- are the ones
+// failing to get out. There was previously no visibility into that at all.
+static volatile uint32_t s_keepalive_send_ok = 0;
+static volatile uint32_t s_keepalive_send_fail = 0;
+
+// Timestamp of the last packet RECEIVED on each stream (any packet, not just
+// a particular type) -- lets the periodic diagnostic show "seconds since
+// last heard from the radio" per stream. Distinguishes "the whole radio went
+// quiet" (all three stall together) from "only the audio server died" (ctrl/
+// serial keep receiving fine while audio alone freezes) -- a materially
+// different failure to chase. Both written and read from this same task, so
+// no lock needed.
+static int64_t s_last_ctrl_rx_us = 0;
+static int64_t s_last_serial_rx_us = 0;
+
+void ic705_net_get_keepalive_stats(uint32_t* ok, uint32_t* fail) {
+    if (ok) *ok = s_keepalive_send_ok;
+    if (fail) *fail = s_keepalive_send_fail;
+}
+
 // pkt7 ping/pong (keepalive + latency probe), shared shape on every stream
 static void send_pkt7_ping(udp_sess_t* s, uint16_t seq) {
     uint8_t rand_id[1];
@@ -554,7 +578,8 @@ static void send_pkt7_ping(udp_sess_t* s, uint16_t seq) {
     d[16] = 0x00;
     d[17] = rand_id[0];
     d[18] = 0x00; d[19] = 0x00; d[20] = 0x06;
-    udp_send(s, d, sizeof(d));
+    if (udp_send(s, d, sizeof(d)) == ESP_OK) s_keepalive_send_ok = s_keepalive_send_ok + 1;
+    else s_keepalive_send_fail = s_keepalive_send_fail + 1;
 }
 
 static void send_pkt7_reply(udp_sess_t* s, const uint8_t* reply_id4, uint16_t seq) {
@@ -588,7 +613,8 @@ static void send_pkt0_idle(udp_sess_t* s) {
     uint8_t d[16] = { 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     put_be32(d + 8, s->local_sid);
     put_be32(d + 12, s->remote_sid);
-    udp_send_tracked(s, d, sizeof(d));
+    if (udp_send_tracked(s, d, sizeof(d)) == ESP_OK) s_keepalive_send_ok = s_keepalive_send_ok + 1;
+    else s_keepalive_send_fail = s_keepalive_send_fail + 1;
 }
 
 // Control packet type 0x05 = "disconnect": tells the radio to release this
@@ -616,13 +642,6 @@ static void send_pkt0_idle_at_seq(udp_sess_t* s, uint16_t seq) {
     put_be32(d + 12, s->remote_sid);
     udp_send(s, d, sizeof(d));
     udp_send(s, d, sizeof(d));
-}
-
-static bool is_pkt0(const uint8_t* r, int len) {
-    return len >= 16 &&
-           (memcmp(r, "\x10\x00\x00\x00\x00\x00", 6) == 0 ||
-            memcmp(r, "\x10\x00\x00\x00\x01\x00", 6) == 0 ||
-            memcmp(r, "\x18\x00\x00\x00\x01\x00", 6) == 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,21 +1158,36 @@ static void handle_audio_rx(const uint8_t* r, int n) {
 }
 
 static void ic705_net_task(void*) {
-    esp_err_t err = do_connect(s_pending_ip);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "connect failed: %s", esp_err_to_name(err));
+  // Supervisor loop: (re)connect, serve until the session dies, then
+  // reconnect on our own -- a dropped/half-dead session no longer needs a
+  // reboot. Only a stop request leaves this loop, falling through to the
+  // graceful teardown. Ported from TD705 (sibling project, same protocol)
+  // 2026-07-18 after a 40+min session where the audio stream went silent
+  // with the WiFi link, ctrl, and serial all reporting nominally healthy the
+  // whole time -- CP705 had no code path that would ever notice or recover;
+  // TD705's had exactly this watchdog+supervisor-loop since day one.
+  while (!s_stop_req) {
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; !s_stop_req; ++attempt) {
+        err = do_connect(s_pending_ip);
+        if (err == ESP_OK) break;
+        ESP_LOGW(TAG, "connect failed (attempt %d): %s -- retrying in ~8s",
+                 attempt + 1, esp_err_to_name(err));
         udp_sess_close(&s_ctrl);
         udp_sess_close(&s_serial);
         udp_sess_close(&s_audio);
         s_audio_ready = false;
-        s_task = nullptr;
-        vTaskDelete(nullptr);
-        return;
+        for (int i = 0; i < 80 && !s_stop_req; ++i) vTaskDelay(pdMS_TO_TICKS(100));
     }
+    if (s_stop_req) break;
 
     TickType_t last_idle = xTaskGetTickCount();
     TickType_t last_ping = xTaskGetTickCount();
     TickType_t last_reauth = xTaskGetTickCount();
+    // Liveness baseline for this session -- see the watchdog check below.
+    s_last_ctrl_rx_us = esp_timer_get_time();
+    s_last_serial_rx_us = esp_timer_get_time();
+    bool session_dead = false;
 
     while (!s_stop_req) {
         // Drain the CI-V TX queue (non-blocking — must NOT block the loop;
@@ -1179,8 +1213,14 @@ static void ic705_net_task(void*) {
         // per ~20ms loop dropped half of them and corrupted the stream.
         uint8_t rx[256];
         int n;
-        while ((n = udp_recv_timeout(s_ctrl.sock, rx, sizeof(rx), 0)) > 0) handle_ctrl_rx(rx, n);
-        while ((n = udp_recv_timeout(s_serial.sock, rx, sizeof(rx), 0)) > 0) handle_serial_rx(rx, n);
+        while ((n = udp_recv_timeout(s_ctrl.sock, rx, sizeof(rx), 0)) > 0) {
+            s_last_ctrl_rx_us = esp_timer_get_time();
+            handle_ctrl_rx(rx, n);
+        }
+        while ((n = udp_recv_timeout(s_serial.sock, rx, sizeof(rx), 0)) > 0) {
+            s_last_serial_rx_us = esp_timer_get_time();
+            handle_serial_rx(rx, n);
+        }
 
         if (s_audio_ready || s_audio_bu != AUDIO_BU_NONE) {
             uint8_t arx[24 + AUDIO_RX_PCM_MAX + 16];
@@ -1236,7 +1276,10 @@ static void ic705_net_task(void*) {
         if (now - last_reauth >= pdMS_TO_TICKS(60000)) {
             uint8_t auth05[64];
             build_auth_pkt(auth05, 0x05);
-            udp_send_tracked_x2(&s_ctrl, auth05, sizeof(auth05));
+            if (udp_send_tracked_x2(&s_ctrl, auth05, sizeof(auth05)) == ESP_OK)
+                s_keepalive_send_ok = s_keepalive_send_ok + 1;
+            else
+                s_keepalive_send_fail = s_keepalive_send_fail + 1;
             last_reauth = now;
         }
         // DIAGNOSTIC: RX audio health every 5s — measured received rate (Hz; a
@@ -1250,6 +1293,81 @@ static void ic705_net_task(void*) {
                      (unsigned)s_audio_rx_pkts, (unsigned)s_audio_rx_drops);
         }
 
+        // DIAGNOSTIC: heap trend every 30s, persisted to the SD card (not just
+        // serial). WIFI DISCONNECT/TXDONE only log heap at the instant of a
+        // TX or a failure -- two isolated points can't tell a slow erosion
+        // over a session apart from a one-off dip. This runs on this task's
+        // already-continuous tick regardless of TX/RX/decode state, so it
+        // samples the WHOLE session and turns those isolated points into a
+        // curve. largestDMA (largest free DMA-capable block, same metric the
+        // boot log already tracks) matters as much as the raw free total --
+        // fragmentation can starve a specific allocation (e.g. a WiFi buffer)
+        // even when the free total still looks comfortable.
+        //
+        // keepaliveOk/Fail added after a session ended with the radio
+        // dropping us -- no WIFI_EVENT_STA_DISCONNECTED ever fired, so the
+        // 802.11 link itself stayed up. The only way that happens is the
+        // RADIO deciding we'd gone quiet and closing the session on its own
+        // side, which means the CTRL/SERIAL keepalives (not the already-
+        // tracked audio stream) are the ones that would have to be failing.
+        //
+        // audioSilentSec/audioReady added after a session where rxPkts/
+        // rxDrops froze at the exact same numbers for 150+ straight seconds
+        // -- the radio had silently stopped sending RX audio entirely, while
+        // keepaliveOk kept climbing the whole time (this loop is independent
+        // of the audio pipeline, so it kept ticking through the stall). That
+        // matters beyond just "no more decodes": decode_monitor_results()
+        // only runs once the audio pipeline has accumulated enough RX blocks
+        // to trigger a decode, and a running CQ is only ever re-armed from
+        // INSIDE that function -- so a silent audio stall doesn't just stop
+        // RX, it silently stops a beacon CQ from ever firing again too, with
+        // nothing else in the app noticing anything is wrong. audioSilentSec
+        // makes that stall an explicit, alarming number instead of something
+        // you have to notice by comparing two log lines' packet counts.
+        // audioReady shows whether our own code ever detects it (if it never
+        // flips false during a stall, we have zero built-in detection today).
+        //
+        // ctrlSilentSec/serialSilentSec/rssi added in the same pass rather
+        // than waiting for another round-trip: they answer the two questions
+        // audioSilentSec alone can't -- did the WHOLE radio go quiet (all
+        // three streams stall together) or just the audio server specifically
+        // (ctrl/serial keep receiving fine, only audio dies)? And was signal
+        // quality degrading at the time, or is this independent of RSSI?
+        static TickType_t last_heap_log = 0;
+        if (now - last_heap_log >= pdMS_TO_TICKS(30000)) {
+            last_heap_log = now;
+            int64_t up_ms = esp_timer_get_time() / 1000;
+            int64_t now_us = esp_timer_get_time();
+            int64_t last_audio_us;
+            taskENTER_CRITICAL(&s_rxr_mux);
+            last_audio_us = s_rxr_last_us;
+            taskEXIT_CRITICAL(&s_rxr_mux);
+            double audio_silent_sec = (last_audio_us == 0) ? -1.0
+                : (double)(now_us - last_audio_us) / 1000000.0;
+            double ctrl_silent_sec = (s_last_ctrl_rx_us == 0) ? -1.0
+                : (double)(now_us - s_last_ctrl_rx_us) / 1000000.0;
+            double serial_silent_sec = (s_last_serial_rx_us == 0) ? -1.0
+                : (double)(now_us - s_last_serial_rx_us) / 1000000.0;
+            int rssi = 0;
+            esp_wifi_sta_get_rssi(&rssi);
+            char hbuf[340];
+            snprintf(hbuf, sizeof(hbuf),
+                     "HEAPTREND up=%lld.%03llds heap8=%u heapInt=%u largestDMA=%u "
+                     "rxRate=%.1fHz rxPkts=%u rxDrops=%u keepaliveOk=%u keepaliveFail=%u "
+                     "audioSilentSec=%.1f audioReady=%d ctrlSilentSec=%.1f "
+                     "serialSilentSec=%.1f rssi=%d\n",
+                     (long long)(up_ms / 1000), (long long)(up_ms % 1000),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                     ic705_net_get_measured_rx_rate(),
+                     (unsigned)s_audio_rx_pkts, (unsigned)s_audio_rx_drops,
+                     (unsigned)s_keepalive_send_ok, (unsigned)s_keepalive_send_fail,
+                     audio_silent_sec, (int)s_audio_ready,
+                     ctrl_silent_sec, serial_silent_sec, rssi);
+            storage_sd_log_append(kDiagLogFile, hbuf);
+        }
+
         // Pace the loop and yield CPU. The sockets above are non-blocking, so
         // without a real delay this task busy-spins. CRITICAL: the FreeRTOS
         // tick is 100Hz, so pdMS_TO_TICKS(2) rounds to 0 ticks — a vTaskDelay(0)
@@ -1259,8 +1377,50 @@ static void ic705_net_task(void*) {
         // high-rate audio stream was dropped while low-rate keepalives still
         // got through. Use 1 full tick (10ms): IDLE and lwIP get CPU, and the
         // drain-all loops above still clear every queued packet per wake.
+
+        // Liveness watchdog: the radio streams pkt0 idle keepalives on
+        // ctrl+serial every ~100ms even while we transmit, so >8s of total
+        // silence on BOTH means the session (or the WiFi link itself) is
+        // dead. Break out and let the supervisor loop reconnect rather than
+        // nursing a corpse -- this is the exact gap that let a stuck audio
+        // stream run silently for 40+ minutes with nothing to notice it.
+        {
+            const int64_t now_wd_us = esp_timer_get_time();
+            if (now_wd_us - s_last_ctrl_rx_us > 8000000 &&
+                now_wd_us - s_last_serial_rx_us > 8000000) {
+                ESP_LOGW(TAG, "session dead: no ctrl/serial RX for >8s -- reconnecting");
+                char dbuf[160];
+                snprintf(dbuf, sizeof(dbuf),
+                         "SESSION DEAD up=%lld.%03llds ctrlSilentSec=%.1f serialSilentSec=%.1f\n",
+                         (long long)(now_wd_us / 1000000), (long long)((now_wd_us / 1000) % 1000),
+                         (double)(now_wd_us - s_last_ctrl_rx_us) / 1000000.0,
+                         (double)(now_wd_us - s_last_serial_rx_us) / 1000000.0);
+                storage_sd_log_append(kDiagLogFile, dbuf);
+                session_dead = true;
+                break;
+            }
+        }
         vTaskDelay(1);
     }
+
+    if (session_dead && !s_stop_req) {
+        // Best-effort disconnect so the radio frees the session immediately —
+        // avoids a stale-session hold on the next connect. If the link itself
+        // dropped these won't arrive and the radio times out on its own side.
+        set_status("Reconnecting");
+        if (s_audio_ready) send_disconnect(&s_audio);
+        send_disconnect(&s_serial);
+        send_disconnect(&s_ctrl);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        if (s_audio_ready) udp_sess_close(&s_audio);
+        udp_sess_close(&s_serial);
+        udp_sess_close(&s_ctrl);
+        s_ready = false;
+        s_audio_ready = false;
+        continue;  // supervisor loop -> reconnect
+    }
+    // Stop requested -> fall through to the graceful teardown, then exit.
+  }  // end supervisor loop
 
     // Graceful release: close the CI-V data stream, then send the protocol
     // disconnect (type 0x05) on every stream so the radio frees the session

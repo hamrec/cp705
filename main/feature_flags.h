@@ -8,5 +8,5 @@
 // Include FT4 protocol code and the runtime Mode menu item. When disabled,
 // only FT8 is available.
 #ifndef ENABLE_FT4
-#define ENABLE_FT4 1
+#define ENABLE_FT4 0
 #endif

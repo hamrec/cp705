@@ -3,19 +3,6 @@
 #include <M5Cardputer.h>
 #include <cstring>
 #include "freertos/semphr.h"
-#include "esp_heap_caps.h"
-
-static bool ui_paused = false;      // waterfall updates paused
-
-static uint8_t waterfall[WATERFALL_H][SCREEN_W];
-static int waterfall_head = 0;
-static bool waterfall_dirty = false;
-
-// Off-screen RGB565 frame buffer for bulk-blit waterfall rendering.
-// Replaces 4,320 individual drawPixel() SPI calls (~43 ms) with a single
-// pushImage() burst (~1 ms), keeping the main loop under its 2 ms TX budget.
-// 240 x 18 x 2 = 8,640 bytes allocated from heap in ui_init().
-static uint16_t* wf_fb = nullptr;
 
 // Static RX list — zero-heap display pipeline
 static RxDecodeEntry rx_lines[RX_MAX_DECODES];
@@ -56,29 +43,8 @@ static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
-void ui_set_paused(bool paused) { ui_paused = paused; }
-bool ui_is_paused() { return ui_paused; }
-
-// When true, ui_push_waterfall_row() from the RX audio pipeline is silenced.
-// ui_push_tx_waterfall_row() bypasses this flag so TX tone markers always appear.
-static bool s_rx_waterfall_muted = false;
-void ui_set_rx_waterfall_muted(bool muted) { s_rx_waterfall_muted = muted; }
-
-bool ui_waterfall_dirty() { return waterfall_dirty; }
-void ui_draw_waterfall_if_dirty() { if (waterfall_dirty) ui_draw_waterfall(); }
-
 void ui_init(bool display_only) {
     g_disp_mutex = xSemaphoreCreateMutex();
-
-    // Allocate the waterfall frame buffer before later runtime allocations so
-    // the request is served while DRAM is unfragmented.
-    if (!wf_fb) {
-        wf_fb = static_cast<uint16_t*>(
-            heap_caps_malloc(WATERFALL_H * SCREEN_W * sizeof(uint16_t), MALLOC_CAP_DEFAULT));
-        if (wf_fb) {
-            memset(wf_fb, 0, WATERFALL_H * SCREEN_W * sizeof(uint16_t));
-        }
-    }
 
     if (display_only) {
         // Display-only board init: full M5Unified startup can claim
@@ -98,144 +64,24 @@ void ui_init(bool display_only) {
     ui_draw_countdown(0.0f, true);
 }
 
-void ui_set_waterfall_row(int row, const uint8_t* bins, int len) {
-    if (len > SCREEN_W) len = SCREEN_W;
-    if (row < 0 || row >= WATERFALL_H) return;
-    memcpy(waterfall[row], bins, len);
-}
-
-// Internal: push one row unconditionally (respects ui_paused, ignores mute).
-static void push_waterfall_row_impl(const uint8_t* bins, int len) {
-    if (ui_paused) return;
-    if (len > SCREEN_W) len = SCREEN_W;
-    memcpy(waterfall[waterfall_head], bins, len);
-    if (len < SCREEN_W) {
-        memset(waterfall[waterfall_head] + len, 0, SCREEN_W - len);
-    }
-    waterfall_head = (waterfall_head + 1) % WATERFALL_H;
-    waterfall_dirty = true;
-}
-
-// Called by audio RX pipeline — suppressed during TX so received-spectrum
-// pixels don't mix with TX tone markers.
-void ui_push_waterfall_row(const uint8_t* bins, int len) {
-    if (s_rx_waterfall_muted) return;
-    push_waterfall_row_impl(bins, len);
-}
-
-// Called by the TX tone synthesiser — always pushes regardless of mute so
-// TX tone markers appear even when the RX audio path is silenced.
-void ui_push_tx_waterfall_row(const uint8_t* bins, int len) {
-    push_waterfall_row_impl(bins, len);
-}
-
-void ui_clear_waterfall() {
-    for (int r = 0; r < WATERFALL_H; ++r) {
-        memset(waterfall[r], 0, SCREEN_W);
-    }
-    waterfall_head = 0;
-    waterfall_dirty = true;
-    ui_draw_waterfall();
-}
-
-void ui_draw_waterfall() {
-    waterfall_dirty = false;
-    if (ui_paused) return;
-
-    // Phase 1: convert intensity → RGB565 into the off-screen frame buffer.
-    // Pure CPU work with no SPI traffic; no lock needed (wf_fb is only written here).
-    // Guard against unlikely allocation failure (device keeps running, waterfall blank).
-    if (!wf_fb) return;
-    //
-    // LovyanGFX pushImage(uint16_t*) sends bytes straight from memory without
-    // swapping — it expects data already in big-endian (wire) order.  Our
-    // rgb565() returns little-endian uint16_t, so we must bswap16 each value
-    // when storing; without the swap SPI sends the byte-reversed value and
-    // the hue comes out wrong.
-    //
-    // Raw bin intensity is a dB-scaled value tuned for decode sensitivity
-    // (ft8_lib's monitor.c spans ~127 dB across 0..255), so the ambient noise
-    // floor typically sits well above 0 -- rendering it directly leaves no
-    // room for black. Auto-scale each frame to whatever's actually on screen
-    // (like the IC-705's own auto-ranging spectrum scope) so the current
-    // noise floor maps to black and the current peak maps to full brightness.
-    uint8_t vmin = 255, vmax = 0;
-    for (int i = 0; i < WATERFALL_H; ++i) {
-        for (int x = 0; x < SCREEN_W; ++x) {
-            uint8_t v = waterfall[i][x];
-            if (v < vmin) vmin = v;
-            if (v > vmax) vmax = v;
-        }
-    }
-    // Guard against a near-flat frame (silence, or right after boot) -- floor
-    // the spread so tiny fluctuations don't get stretched into full contrast.
-    int spread = vmax - vmin;
-    if (spread < 20) {
-        int widened = vmin + 20;
-        vmax = (uint8_t)(widened > 255 ? 255 : widened);
-        spread = vmax - vmin;
-    }
-
-    // Black floor (current noise level) fading up through dark blue to light
-    // blue (current peak), by normalized intensity. Noise fluctuates *around*
-    // the floor, not pinned to it, so a plain linear stretch still leaves the
-    // typical noise pixel visibly lit (roughly half of it sits above the
-    // floor). Squaring the normalized value pushes that whole noise band much
-    // closer to black while leaving the true peak (norm=255) untouched --
-    // same effect as the "gamma" control on an SDR waterfall.
-    //
-    // The R/G/B ramp is split into two explicit legs rather than one blended
-    // lerp: at low brightness, R and G stay pinned at 0 (pure blue, only B
-    // rises) so dim pixels can only ever read as black-to-navy. A single
-    // shared lerp put tiny near-equal R/G/B values at the low end, which
-    // RGB565's limited bit depth crushes into a visible grey instead of blue.
-    // R/G only start opening up in the upper half, giving the light-blue
-    // highlight on genuine signal peaks.
-    for (int i = 0; i < WATERFALL_H; ++i) {
-        int src = (waterfall_head + i) % WATERFALL_H;
-        for (int x = 0; x < SCREEN_W; ++x) {
-            int raw = waterfall[src][x];
-            int norm = ((raw - vmin) * 255) / spread;
-            if (norm < 0) norm = 0; else if (norm > 255) norm = 255;
-            uint8_t v = (uint8_t)((norm * norm) / 255);
-            uint8_t r, g, b;
-            if (v <= 128) {
-                r = 0;
-                g = 0;
-                b = (uint8_t)(150 * v / 128);
-            } else {
-                int t = v - 128;  // 0..127
-                r = (uint8_t)(120 * t / 127);
-                g = (uint8_t)(170 * t / 127);
-                b = (uint8_t)(150 + (255 - 150) * t / 127);
-            }
-            wf_fb[i * SCREEN_W + x] = __builtin_bswap16(rgb565(r, g, b));
-        }
-    }
-
-    // Phase 2: single pushImage() burst transfers all 4,320 pixels in one SPI
-    // transaction (~1 ms) instead of 4,320 individual drawPixel() calls (~43 ms).
-    DispGuard guard;
-    M5.Display.pushImage(0, 0, SCREEN_W, WATERFALL_H, wf_fb);
-}
-
+// Countdown/progress bar lives at the very top edge of the display now that
+// the waterfall strip above it is gone.
 void ui_draw_countdown(float fraction, bool even_slot) {
     if (fraction < 0.0f) fraction = 0.0f;
     if (fraction > 1.0f) fraction = 1.0f;
     int filled = (int)(fraction * SCREEN_W);
-    int y = WATERFALL_H;
     // Draw a faint background to make the bar visible even at 0%
     DispGuard guard;
-    M5.Display.fillRect(0, y, SCREEN_W, COUNTDOWN_H, rgb565(20, 20, 40));
+    M5.Display.fillRect(0, 0, SCREEN_W, COUNTDOWN_H, rgb565(20, 20, 40));
     if (filled > 0) {
         uint16_t color = even_slot ? rgb565(0, 180, 0) : rgb565(180, 0, 0);
-        M5.Display.fillRect(0, y, filled, COUNTDOWN_H, color);
+        M5.Display.fillRect(0, 0, filled, COUNTDOWN_H, color);
     }
 }
 
 void ui_clear_countdown() {
     DispGuard guard;
-    M5.Display.fillRect(0, WATERFALL_H, SCREEN_W, COUNTDOWN_H, TFT_BLACK);
+    M5.Display.fillRect(0, 0, SCREEN_W, COUNTDOWN_H, TFT_BLACK);
 }
 
 // Helper: copy a UiRxLine into a RxDecodeEntry with bounded string copies
@@ -381,8 +227,8 @@ void ui_draw_rx(int flash_index) {
 }
 
 // --- QSO hero card -----------------------------------------------------
-// QSO/CQ progress view, replaces the waterfall + decode list while autoseq
-// has an active context. DIFF-AWARE: each of the card's five row bands is
+// QSO/CQ progress view, replaces the decode list while autoseq has an
+// active context. DIFF-AWARE: each of the card's five row bands is
 // repainted only when its own inputs changed since the last call, so a
 // routine redraw touches a few hundred bytes of SPI instead of blasting the
 // full ~65KB screen. That matters for the radio link, not just speed: a
@@ -453,11 +299,12 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
     if (full) M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setTextWrap(false);
 
-    // Row 0: status label + clock, y 0-19
+    // Row 0: status label + clock, y 4-23 (nudged down from y 0-19 so it
+    // clears the countdown bar now living at the top edge, y 0-3).
     if (row0_ch) {
-        M5.Display.fillRect(0, 0, SCREEN_W, 19, TFT_BLACK);
+        M5.Display.fillRect(0, 4, SCREEN_W, 19, TFT_BLACK);
         M5.Display.setTextSize(1);
-        M5.Display.setCursor(4, 3);
+        M5.Display.setCursor(4, 7);
         if (info.qso_done) {
             M5.Display.setTextColor(rgb565(0, 220, 0), TFT_BLACK);
             M5.Display.print("QSO COMPLETE");
@@ -477,14 +324,14 @@ void ui_draw_qso_hero(const QsoHeroInfo& info) {
         if (!info.clock_hm.empty()) {
             int tw = (int)info.clock_hm.size() * 6;
             M5.Display.setTextColor(rgb565(150, 150, 150), TFT_BLACK);
-            M5.Display.setCursor(SCREEN_W - tw - 4, 3);
+            M5.Display.setCursor(SCREEN_W - tw - 4, 7);
             M5.Display.print(info.clock_hm.c_str());
         }
     }
 
     // Row 1: callsign + grid, y 32-60. Cursor at y=35 centers the size-3
-    // glyph (24px tall) on y=47 -- the midpoint between the countdown bar's
-    // bottom edge (UI_START_Y=21) and the tracker's top edge (box_y=73).
+    // glyph (24px tall) on y=47, the midpoint between row 0's bottom edge
+    // (y=19) and the tracker's top edge (box_y=73).
     if (row1_ch) {
         M5.Display.fillRect(0, 32, SCREEN_W, 28, TFT_BLACK);
         M5.Display.setTextSize(3);

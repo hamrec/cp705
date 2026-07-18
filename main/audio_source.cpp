@@ -44,18 +44,3 @@ bool audio_source_ic705_detected(void) {
     return ic705_stream_is_streaming();
 }
 
-const char* audio_source_get_status_string(void) {
-    return ic705_stream_get_status_string();
-}
-
-const char* audio_source_get_debug_line1(void) {
-    return ic705_stream_get_debug_line1();
-}
-
-const char* audio_source_get_debug_line2(void) {
-    return ic705_stream_get_debug_line2();
-}
-
-bool audio_source_get_latest_waterfall_row(uint8_t* out_row, int out_len) {
-    return ft8_audio_pipeline_get_latest_waterfall_row(out_row, out_len);
-}

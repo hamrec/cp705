@@ -12,10 +12,45 @@
 #include <cstdarg>
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "storage_service.h"
+#include "diag_log.h"
+#include "lazy_mutex_guard.h"
 #include <string>
 
 //void debug_log_line_public(const std::string& msg);
 static const char* TAG = "AUTOSEQ";
+
+// ============== Locking ==============
+// s_queue/s_active_count/s_tx_msg_buffer/g_pending_tx (main.cpp) are touched
+// from TWO cores: the decode task (core 1, via autoseq_on_decodes/
+// autoseq_fetch_pending_tx inside decode_monitor_results) and the main UI
+// loop (core 0, via check_slot_boundary/tx_start/the menu+tap handlers/the
+// hero-card renderer). There was previously NO lock -- safety depended
+// entirely on !g_decode_in_progress in check_slot_boundary keeping the two
+// cores out of each other's way by timing alone. A same-night attempt to
+// exempt CQ transmissions from that guard turned out to remove the only
+// synchronization that existed and caused a real, on-air-observed data race
+// (torn std::strings / corrupted queue state) -- see git history "revert the
+// CQ decode-guard exemption". This lock replaces the timing-avoidance hack
+// with real mutual exclusion, matching the pattern already proven on the
+// TD705 sibling project (its autoseq.cpp has carried an equivalent
+// SemaphoreHandle_t since day one with no analogous bug ever reported).
+//
+// Every PUBLIC autoseq_* function takes this lock via AutoseqLockGuard for
+// its entire body (RAII -- released on every exit path, including early
+// returns, with no per-return-site bookkeeping needed). Private static
+// helpers never lock themselves; they assume the caller already holds it.
+// The one place two public functions used to call each other directly
+// (autoseq_clear -> autoseq_init) was restructured so the shared logic
+// lives in a private init_locked() that neither public entry point calls
+// while ALSO holding a second, nested lock of its own.
+static SemaphoreHandle_t s_lock = nullptr;
+
+struct AutoseqLockGuard : LazyMutexGuard {
+    AutoseqLockGuard() : LazyMutexGuard(s_lock) {}
+};
 
 // ============== Internal state ==============
 
@@ -56,10 +91,6 @@ static std::string s_cq_freetext;
 
 // ADIF callback
 static AdifLogCallback s_adif_callback;
-
-// Cabrillo Field Day callback (for ARRL-FD logging)
-static CabrilloFdLogCallback s_cabrillo_fd_callback = nullptr;
-
 
 // TX scheduling state
 static bool s_pending_valid = false;
@@ -111,7 +142,11 @@ static inline int clamp_retry_limit(int retry) {
 
 // ============== Public API ==============
 
-void autoseq_init() {
+// Shared body for autoseq_init()/autoseq_clear() -- both public entry points
+// take the lock themselves before calling this, so it must never lock (a
+// second public function calling this while ALREADY holding the lock would
+// deadlock a non-recursive mutex).
+static void init_locked() {
     s_active_count = 0;
     s_inactive_start = AUTOSEQ_MAX_QUEUE;
     s_pending_valid = false;
@@ -122,8 +157,14 @@ void autoseq_init() {
     s_pending_ft_text.clear();
 }
 
+void autoseq_init() {
+    AutoseqLockGuard guard;
+    init_locked();
+}
+
 void autoseq_clear() {
-    autoseq_init();
+    AutoseqLockGuard guard;
+    init_locked();
 }
 
 /*
@@ -138,6 +179,7 @@ static void dlogf(const char* fmt, ...) {
 */
 
 bool autoseq_drop_index(int idx) {
+    AutoseqLockGuard guard;
     if (idx < 0 || idx >= s_active_count) return false;
     // TX-page "drop" should preserve QSO metadata for late retries.
     // Keep CQ/transient entries removable as before.
@@ -185,6 +227,7 @@ static QsoContext* enqueue_one_shot(const std::string& dxcall,
 }
 
 void autoseq_start_cq(int slot_parity) {
+    AutoseqLockGuard guard;
     // Don't add duplicate CQ in active zone
     for (int i = 0; i < s_active_count; ++i) {
         if (s_queue[i].state == AutoseqState::CALLING && !s_queue[i].is_freetext) {
@@ -194,10 +237,26 @@ void autoseq_start_cq(int slot_parity) {
     if (enqueue_one_shot("CQ", false, slot_parity)) {
         ESP_LOGI(TAG, "Started CQ on slot %d", slot_parity);
         refresh_tx_msg_buffer();
+    } else {
+        // Queue exhausted (active+inactive zones both full, evict_oldest_inactive
+        // couldn't free a slot either) -- a running CQ beacon would silently stop
+        // re-arming forever with no other trace of why. Throttled since this can
+        // repeat every decode cycle once it starts happening.
+        static int64_t s_last_full_log_ms = 0;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (diag_log_due(&s_last_full_log_ms, now_ms, 30000)) {
+            char qbuf[160];
+            snprintf(qbuf, sizeof(qbuf),
+                     "CQFAIL up=%lld.%03llds active=%d inactiveStart=%d queueMax=%d\n",
+                     (long long)(now_ms / 1000), (long long)(now_ms % 1000),
+                     s_active_count, s_inactive_start, AUTOSEQ_MAX_QUEUE);
+            storage_sd_log_append(kDiagLogFile, qbuf);
+        }
     }
 }
 
 bool autoseq_schedule_freetext(const std::string& text, int fallback_slot_parity) {
+    AutoseqLockGuard guard;
     if (text.empty()) return false;
     // Don't duplicate an already-pending Free Text.
     for (int i = 0; i < s_active_count; ++i) {
@@ -224,6 +283,7 @@ bool autoseq_schedule_freetext(const std::string& text, int fallback_slot_parity
 }
 
 void autoseq_on_touch(const UiRxLine& msg) {
+    AutoseqLockGuard guard;
     // If no free space, evict an inactive entry to make room
     if (s_inactive_start <= s_active_count) {
         evict_oldest_inactive();
@@ -292,6 +352,7 @@ void autoseq_on_touch(const UiRxLine& msg) {
 }
 
 void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages) {
+    AutoseqLockGuard guard;
     ESP_LOGI(TAG, "on_decodes: %d messages, active=%d inactive=%d",
              (int)to_me_messages.size(), s_active_count,
              AUTOSEQ_MAX_QUEUE - s_inactive_start);
@@ -311,6 +372,7 @@ void autoseq_on_decodes(const std::vector<UiRxLine>& to_me_messages) {
 // Called AFTER TX completes to set up retry for next attempt
 // This is the reference architecture - tick is for retry management, not scheduling
 void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
+    AutoseqLockGuard guard;
     (void)slot_idx; (void)slot_parity; (void)ms_to_boundary;  // unused for now
 
     if (s_active_count == 0) return;
@@ -378,6 +440,7 @@ void autoseq_tick(int64_t slot_idx, int slot_parity, int ms_to_boundary) {
 }
 
 bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
+    AutoseqLockGuard guard;
     if (s_tx_msg_buffer.empty()) {
         // An active context with nothing pending is abnormal -- every state
         // that isn't IDLE should have text queued via refresh_tx_msg_buffer().
@@ -407,6 +470,7 @@ bool autoseq_fetch_pending_tx(AutoseqTxEntry& out) {
 }
 
 void autoseq_mark_sent(int64_t slot_idx) {
+    AutoseqLockGuard guard;
     if (s_active_count == 0) return;
 
     s_last_tx_slot_idx = slot_idx;
@@ -428,6 +492,7 @@ void autoseq_mark_sent(int64_t slot_idx) {
 //   (c) snr_tx/snr_rx are both latched by the time we reach ROGERS/SIGNOFF
 //       (we reached those states via parse_rcvd_msg updates on received TX2/TX3).
 void autoseq_on_tx_starting() {
+    AutoseqLockGuard guard;
     if (s_active_count == 0) return;
     QsoContext* ctx = &s_queue[0];
     if (ctx->next_tx == TxMsgType::TX4 || ctx->next_tx == TxMsgType::TX5) {
@@ -435,44 +500,25 @@ void autoseq_on_tx_starting() {
     }
 }
 
-bool autoseq_has_active_qso() {
-    for (int i = 0; i < s_active_count; ++i) {
-        if (s_queue[i].state != AutoseqState::IDLE &&
-            s_queue[i].state != AutoseqState::CALLING) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void autoseq_get_active_contexts(std::vector<QsoContext>& out) {
-    out.clear();
-    out.reserve(s_active_count);
-    for (int i = 0; i < s_active_count; ++i) {
-        out.push_back(s_queue[i]);
-    }
-}
-
 int autoseq_active_count() {
+    AutoseqLockGuard guard;
     return s_active_count;
 }
 
 bool autoseq_get_active_context(int idx, QsoContext* out) {
+    AutoseqLockGuard guard;
     if (!out || idx < 0 || idx >= s_active_count) return false;
     *out = s_queue[idx];
     return true;
 }
 
 void autoseq_set_adif_callback(AdifLogCallback cb) {
+    AutoseqLockGuard guard;
     s_adif_callback = cb;
 }
 
-
-void autoseq_set_cabrillo_fd_callback(CabrilloFdLogCallback cb) {
-    s_cabrillo_fd_callback = cb;
-}
-
 void autoseq_set_station(const std::string& call, const std::string& grid) {
+    AutoseqLockGuard guard;
     s_my_call = call;
     s_my_grid = grid;
     // CQ template is regenerated on every refresh, so just re-derive the
@@ -481,10 +527,12 @@ void autoseq_set_station(const std::string& call, const std::string& grid) {
 }
 
 void autoseq_set_skip_tx1(bool skip) {
+    AutoseqLockGuard guard;
     s_skip_tx1 = skip;
 }
 
 void autoseq_set_max_retry(int retry) {
+    AutoseqLockGuard guard;
     s_max_retry = clamp_retry_limit(retry);
     for (int i = 0; i < s_active_count; ++i) {
         QsoContext& ctx = s_queue[i];
@@ -498,6 +546,7 @@ void autoseq_set_max_retry(int retry) {
 }
 
 void autoseq_set_cq_type(AutoseqCqType type, const std::string& freetext) {
+    AutoseqLockGuard guard;
     s_cq_type = type;
     s_cq_freetext = freetext;
     refresh_tx_msg_buffer();  // re-derive CQ template if CQ is at queue[0]
@@ -706,8 +755,6 @@ static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
         // FD exchange shortcut
         std::string norm;
         if (ctx && parse_fd_exchange(msg.field3, norm) && !ctx->dxcall.empty()) {
-            ctx->fd_rx_exchange = norm;
-
             std::string t = trim_copy(msg.field3);
             if (!t.empty() && (t[0] == 'R' || t[0] == 'r')) rcvd = TxMsgType::TX3;
             else rcvd = TxMsgType::TX2;
@@ -741,18 +788,6 @@ static TxMsgType parse_rcvd_msg(QsoContext* ctx, const UiRxLine& msg) {
 
 static void log_qso_if_needed(QsoContext* ctx) {
     if (!ctx) return;
-
-    // Cabrillo Field Day log (optional, independent of ADIF)
-    if (ctx->is_fd && s_cabrillo_fd_callback &&
-        !ctx->cabrillo_logged &&
-        !ctx->dxcall.empty() && !ctx->fd_rx_exchange.empty()) {
-        if (!s_cabrillo_fd_callback(ctx->dxcall, ctx->fd_rx_exchange)) {
-            ESP_LOGW(TAG, "Cabrillo FD log failed for %s; will retry",
-                     ctx->dxcall.c_str());
-            return;
-        }
-        ctx->cabrillo_logged = true;
-    }
 
     if (ctx->logged) return;
     if (!s_adif_callback) return;

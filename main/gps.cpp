@@ -274,19 +274,6 @@ void gps_start(const gps_pins_t& pins) {
            s_pins.auto_baud ? 1 : 0);
 }
 
-void gps_stop() {
-  if (!s_state.running) return;
-  uart_flush_input(s_pins.uart);
-  uart_driver_delete(s_pins.uart);
-  s_state = {};
-  s_pending_baud_update = false;
-  s_pending_baud_value = 0;
-  s_line_buffer.clear();
-  s_probe_start_ms = 0;
-  s_probe_rx_bytes = 0;
-  s_probe_decodable = false;
-  ESP_LOGI(kTag, "GPS stopped");
-}
 
 void gps_tick() {
   if (!s_state.running) return;

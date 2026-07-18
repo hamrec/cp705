@@ -5,15 +5,18 @@
 
 // ---------------------------------------------------------------------------
 // Screen layout constants — shared between ui.cpp and callers that need to
-// position content relative to the waterfall / countdown areas.
+// position content relative to the countdown bar.
 // ---------------------------------------------------------------------------
 #define SCREEN_W    240
 #define SCREEN_H    135
-#define WATERFALL_H  18    ///< Pixel height of the waterfall strip
-#define COUNTDOWN_H   3    ///< Pixel height of the TX countdown bar
+#define COUNTDOWN_H   3    ///< Pixel height of the TX countdown bar, top edge
 #define RX_LINES      6    ///< Visible text rows below the countdown bar
-/// Y-coordinate where the text area begins (below waterfall + countdown).
-#define UI_START_Y  (WATERFALL_H + COUNTDOWN_H)   // 21 px
+/// Y-coordinate where the text area begins. COUNTDOWN_H alone (3px) put text
+/// immediately touching the bar's bottom edge with no gap -- same fix as the
+/// hero card's row0 (+4px), applied at the source so every list-style screen
+/// (STATUS, MENU, band select, long-edit) that derives its top row from this
+/// constant clears the bar too.
+#define UI_START_Y  (COUNTDOWN_H + 4)   // 7 px
 
 // A lightweight RX line format you can fill from your decoder
 struct UiRxLine {
@@ -75,18 +78,7 @@ struct QsoHeroInfo {
 void ui_init(bool display_only = false);
 // Icom-styled boot splash: app title, version, and the operator's callsign.
 void ui_draw_splash(const std::string& callsign, const std::string& version);
-void ui_set_waterfall_row(int row, const uint8_t* bins, int len);
-// Push a new row from the RX audio pipeline.  Suppressed during TX (see ui_set_rx_waterfall_muted).
-void ui_push_waterfall_row(const uint8_t* bins, int len);
-// Push a TX tone marker row — always visible regardless of mute state.
-void ui_push_tx_waterfall_row(const uint8_t* bins, int len);
-// Mute/unmute incoming RX waterfall rows.  Call with true when TX starts, false when TX ends.
-void ui_set_rx_waterfall_muted(bool muted);
-void ui_clear_waterfall();
-void ui_draw_waterfall();
-void ui_draw_waterfall_if_dirty();
-bool ui_waterfall_dirty();
-void ui_draw_countdown(float fraction, bool even_slot);  // 0.0-1.0 fill of the countdown bar
+void ui_draw_countdown(float fraction, bool even_slot);  // 0.0-1.0 fill of the countdown bar, top edge
 // Blanks the countdown bar strip to black. Called once, right before a TX
 // starts, so the bar (frozen at whatever fraction it had when TX began,
 // since redraws are held during TX) doesn't sit there stale for the whole
@@ -101,8 +93,6 @@ void ui_set_rx_list_static(const RxDecodeEntry* entries, int count);
 bool ui_get_rx_entry(int idx, RxDecodeEntry* out);
 // Current RX list count.
 int ui_get_rx_count();
-void ui_set_paused(bool paused);
-bool ui_is_paused();
 void ui_draw_rx(int flash_index = -1);
 void ui_force_redraw_rx();
 // QSO progress card, replaces the decode list while a QSO/CQ is active.

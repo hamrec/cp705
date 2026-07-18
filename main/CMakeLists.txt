@@ -18,4 +18,4 @@ idf_component_register(
              esp_wifi esp_netif mdns lwip nvs_flash
              storage_service external_rtc efuse
 )
-target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-unused-function)
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wunused-function -Wunused-variable -Wunused-but-set-variable -Wunused-value)

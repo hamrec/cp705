@@ -14,7 +14,6 @@ typedef enum {
 } radio_control_backend_t;
 
 void radio_control_set_backend(radio_control_backend_t backend);
-radio_control_backend_t radio_control_get_backend(void);
 const char* radio_control_backend_name(radio_control_backend_t backend);
 
 bool radio_control_ready(void);

@@ -17,6 +17,7 @@
 #include "lwip/ip4_addr.h"
 
 #include "storage_service.h"
+#include "diag_log.h"
 #include "ic705_netctrl.h"
 
 extern volatile bool g_decode_in_progress;
@@ -36,7 +37,6 @@ static char             s_status[64]  = "Idle";
 static EventGroupHandle_t s_event_group = NULL;
 static bool             s_initialized = false;
 static int              s_retry_count = 0;
-#define MAX_RETRIES 10
 
 // ---------------------------------------------------------------------------
 // mDNS hostname resolution
@@ -97,31 +97,42 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             // every retry). Log free heap + what the app was doing at the exact
             // moment of the drop so a recurrence is actually diagnosable instead
             // of just re-confirming the bare reason code.
-            char buf[220];
+            uint32_t ka_ok = 0, ka_fail = 0;
+            ic705_net_get_keepalive_stats(&ka_ok, &ka_fail);
+            char buf[280];
             snprintf(buf, sizeof(buf),
-                     "WIFI DISCONNECT up=%lld.%03llds reason=%u retry=%d/%d "
-                     "heap8=%u heapInt=%u decode_in_progress=%d cat_ready=%d audio_ready=%d\n",
+                     "WIFI DISCONNECT up=%lld.%03llds reason=%u retry=%d "
+                     "heap8=%u heapInt=%u largestDMA=%u decode_in_progress=%d cat_ready=%d "
+                     "audio_ready=%d keepaliveOk=%u keepaliveFail=%u\n",
                      (long long)(up_ms / 1000), (long long)(up_ms % 1000),
-                     (unsigned)reason, s_retry_count, MAX_RETRIES,
+                     (unsigned)reason, s_retry_count,
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
                      (int)g_decode_in_progress,
-                     (int)ic705_net_is_ready(), (int)ic705_net_audio_is_ready());
-            storage_sd_log_append("IC705DBG.txt", buf);
+                     (int)ic705_net_is_ready(), (int)ic705_net_audio_is_ready(),
+                     (unsigned)ka_ok, (unsigned)ka_fail);
+            storage_sd_log_append(kDiagLogFile, buf);
         }
         if (s_state == WIFI_MGR_IDLE) return;  // intentional stop
-        if (s_retry_count < MAX_RETRIES) {
-            s_retry_count++;
-            snprintf(s_status, sizeof(s_status), "Reconnecting... (%d/%d)", s_retry_count, MAX_RETRIES);
-            s_state = WIFI_MGR_CONNECTING;
-            esp_wifi_connect();
-            ESP_LOGI(TAG, "WiFi disconnected, retry %d/%d", s_retry_count, MAX_RETRIES);
-        } else {
-            snprintf(s_status, sizeof(s_status), "WiFi connect failed");
-            s_state = WIFI_MGR_ERROR;
-            xEventGroupSetBits(s_event_group, WIFI_FAIL_BIT);
-            ESP_LOGE(TAG, "WiFi connect failed after %d retries", MAX_RETRIES);
-        }
+        // Retry FOREVER instead of giving up after MAX_RETRIES. This used to
+        // latch WIFI_MGR_ERROR and stop reconnecting entirely, requiring a
+        // manual reboot to recover -- exactly the failure mode traced 2026-07-18
+        // to a transient RF drop (the IC-705's own WLAN icon blinked out, our
+        // RSSI dipped -30->-36, confirmed by the operator watching the radio
+        // directly). TD705 (sibling project, same protocol) never had this cap
+        // and reconnects silently through the same kind of blip instead of
+        // surfacing it as a failure -- its own comment: "never latch a
+        // permanent error that needs a reboot." The WIFI DISCONNECT log above
+        // still captures reason/heap context on every drop either way; this
+        // just stops giving up on the connection itself.
+        s_retry_count++;
+        snprintf(s_status, sizeof(s_status), "Reconnecting... (%d)", s_retry_count);
+        s_state = WIFI_MGR_CONNECTING;
+        esp_wifi_connect();
+        if (s_retry_count <= 10 || (s_retry_count % 20) == 0)
+            ESP_LOGI(TAG, "WiFi disconnected, retry %d (waiting for %s)",
+                     s_retry_count, s_ssid);
 
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;

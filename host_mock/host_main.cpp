@@ -30,13 +30,6 @@ static bool adif_callback(const std::string& dxcall, const std::string& dxgrid,
     return true;
 }
 
-// ---------- Cabrillo FD callback ----------
-static bool cabrillo_fd_callback(const std::string& dxcall, const std::string& their_exchange) {
-    printf(">>> Cabrillo FD log: %s exchange=%s\n",
-           dxcall.c_str(), their_exchange.c_str());
-    return true;
-}
-
 // ---------- Helpers ----------
 
 static const char* beacon_mode_str(BeaconMode m) {
@@ -67,7 +60,6 @@ int main(int argc, char* argv[]) {
     autoseq_init();
     autoseq_set_station(td.config.my_callsign, td.config.my_grid);
     autoseq_set_adif_callback(adif_callback);
-    autoseq_set_cabrillo_fd_callback(cabrillo_fd_callback);
     autoseq_set_max_retry(td.config.max_retry);
 
     // Configure CQ type from test config

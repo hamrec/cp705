@@ -112,16 +112,6 @@ struct StationConfig {
   std::string      time;           // "HH:MM:SS"
 };
 
-// One row from the live waterfall stream.
-struct WaterfallRow {
-  int                  sym;       // 0..92 within current 15s slot
-  const uint8_t*       mag;       // num_bins bytes; null during TX
-  int                  num_bins;  // matches config (~433 at 6 kHz, f_max=2900)
-  float                swr;       // stubbed 1.5 until real polling
-  float                pwr;       // stubbed 2.0 until real polling
-  bool                 ptt;       // true during TX (mag is null)
-};
-
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -162,12 +152,10 @@ void core_get_config(StationConfig& out);
 // ---------------------------------------------------------------------------
 
 using CoreChangeCb    = void (*)(void);
-using CoreWaterfallCb = void (*)(const WaterfallRow& row);
 
 void core_on_rx_changed    (CoreChangeCb cb);
 void core_on_qso_changed   (CoreChangeCb cb);
 void core_on_config_changed(CoreChangeCb cb);
-void core_on_waterfall_row (CoreWaterfallCb cb);
 
 // ---------------------------------------------------------------------------
 // Commands (mutations)

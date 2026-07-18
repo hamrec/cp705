@@ -6,8 +6,10 @@
 #include <functional>
 #include "ui.h"
 
-// Queue size: active + inactive entries.
-constexpr int AUTOSEQ_MAX_QUEUE = 30;
+// Queue size: active + inactive entries. Sized for casual single-op operation
+// (one QSO at a time, plus a running CQ/FreeText one-shot, plus a handful of
+// recently-parked late-RR73 signoffs) rather than contest pileups.
+constexpr int AUTOSEQ_MAX_QUEUE = 8;
 // Maximum retries before moving to inactive zone
 constexpr int AUTOSEQ_MAX_RETRY = 5;
 
@@ -64,9 +66,7 @@ struct QsoContext {
     int retry_counter = 0;
     int retry_limit = AUTOSEQ_MAX_RETRY;
     bool logged = false;    // Prevents duplicate ADIF logging
-    bool cabrillo_logged = false; // Prevents duplicate Field Day Cabrillo logging
     bool is_fd = false;
-    std::string fd_rx_exchange; // Last received FD exchange (for Cabrillo logging)
     // SIGNOFF handling:
     // true  -> after sending TX5, park context in inactive for possible late RR73
     // false -> after sending TX5, finish immediately (IDLE/pop)
@@ -150,25 +150,13 @@ void autoseq_mark_sent(int64_t slot_idx);
 // retries or re-emissions.
 void autoseq_on_tx_starting();
 
-// Copy the full active-zone QsoContext entries for structured consumers
-// (e.g. the core_api). Returns active contexts only; inactive
-// zone is not included. Thread-safe snapshot.
-void autoseq_get_active_contexts(std::vector<QsoContext>& out);
-
 // Non-allocating accessors for hot paths that can't tolerate
 // std::vector::reserve under heap fragmentation.
 int  autoseq_active_count();
 bool autoseq_get_active_context(int idx, QsoContext* out);
 
-// Check if there's any active QSO (not IDLE)
-bool autoseq_has_active_qso();
-
 // Set the ADIF logging callback
 void autoseq_set_adif_callback(AdifLogCallback cb);
-
-// Cabrillo Field Day callback type (for ARRL-FD logging)
-using CabrilloFdLogCallback = bool (*)(const std::string& dxcall, const std::string& their_fd_exchange);
-void autoseq_set_cabrillo_fd_callback(CabrilloFdLogCallback cb);
 
 // Configuration setters (called when station data changes)
 void autoseq_set_station(const std::string& call, const std::string& grid);

@@ -64,6 +64,8 @@ extern "C" {
 #include "external_rtc.h"
 
 #include "storage_service.h"
+#include "diag_log.h"
+#include "lazy_mutex_guard.h"
 #include <dirent.h>        // opendir/readdir (SD self-test)
 
 static const char* STATION_FILE = "Station.txt";
@@ -81,7 +83,6 @@ const ProtocolConfig* g_protocol = &kProtocolFT8;
 #endif
 
 int64_t rtc_now_ms();
-using CopyLogsResult = StorageCopyResult;
 
 static void debug_log_line(const std::string& msg);
 //exported symbol (linkable from other .cpp)
@@ -109,10 +110,6 @@ static bool storage_is_active_log_name(const std::string& name_or_path) {
   const std::string name = storage_basename(name_or_path);
   return name == today_qso_file_name() ||
          name == "fieldday.txt";
-}
-
-static CopyLogsResult copy_logs_to_sd_overwrite() {
-  return storage_copy_all_to_sd(today_qso_file_name());
 }
 
 // 128 entries × 16 bytes = 2 KB of BSS. 256 was the original size but
@@ -373,6 +370,10 @@ volatile bool g_qso_xmit = false;        // TX is pending
 volatile int g_target_slot_parity = 0;   // 0=even, 1=odd - parity of slot to TX on
 static volatile bool g_was_txing = false;       // We were transmitting (for tick timing)
 volatile bool g_decode_in_progress = false; // Block TX trigger while decoding
+// rtc_now_ms() at the start of the last TX that actually fired. Diagnostic
+// only -- read by the periodic CQHEALTH log to answer "g_cq_running is
+// true, but has anything actually transmitted recently?" directly.
+static volatile int64_t g_last_tx_fired_ms = 0;
 static int g_last_slot_parity = -1;             // For slot boundary detection (just parity, like reference)
 
 static volatile uint32_t g_perf_idle_count[2] = {0, 0};
@@ -443,8 +444,33 @@ extern volatile bool g_config_save_pending;
 // TX entry for display and scheduling (populated by autoseq)
 // Non-static for the same reason as g_qso_xmit / g_target_slot_parity
 // above — core_api.cpp's tap_rx RPC arms these on user-pick events.
+//
+// arm_pending_tx() writes these four globals from THREE different call
+// contexts: check_slot_boundary/the menu+tap handlers (core 0, main UI
+// loop), decode_monitor_results (core 1, the FT8 audio pipeline task), and
+// core_api.cpp's tap_rx RPC (a third caller, whichever task issues that
+// command). tx_start() and core_api.cpp's core_qso_get_next_tx() both used
+// to read g_pending_tx.text (a heap std::string) directly with no lock --
+// exactly the class of bug behind the reverted CQ-decode-guard race (see
+// autoseq.cpp's lock comment). g_pending_tx_lock + get_pending_tx_snapshot()
+// below are the fix: every writer takes the lock, every reader gets an
+// atomic copy instead of touching the globals directly.
 AutoseqTxEntry g_pending_tx;
 bool g_pending_tx_valid = false;
+static SemaphoreHandle_t g_pending_tx_lock = nullptr;
+
+struct PendingTxLockGuard : LazyMutexGuard {
+  PendingTxLockGuard() : LazyMutexGuard(g_pending_tx_lock) {}
+};
+
+// The only safe way to read g_pending_tx from any caller. Returns false (out
+// left untouched) if nothing valid is armed.
+bool get_pending_tx_snapshot(AutoseqTxEntry* out) {
+  PendingTxLockGuard guard;
+  if (!g_pending_tx_valid || g_pending_tx.text.empty()) return false;
+  *out = g_pending_tx;
+  return true;
+}
 
 // Forward declarations — definitions live near check_slot_boundary, where
 // g_offset_src has been declared.
@@ -478,7 +504,7 @@ static std::vector<std::string> g_host_help_lines = {
     "INFO/HELP/EXIT",
 };
 
-static const char* kAppVersion = "3.0.1";
+static const char* kAppVersion = "3.0.2";
 
 // Runtime latch: when true, we're still showing the startup screen. Either
 // a keypress or the 5 s auto-dismiss timer (g_startup_start_ms) takes us
@@ -575,8 +601,8 @@ static void apply_brightness() {
   M5.Display.setBrightness((uint8_t)(255 * pct / 10));
 }
 static std::string g_free_text = "TNX 73";
-std::string g_call = "";   // visible to core_api.cpp; set via MENU P1 / Station.txt
-std::string g_grid = "";    // visible to core_api.cpp; set via MENU P1 / Station.txt
+std::string g_call = "";   // visible to core_api.cpp; set via Station category / Station.txt
+std::string g_grid = "";    // visible to core_api.cpp; set via Station category / Station.txt
 static std::string g_grid_saved_manual = "";
 static bool g_grid_from_gps = false;
 static bool g_time_synced_from_gps = false;
@@ -706,9 +732,6 @@ bool storage_append_text_locked_path(const std::string& path,
                                             const std::string& line,
                                             const std::string& header_if_new,
                                             bool sync_to_flash);
-static bool storage_write_cabrillo_fd_entry(const std::string& mycall,
-                                             const std::string& location,
-                                             const std::string& qso_line);
 #if !MIC_PROBE_APP
 void log_heap(const char* tag) {
   size_t free_sz = heap_caps_get_free_size(MALLOC_CAP_8BIT);
@@ -716,89 +739,8 @@ void log_heap(const char* tag) {
   size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   ESP_LOGI(tag, "HEAP: free=%u min=%u largest=%u", (unsigned)free_sz, (unsigned)min_free, (unsigned)largest);
 }
-static void log_mem_caps(const char* tag) {
-  size_t free_8bit = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-  size_t largest_8bit = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-  size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-  size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
-  size_t largest_dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-  size_t min_8bit = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
-  ESP_LOGI(tag,
-           "MEM: 8bit_free=%u 8bit_largest=%u internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u 8bit_min=%u",
-           (unsigned)free_8bit,
-           (unsigned)largest_8bit,
-           (unsigned)free_internal,
-           (unsigned)largest_internal,
-           (unsigned)free_dma,
-           (unsigned)largest_dma,
-           (unsigned)min_8bit);
-}
-static std::string fd_trim(const std::string& s) {
-  size_t a = 0, b = s.size();
-  while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r' || s[a] == '\n')) ++a;
-  while (b > a && (s[b-1] == ' ' || s[b-1] == '\t' || s[b-1] == '\r' || s[b-1] == '\n')) --b;
-  return s.substr(a, b - a);
-}
-
-static std::string fd_strip_R(const std::string& s) {
-  std::string t = fd_trim(s);
-  if (t.size() >= 2 && t[0] == 'R' && t[1] == ' ') return fd_trim(t.substr(2));
-  return t;
-}
-
-static std::string fd_get_section_from_exchange(const std::string& ex) {
-  // ex: "1B SCV" (or "R 1B SCV")
-  std::string t = fd_strip_R(ex);
-  size_t sp = t.find(' ');
-  if (sp == std::string::npos) return "DX";
-  return fd_trim(t.substr(sp + 1));
-}
-
-// Called by autoseq when an FD QSO completes. We derive freq/time from current radio state
-// and use FreeText as our FD exchange (e.g. "1B SCV").
-static bool log_cabrillo_fd_entry(const std::string& dxcall, const std::string& their_fd_exchange) {
-  if (g_cq_type != CqType::CQFD) return true;
-
-  const std::string my_fd = fd_strip_R(g_free_text);
-  const std::string their_fd = fd_strip_R(their_fd_exchange);
-
-  if (my_fd.empty() || their_fd.empty() || dxcall.empty()) return false;
-
-  // Time (UTC assumed as RTC timebase, same as ADIF writer)
-  time_t now = (time_t)(rtc_now_ms() / 1000);
-  struct tm t;
-  localtime_r(&now, &t);
-
-  char date_ymd[16];
-  snprintf(date_ymd, sizeof(date_ymd), "%04d-%02d-%02d",
-           (t.tm_year + 1900) % 10000, (t.tm_mon + 1) % 100, t.tm_mday % 100);
-
-  char time_hhmm[8];
-  snprintf(time_hhmm, sizeof(time_hhmm), "%02d%02d", t.tm_hour % 100, t.tm_min % 100);
-
-  // Frequency: use selected band dial frequency (kHz); round float to nearest integer.
-  int freq_khz = (int)(g_bands[g_band_sel].freq + 0.5f);
-
-  std::string location = fd_get_section_from_exchange(my_fd);
-
-  char qso_line[128];
-  snprintf(qso_line, sizeof(qso_line), "QSO: %d DG %s %s %s %s %s %s",
-           freq_khz,
-           date_ymd,
-           time_hhmm,
-           g_call.c_str(),
-           my_fd.c_str(),
-           dxcall.c_str(),
-           their_fd.c_str());
-
-  return storage_write_cabrillo_fd_entry(g_call, location, qso_line);
-}
-
 #else
 static inline void log_heap(const char*) {}
-static inline void log_mem_caps(const char*) {}
-static bool log_cabrillo_fd_entry(const std::string&, const std::string&) { return true; }
 #endif
 
 bool storage_append_text_locked_path(const std::string& path,
@@ -806,19 +748,6 @@ bool storage_append_text_locked_path(const std::string& path,
                                              const std::string& header_if_new,
                                              bool sync_to_flash) {
   return storage_file_append(path, line, header_if_new, sync_to_flash);
-}
-
-static bool storage_write_cabrillo_fd_entry(const std::string& mycall,
-                                            const std::string& location,
-                                            const std::string& qso_line) {
-#if !MIC_PROBE_APP
-  return storage_file_append_cabrillo(mycall, location, qso_line);
-#else
-  (void)mycall;
-  (void)location;
-  (void)qso_line;
-  return true;
-#endif
 }
 
 static bool nvs_save_station(const std::string& content);  // defined below
@@ -1119,8 +1048,10 @@ static bool g_hero_locked = false;
 // once autoseq pops the finished entry out of the active queue.
 static QsoHeroInfo s_last_hero_info{};
 
-static void build_qso_hero_info(QsoHeroInfo& info) {
-  if (autoseq_active_count() == 0) {
+// has_active/ctx are a single pre-fetched snapshot from the caller (one
+// autoseq lock acquisition instead of this function taking its own).
+static void build_qso_hero_info(QsoHeroInfo& info, bool has_active, const QsoContext& ctx) {
+  if (!has_active) {
     info = s_last_hero_info;
     // g_qso_done_active means this is the exact context that just legitimately
     // ended (see check_slot_boundary()) -- either a real sign-off (show fully
@@ -1132,8 +1063,6 @@ static void build_qso_hero_info(QsoHeroInfo& info) {
     if (info.qso_done) info.stage = 6;
     return;
   }
-  QsoContext ctx{};
-  autoseq_get_active_context(0, &ctx);
   // autoseq_start_cq() enqueues a self-CQ one-shot with the literal
   // placeholder dxcall "CQ" (see enqueue_one_shot in autoseq.cpp) — that's
   // not a real worked station, so detect it by that placeholder rather than
@@ -1170,35 +1099,39 @@ static void build_qso_hero_info(QsoHeroInfo& info) {
 // Draws the decode list or the QSO hero card, whichever applies right now.
 // Call sites: the two g_rx_dirty-gated spots in the main loop.
 static void render_rx_or_hero() {
+  // Single snapshot for this whole call -- reused below instead of each of
+  // render_rx_or_hero()/build_qso_hero_info() re-querying autoseq under its
+  // own lock acquisition.
+  QsoContext active_ctx{};
+  const bool has_active = autoseq_get_active_context(0, &active_ctx);
   // Lock the hero card on as soon as a QSO/CQ goes active. Deliberately does
-  // NOT auto-clear when autoseq_active_count() drops back to 0 (QSO signed
+  // NOT auto-clear when it drops back to 0 (QSO signed
   // off and got popped) -- only the RX-mode '`' (ESC) handler clears the lock,
   // so the completed exchange stays on screen for review until dismissed.
-  if (autoseq_active_count() > 0) g_hero_locked = true;
+  if (has_active) g_hero_locked = true;
   const bool hero_now = g_hero_locked;
   if (hero_now != s_hero_was_active) {
     if (!hero_now) {
-      // Hero's status/clock row overlaps the waterfall + countdown bar's
-      // screen real estate (both live in the top ~21px), and neither of
-      // those get touched by ui_force_redraw_rx() (that only invalidates
-      // the decode list's own diff cache) -- so without a full clear here,
-      // stale hero pixels (e.g. "CALLING CQ" + the clock) linger at the top
-      // until fresh waterfall data happens to paint over them. The decode
-      // list, waterfall, and countdown bar all repaint themselves within
-      // the next tick or two via their existing dirty-tracked redraws.
+      // Hero's status/clock row overlaps the countdown bar's screen real
+      // estate (both live in the top few px), and that isn't touched by
+      // ui_force_redraw_rx() (that only invalidates the decode list's own
+      // diff cache) -- so without a full clear here, stale hero pixels
+      // (e.g. "CALLING CQ" + the clock) would linger at the top. The decode
+      // list and countdown bar both repaint themselves within the next
+      // tick or two via their existing dirty-tracked redraws.
       M5.Display.fillScreen(TFT_BLACK);
       ui_force_redraw_rx();
     } else {
-      // Entering the hero view: the decode list / waterfall were on screen,
-      // so force the first hero draw to be a full repaint (its diff cache is
-      // stale relative to what's actually on the glass).
+      // Entering the hero view: the decode list was on screen, so force the
+      // first hero draw to be a full repaint (its diff cache is stale
+      // relative to what's actually on the glass).
       ui_hero_invalidate();
     }
     s_hero_was_active = hero_now;
   }
   if (hero_now) {
     QsoHeroInfo info;
-    build_qso_hero_info(info);
+    build_qso_hero_info(info, has_active, active_ctx);
     ui_draw_qso_hero(info);
   } else {
     ui_draw_rx(rx_flash_idx);
@@ -1499,38 +1432,6 @@ static gps_pins_t gps_pins_for_current_source() {
 
 static const char* gps_source_name() {
   return "GNSS_LoRa";
-}
-
-static std::string normalize_date_ymd(const std::string& src) {
-  auto date_in_range = [](int y, int M, int d) -> bool {
-    return (y >= 2024 && y <= 2099 && M >= 1 && M <= 12 && d >= 1 && d <= 31);
-  };
-
-  int y = 0, M = 0, d = 0;
-  if (sscanf(src.c_str(), "%d-%d-%d", &y, &M, &d) == 3 && date_in_range(y, M, d)) {
-    char out[16];
-    snprintf(out, sizeof(out), "%04d-%02d-%02d", y, M, d);
-    return out;
-  }
-
-  std::string digits;
-  digits.reserve(src.size());
-  for (unsigned char ch : src) {
-    if (std::isdigit(ch)) digits.push_back((char)ch);
-  }
-  if (digits.size() >= 8) {
-    y = (digits[0] - '0') * 1000 + (digits[1] - '0') * 100 +
-        (digits[2] - '0') * 10 + (digits[3] - '0');
-    M = (digits[4] - '0') * 10 + (digits[5] - '0');
-    d = (digits[6] - '0') * 10 + (digits[7] - '0');
-    if (date_in_range(y, M, d)) {
-      char out[16];
-      snprintf(out, sizeof(out), "%04d-%02d-%02d", y, M, d);
-      return out;
-    }
-  }
-
-  return "";
 }
 
 static std::string normalize_grid_maidenhead(const std::string& src) {
@@ -1992,7 +1893,7 @@ static bool rx_redraw_should_hold() {
 }
 
 // Forward declarations for single-threaded TX state machine
-static void tx_start(int skip_tones);
+static void tx_start(int skip_tones, const std::string& tx_text, int tx_offset_hz);
 static void tx_tick();
 
 // Slot boundary check - called from main loop
@@ -2001,9 +1902,9 @@ static void tx_tick();
 // configured g_offset_src and the autoseq pending entry. Storing the
 // resolved value at scheduling time (rather than at the slot boundary,
 // as the firmware used to do) means UI consumers reading core_get_qso see
-// the same number that will actually go on air — important for the
-// waterfall offset marker, especially in RANDOM / beacon-CQ modes where
-// the random was previously rolled inside check_slot_boundary.
+// the same number that will actually go on air, especially in RANDOM /
+// beacon-CQ modes where the random was previously rolled inside
+// check_slot_boundary.
 static int resolve_tx_offset(const AutoseqTxEntry& e) {
   if (g_offset_src == OffsetSrc::CURSOR) {
     return g_offset_hz;
@@ -2023,6 +1924,7 @@ static int resolve_tx_offset(const AutoseqTxEntry& e) {
 // block that used to be repeated at every scheduling site (autoseq tick,
 // beacon-on, free-text queue, and RX selection).
 void arm_pending_tx(const AutoseqTxEntry& pending) {
+  PendingTxLockGuard guard;
   g_qso_xmit           = true;
   g_target_slot_parity = pending.slot_id & 1;
   g_pending_tx         = pending;
@@ -2109,19 +2011,24 @@ static void check_slot_boundary() {
   const bool window_ok = (slot_ms < (g_protocol->slot_time_ms * 4 / 15));
   const bool decode_ok = (g_decode_applied_slot_idx >= slot_idx - 2);
 
-  // !g_decode_in_progress is LOAD-BEARING CROSS-CORE SYNCHRONIZATION, not just
-  // a data-freshness check. decode_monitor_results (core 1) ends with a block
-  // that mutates autoseq state and writes g_pending_tx (std::strings, heap) via
-  // arm_pending_tx; the fire path below (and tx_start) reads g_pending_tx and
-  // mutates autoseq from core 0. Neither side takes a lock -- the ONLY thing
-  // keeping the two cores out of each other's way is that TX never fires while
-  // the decode is running. A "CQ doesn't need decode results" exemption was
-  // tried here (v3.0, reverted same night): functionally reasonable, but it let
-  // tx_start run concurrently with the decode tail AND read g_pending_tx.text
-  // ungated at ~100Hz -- torn std::strings and corrupted autoseq state on a
-  // no-PSRAM board (crashes/stalls that presented as WiFi drops and armed-but-
-  // never-firing TX). Do not exempt ANY path from this guard without first
-  // putting a real mutex around autoseq + g_pending_tx.
+  // !g_decode_in_progress: autoseq and g_pending_tx are NOW properly locked
+  // (autoseq.cpp's AutoseqLockGuard, main.cpp's PendingTxLockGuard/
+  // get_pending_tx_snapshot()) -- so this is no longer covering for a total
+  // absence of synchronization the way it used to. It stays here for a
+  // logical reason instead: firing TX while a decode is still in flight risks
+  // acting on STALE autoseq state (e.g. sending a report we've already been
+  // RR73'd for, because the decode holding that RR73 hasn't finished
+  // updating autoseq yet) -- a correctness question the lock doesn't answer,
+  // since the lock only guarantees a clean read, not a fresh one. A "CQ
+  // doesn't need decode results" exemption was tried here (v3.0, reverted
+  // same night): CQ genuinely doesn't have this staleness problem (it's a
+  // fixed, self-originated message), but the exemption was implemented
+  // BEFORE this locking existed, so it also removed the only synchronization
+  // g_pending_tx had at the time -- torn std::strings and corrupted autoseq
+  // state on a no-PSRAM board (crashes/stalls that presented as WiFi drops
+  // and armed-but-never-firing TX). Re-attempting a CQ exemption on top of
+  // the lock added here is plausible future work, deliberately not done in
+  // this pass -- ship the safety fix on its own first.
   if (g_qso_xmit &&
       parity_ok &&
       window_ok &&
@@ -2136,15 +2043,17 @@ static void check_slot_boundary() {
     const int sym_ms = (int)roundf(g_protocol->symbol_period * 1000.0f);
     int skip_tones = slot_ms / sym_ms;
     if (skip_tones < g_protocol->total_symbols) {
-      // Only proceed if we have a valid pending TX
-      // NOTE: Don't clear g_qso_xmit until we're sure g_pending_tx is valid.
-      // This avoids a race condition where decode_monitor_results is still
-      // writing g_pending_tx on core 1 while we read it on core 0.
-      if (g_pending_tx_valid && !g_pending_tx.text.empty()) {
+      // Only proceed if we have a valid pending TX. get_pending_tx_snapshot()
+      // takes g_pending_tx_lock and returns an atomic copy -- this used to be
+      // a bare read of g_pending_tx (a heap std::string) with no lock at all,
+      // "protected" only by decode_in_progress timing avoidance above. See
+      // g_pending_tx_lock's comment.
+      AutoseqTxEntry pending_snapshot;
+      if (get_pending_tx_snapshot(&pending_snapshot)) {
         g_qso_xmit = false;  // Clear flag only AFTER validation succeeds
         g_was_txing = true;  // Set IMMEDIATELY when TX starts (prevents decode_monitor_results from re-setting flags)
 
-        tx_start(skip_tones);
+        tx_start(skip_tones, pending_snapshot.text, pending_snapshot.offset_hz);
       }
     }
   } else if (g_qso_xmit) {
@@ -2161,6 +2070,22 @@ static void check_slot_boundary() {
                (int)parity_ok, g_target_slot_parity, slot_parity,
                (int)window_ok, slot_ms, (int)g_tx_active, (int)g_decode_in_progress,
                (int)decode_ok, (long long)g_decode_applied_slot_idx, (long long)slot_idx);
+    }
+    // Same trace, throttled to 30s and written to the SD log -- the ESP_LOGW
+    // above is console-only (no serial monitor in the normal workflow), so a
+    // stall like this was invisible outside a lab bench. See CQHEALTH's
+    // qsoXmit field: if that shows stuck at 1, this line says which guard.
+    static int64_t s_last_xmit_stall_sd_ms = 0;
+    if (diag_log_due(&s_last_xmit_stall_sd_ms, now_ms, 30000)) {
+      char xbuf[200];
+      snprintf(xbuf, sizeof(xbuf),
+               "TXSTALL up=%lld.%03llds parity_ok=%d(target=%d,slot=%d) window_ok=%d(slot_ms=%d) "
+               "decode_in_progress=%d decode_ok=%d(applied=%lld,slot_idx=%lld)\n",
+               (long long)(now_ms / 1000), (long long)(now_ms % 1000),
+               (int)parity_ok, g_target_slot_parity, slot_parity,
+               (int)window_ok, slot_ms, (int)g_decode_in_progress,
+               (int)decode_ok, (long long)g_decode_applied_slot_idx, (long long)slot_idx);
+      storage_sd_log_append(kDiagLogFile, xbuf);
     }
   }
 }
@@ -2354,38 +2279,6 @@ static void advance_active_band(int delta) {
   clear_decode_list();
 }
 
-static int tx_waterfall_hz_to_x(float tone_hz) {
-  constexpr int kScreenW = 240;
-  constexpr float kMinHz = 200.0f;
-  constexpr float kMaxHz = 3000.0f;
-  int x = (int)lrintf((tone_hz - kMinHz) * (float)(kScreenW - 1) / (kMaxHz - kMinHz));
-  if (x < 0) x = 0;
-  if (x >= kScreenW) x = kScreenW - 1;
-  return x;
-}
-
-static void tx_waterfall_set_max(std::array<uint8_t, 240>& row, int x, uint8_t value) {
-  if (x < 0 || x >= (int)row.size()) return;
-  if (row[(size_t)x] < value) row[(size_t)x] = value;
-}
-
-static void fft_waterfall_tx_tone(float tone_hz) {
-  std::array<uint8_t, 240> row{};
-  static uint8_t noise_phase = 0;
-  for (size_t i = 0; i < row.size(); ++i) {
-    row[i] = (uint8_t)(2 + ((i * 17 + noise_phase) & 0x03));
-  }
-  noise_phase += 29;
-
-  const int pos = tx_waterfall_hz_to_x(tone_hz);
-  tx_waterfall_set_max(row, pos - 2, 50);
-  tx_waterfall_set_max(row, pos - 1, 120);
-  tx_waterfall_set_max(row, pos, 230);
-  tx_waterfall_set_max(row, pos + 1, 120);
-  tx_waterfall_set_max(row, pos + 2, 50);
-  ui_push_tx_waterfall_row(row.data(), (int)row.size());
-}
-
 [[maybe_unused]] static bool is_grid4(const std::string& s) {
   if (s.size() != 4) return false;
   auto is_letter = [](char c){ return c >= 'A' && c <= 'R'; };
@@ -2528,6 +2421,38 @@ static void clear_decode_list() {
   ui_set_rx_list_static(s_dec, 0);
 }
 
+// Attempts to arm the next pending TX: an existing autoseq-queued entry (a
+// QSO reply) or, if none and a beacon CQ is running, a fresh self-CQ. This
+// has no dependency on this cycle having found any decode candidates -- it
+// only reads autoseq's existing queue state / g_cq_running -- so it must run
+// on EVERY decode cycle, including a quiet one with zero candidates.
+//
+// On-air stall traced 2026-07-17: this call used to live only in the
+// "candidates found" path below. A running CQ beacon would silently and
+// permanently stop re-arming itself the first time a slot came up with zero
+// candidates (an ordinary quiet slot, not a fault) -- decode_monitor_results
+// still returned early from the num_candidates<=0 branch further up,
+// updating g_decode_applied_slot_idx and clearing g_decode_in_progress (so
+// nothing else looked stuck), but skipping this block entirely forever
+// after. CQHEALTH showed exactly that: cqRunning=1, queueCount/wasTxing/
+// qsoXmit stuck at 0, decodeSlotsBehind staying low the whole time.
+static void try_arm_next_tx() {
+  AutoseqTxEntry pending;
+  if (autoseq_fetch_pending_tx(pending)) {
+    arm_pending_tx(pending);
+    ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
+  } else if (g_cq_running) {
+    // Calling CQ is the beacon trigger now: keep re-issuing the same CQ
+    // every cycle the queue is idle (unanswered CQ, or a finished QSO)
+    // until the user answers someone else or presses ESC.
+    enqueue_running_cq();
+    if (autoseq_fetch_pending_tx(pending)) {
+      arm_pending_tx(pending);
+      ESP_LOGI(TAG, "Running CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
+    }
+  }
+}
+
 void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool update_ui) {
   // The decode list persists across cycles (Dean: don't blank it away between
   // cycles on a quiet band -- keep everything, newest at top; repeats from
@@ -2617,6 +2542,10 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
     if (g_decode_slot_idx > g_decode_applied_slot_idx) {
       g_decode_applied_slot_idx = g_decode_slot_idx;
     }
+    // A quiet slot has nothing to feed autoseq_on_decodes(), but a pending
+    // reply or running CQ beacon still needs to be (re)armed -- see
+    // try_arm_next_tx()'s comment for the stall this fixes.
+    if (!g_was_txing) try_arm_next_tx();
     g_decode_in_progress = false;
     return;
   }
@@ -2835,20 +2764,7 @@ void decode_monitor_results(monitor_t* mon, const monitor_config_t* cfg, bool up
       g_last_reply_text = to_me_auto.front().text;
     }
 
-    AutoseqTxEntry pending;
-    if (autoseq_fetch_pending_tx(pending)) {
-      arm_pending_tx(pending);
-      ESP_LOGI(TAG, "TX ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
-    } else if (g_cq_running) {
-      // Calling CQ is the beacon trigger now: keep re-issuing the same CQ
-      // every cycle the queue is idle (unanswered CQ, or a finished QSO)
-      // until the user answers someone else or presses ESC.
-      enqueue_running_cq();
-      if (autoseq_fetch_pending_tx(pending)) {
-        arm_pending_tx(pending);
-        ESP_LOGI(TAG, "Running CQ ready: %s parity=%d", pending.text.c_str(), g_target_slot_parity);
-      }
-    }
+    try_arm_next_tx();
   }
 
   // ---- Zero-heap handoff: static s_dec[] → ui.cpp's static rx_lines[] ----
@@ -2935,26 +2851,6 @@ static void enqueue_running_cq() {
   core_fire_qso_changed();  // propagates to all registered consumers
 }
 
-static bool autoseq_has_pending_tx() {
-  AutoseqTxEntry tmp;
-  return autoseq_fetch_pending_tx(tmp);
-}
-
-// Schedule a one-off pending TX (e.g., manual FreeText) without touching autoseq state.
-// Returns false if TX is already active or if scheduling failed.
-// Uses the single-threaded state machine - TX will trigger at next matching slot boundary.
-static bool schedule_manual_pending_tx(const AutoseqTxEntry& pending) {
-  // Already transmitting or TX pending?
-  if (g_tx_active || g_qso_xmit) {
-    return false;
-  }
-
-  arm_pending_tx(pending);
-  ESP_LOGI(TAG, "schedule_manual_pending_tx: queued TX=%s for parity=%d",
-           pending.text.c_str(), g_target_slot_parity);
-  return true;
-}
-
 // NOTE: This function is now mostly superseded by the state machine approach.
 // TX scheduling is done via g_qso_xmit and g_target_slot_parity flags,
 // and check_slot_boundary() triggers TX at the right time.
@@ -2977,19 +2873,26 @@ static void tx_send_ta(float tone_hz) {
 }
 
 // Start TX (single-threaded state machine initialization)
-// Called from check_slot_boundary at the right time
-// Uses g_pending_tx which was prepared by check_slot_boundary with correct offset
-static void tx_start(int skip_tones) {
+// Called from check_slot_boundary at the right time. tx_text/tx_offset_hz
+// are a snapshot check_slot_boundary already took under g_pending_tx_lock
+// (see get_pending_tx_snapshot()) -- tx_start() itself never touches
+// g_pending_tx directly, so it has no need to take that lock at all.
+static void tx_start(int skip_tones, const std::string& tx_text, int tx_offset_hz) {
   // Already transmitting?
   if (g_tx_active) {
     return;
   }
 
-  // Use g_pending_tx which was prepared by check_slot_boundary
-  if (!g_pending_tx_valid || g_pending_tx.text.empty()) {
+  if (tx_text.empty()) {
     ESP_LOGW(TAG, "tx_start: no pending TX");
     return;
   }
+
+  // Timestamp of the last TX that actually started -- read by the periodic
+  // CQHEALTH diagnostic below to answer "g_cq_running is true, but has
+  // anything actually fired lately?" directly, instead of inferring a stall
+  // from an absence of TXDONE lines in a different log stream.
+  g_last_tx_fired_ms = rtc_now_ms();
 
   // Blank the countdown bar now, before any audio/CAT setup below -- once TX
   // is actually underway, redraws are held (SPI/DMA contention with the
@@ -3005,7 +2908,7 @@ static void tx_start(int skip_tones) {
   g_tx_slot_idx = now_ms / slot_period;
 
   ESP_LOGI(TAG, "tx_start: TX=%s offset=%d skip=%d slot=%lld proto=%s",
-           g_pending_tx.text.c_str(), g_pending_tx.offset_hz, skip_tones, (long long)g_tx_slot_idx,
+           tx_text.c_str(), tx_offset_hz, skip_tones, (long long)g_tx_slot_idx,
            g_protocol->name);
 
   // Notify autoseq that TX emission is starting. This is the single canonical
@@ -3015,7 +2918,7 @@ static void tx_start(int skip_tones) {
 
   // Encode message to tones
   ftx_message_t msg;
-  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, g_pending_tx.text.c_str());
+  ftx_message_rc_t rc = ftx_message_encode(&msg, &hash_if, tx_text.c_str());
   if (rc != FTX_MESSAGE_RC_OK) {
     ESP_LOGE(TAG, "Encode failed for TX");
     return;
@@ -3030,7 +2933,7 @@ static void tx_start(int skip_tones) {
   // IMPORTANT: Tone timing must be based on slot boundary, not TX start time.
   // This ensures TX ends at the correct time even if TX started late,
   // allowing RX to start cleanly at the next slot boundary.
-  g_tx_base_hz = g_pending_tx.offset_hz;
+  g_tx_base_hz = tx_offset_hz;
   g_tx_slot_start_ms = (now_ms / slot_period) * slot_period;  // Slot boundary time
   g_tx_tone_idx = (skip_tones >= g_protocol->total_symbols) ? g_protocol->total_symbols : skip_tones;
   // Next tone time = slot_start + tone_idx * symbol_period_ms
@@ -3040,7 +2943,7 @@ static void tx_start(int skip_tones) {
   g_tx_last_ta_int = -1;
   g_tx_last_ta_frac = -1;
 
-  ESP_LOGI(TAG, "TX base_hz=%d (from pre-computed offset, text=%s)", g_tx_base_hz, g_pending_tx.text.c_str());
+  ESP_LOGI(TAG, "TX base_hz=%d (from pre-computed offset, text=%s)", g_tx_base_hz, tx_text.c_str());
 
   // Send CAT setup commands
   g_tx_cat_ok = radio_control_ready();
@@ -3084,7 +2987,6 @@ static void tx_start(int skip_tones) {
   // Mark TX as active. FT8 is half-duplex and this device has no use for
   // RX decode while transmitting (that's only useful feeding a logger on a
   // PC) — pause the decoder so it can't contend with the TX path at all.
-  ui_set_rx_waterfall_muted(true);
   g_tx_active = true;
   g_decode_enabled = false;
 }
@@ -3104,7 +3006,6 @@ static void tx_tick() {
     if (g_tx_cat_ok) {
       radio_control_end_tx();
     }
-    ui_set_rx_waterfall_muted(false);
     g_tx_active = false;
     g_decode_enabled = true;
     g_pending_tx_valid = false;
@@ -3125,7 +3026,6 @@ static void tx_tick() {
     if (g_tx_cat_ok) {
       radio_control_end_tx();
     }
-    ui_set_rx_waterfall_muted(false);
     // Record slot index for spacing and notify autoseq
     s_last_tx_slot_idx = g_tx_slot_idx;
     autoseq_mark_sent(g_tx_slot_idx);
@@ -3139,10 +3039,9 @@ static void tx_tick() {
     return;
   }
 
-  // Send current tone to the local visualizer and selected radio backend.
+  // Send current tone to the radio backend.
   ESP_LOGD("TXTONE", "%02d %u", g_tx_tone_idx, (unsigned)g_tx_tones[g_tx_tone_idx]);
   float tone_hz = g_tx_base_hz + g_protocol->tone_spacing * g_tx_tones[g_tx_tone_idx];
-  fft_waterfall_tx_tone(tone_hz);
   if (g_tx_cat_ok) {
     tx_send_ta(tone_hz);
   }
@@ -4557,7 +4456,6 @@ static void app_task_core0(void* /*param*/) {
   core_on_config_changed([]{ g_rx_dirty = true; });
   
 autoseq_set_adif_callback(log_adif_entry);
-autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
 
 
   ui_mode = UIMode::RX;
@@ -4667,7 +4565,7 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    storage_sd_log_append("IC705DBG.txt", buf);
+    storage_sd_log_append(kDiagLogFile, buf);
   }
 
   // UI loop
@@ -4733,6 +4631,37 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         draw_perf_view(false);
       }
     }
+    // DIAGNOSTIC: CQ/decode health every 30s, persisted to the SD card.
+    // Companion to ic705_netctrl.cpp's HEAPTREND/audioSilentSec -- that side
+    // showed a beacon CQ can silently stop firing when the audio pipeline
+    // stalls (a running CQ is only ever re-armed from inside
+    // decode_monitor_results, which only runs once the pipeline has
+    // accumulated a full slot's worth of RX audio). This proves that chain
+    // directly instead of inferring it from an absence of TXDONE lines:
+    // cqRunning + secSinceLastTxFired together show "CQ is supposed to be
+    // running, but nothing has fired in Ns"; decodeSlotsBehind (current slot
+    // minus the last slot decode actually applied) shows whether decode
+    // itself has stalled, and by how much, independent of TX entirely.
+    static int64_t s_last_cq_health_log_ms = 0;
+    const int64_t now_ms_health = rtc_now_ms();
+    if (diag_log_due(&s_last_cq_health_log_ms, now_ms_health, 30000)) {
+      const int64_t cur_slot = now_ms_health / g_protocol->slot_time_ms;
+      const int64_t last_fire_ms = g_last_tx_fired_ms;
+      const double sec_since_tx = (last_fire_ms == 0) ? -1.0
+          : (double)(now_ms_health - last_fire_ms) / 1000.0;
+      const int active_count = autoseq_active_count();
+      char cbuf[240];
+      snprintf(cbuf, sizeof(cbuf),
+               "CQHEALTH up=%lld.%03llds cqRunning=%d secSinceLastTxFired=%.1f "
+               "decodeSlotsBehind=%lld qsoActive=%d queueCount=%d "
+               "wasTxing=%d qsoXmit=%d txActive=%d\n",
+               (long long)(now_ms_health / 1000), (long long)(now_ms_health % 1000),
+               (int)g_cq_running, sec_since_tx,
+               (long long)(cur_slot - g_decode_applied_slot_idx),
+               (int)(active_count > 0), active_count,
+               (int)g_was_txing, (int)g_qso_xmit, (int)g_tx_active);
+      storage_sd_log_append(kDiagLogFile, cbuf);
+    }
     // Startup splash: show briefly, then land on STATUS by default. Radio
     // connection is explicit through STATUS -> 2; direct-mode keys still
     // work immediately.
@@ -4747,10 +4676,10 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         save_station_data();
         // The splash paints its own full-screen graphic (red/blue Icom bars,
         // title). Nothing else on exit does a full clear -- STATUS's own
-        // draw only touches rows below UI_START_Y, and the top waterfall/
-        // countdown strip is normally kept fresh by the running RX loop,
-        // which hasn't executed yet here -- so blank once at the real exit
-        // point, before any subsequent mode (STATUS or a direct-mode key) draws.
+        // draw only touches rows below UI_START_Y, and the top countdown
+        // strip is normally kept fresh by the running RX loop, which hasn't
+        // executed yet here -- so blank once at the real exit point, before
+        // any subsequent mode (STATUS or a direct-mode key) draws.
         M5.Display.fillScreen(TFT_BLACK);
         if (!direct_mode_entry) {
           // Non-mode key: dismiss, land on STATUS, consume the key.
@@ -4842,10 +4771,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
           render_rx_or_hero();
           g_rx_dirty = false;
         }
-        // Waterfall stays off the hero card entirely (Dean's preference) --
-        // the timer/countdown bar (update_countdown(), unaffected here) is
-        // still shown there.
-        if (!(ui_mode == UIMode::RX && g_hero_locked)) ui_draw_waterfall_if_dirty();
         menu_flash_tick();
         rx_flash_tick();
         qso_clear_tick();
@@ -4860,7 +4785,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
     // No new keypress - still need to refresh dirty views
     // NOTE: running-CQ re-scheduling lives in decode_monitor_results()
     if (!(g_tx_active || g_tune)) {
-      if (!(ui_mode == UIMode::RX && g_hero_locked)) ui_draw_waterfall_if_dirty();
       refresh_status_view_if_dirty();
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -4890,7 +4814,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
   // Ensure decode is enabled whenever streaming becomes active.
   if (audio_source_is_streaming() && !g_decode_enabled) {
     g_decode_enabled = true;
-    ui_set_paused(false);
   }
 
   // Same TX/tune hold as the c==0 idle branch above -- a keypress landing
@@ -4902,7 +4825,6 @@ autoseq_set_cabrillo_fd_callback(log_cabrillo_fd_entry);
         render_rx_or_hero();
         g_rx_dirty = false;
     }
-    if (!(ui_mode == UIMode::RX && g_hero_locked)) ui_draw_waterfall_if_dirty();
   }
 
   bool switched = false;

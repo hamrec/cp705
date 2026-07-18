@@ -55,7 +55,6 @@ SemaphoreHandle_t s_mutex;
 StorageOwner s_owner = StorageOwner::UNAVAILABLE;
 wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
 tinyusb_msc_storage_handle_t s_msc_storage;
-bool s_tinyusb_installed;
 size_t s_open_streams;
 bool s_station_sync_attempted;
 sdmmc_card_t* s_sd_card;
@@ -295,7 +294,7 @@ esp_err_t storage_sd_log_premount() {
     return err;
 }
 
-bool storage_sd_log_append(const std::string& name, const std::string& content) {
+static bool storage_sd_log_append_impl(const std::string& name, const char* content, size_t content_len) {
     StorageGuard guard;
     if (!guard.held()) { g_storage_sd_log_last_code = 1; return false; }
     // mount_sd_locked() is a fast no-op once already mounted, so repeated
@@ -309,14 +308,22 @@ bool storage_sd_log_append(const std::string& name, const std::string& content) 
     const std::string path = std::string(kSdBasePath) + "/" + name;
     FILE* f = fopen(path.c_str(), "a");
     if (!f) { g_storage_sd_log_last_code = -1 - errno; return false; }
-    const size_t written = fwrite(content.data(), 1, content.size(), f);
+    const size_t written = fwrite(content, 1, content_len, f);
     // Force the data AND the FAT/directory update to the physical card now, so
     // the record survives the card being pulled without a clean unmount.
     sync_file(f);
     fclose(f);
-    if (written != content.size()) { g_storage_sd_log_last_code = -2; return false; }
+    if (written != content_len) { g_storage_sd_log_last_code = -2; return false; }
     g_storage_sd_log_last_code = 0;
     return true;
+}
+
+bool storage_sd_log_append(const std::string& name, const std::string& content) {
+    return storage_sd_log_append_impl(name, content.data(), content.size());
+}
+
+bool storage_sd_log_append(const char* name, const char* content) {
+    return storage_sd_log_append_impl(name, content, strlen(content));
 }
 
 bool storage_sd_append_with_header(const std::string& name,
@@ -347,17 +354,6 @@ bool storage_sd_append_with_header(const std::string& name,
     fclose(f);
     g_storage_sd_log_last_code = ok ? 0 : -2;
     return ok;
-}
-
-bool storage_sd_space(uint64_t* total_bytes, uint64_t* free_bytes) {
-    StorageGuard guard;
-    if (!guard.held()) return false;
-    if (mount_sd_locked() != ESP_OK) return false;
-    uint64_t total = 0, freeb = 0;
-    if (esp_vfs_fat_info(kSdBasePath, &total, &freeb) != ESP_OK) return false;
-    if (total_bytes) *total_bytes = total;
-    if (free_bytes) *free_bytes = freeb;
-    return true;
 }
 
 bool storage_sd_read_file(const std::string& name, std::string& out) {
@@ -409,125 +405,6 @@ bool storage_sd_write_file(const std::string& name, const std::string& content) 
 
 namespace {
 
-esp_err_t copy_file_locked(const std::string& source, const std::string& destination) {
-    FILE* input = fopen(source.c_str(), "rb");
-    if (!input) {
-        return ESP_FAIL;
-    }
-    FILE* output = fopen(destination.c_str(), "wb");
-    if (!output) {
-        fclose(input);
-        return ESP_FAIL;
-    }
-
-    uint8_t buffer[4096];
-    bool ok = true;
-    while (true) {
-        const size_t count = fread(buffer, 1, sizeof(buffer), input);
-        if (count > 0 && fwrite(buffer, 1, count, output) != count) {
-            ok = false;
-            break;
-        }
-        if (count < sizeof(buffer)) {
-            if (ferror(input)) {
-                ok = false;
-            }
-            break;
-        }
-    }
-    ok = ok && sync_file(output);
-    if (fclose(output) != 0) {
-        ok = false;
-    }
-    fclose(input);
-    return ok ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t copy_file_retry_locked(const std::string& source,
-                                 const std::string& destination,
-                                 int attempts = 5) {
-    esp_err_t result = ESP_FAIL;
-    for (int attempt = 0; attempt < attempts; ++attempt) {
-        result = copy_file_locked(source, destination);
-        if (result == ESP_OK) {
-            break;
-        }
-        if (attempt + 1 < attempts) {
-            vTaskDelay(pdMS_TO_TICKS(80));
-        }
-    }
-    return result;
-}
-
-bool cabrillo_ensure_header_locked(const std::string& path,
-                                   const std::string& mycall,
-                                   const std::string& location) {
-    struct stat info {};
-    if (stat(path.c_str(), &info) == 0 && info.st_size > 0) {
-        return true;
-    }
-
-    FILE* file = fopen(path.c_str(), "wb");
-    if (!file) {
-        return false;
-    }
-    bool ok = fprintf(file, "START-OF-LOG: 3.0\n") >= 0;
-    ok = ok && fprintf(file, "CREATED-BY: CP705\n") >= 0;
-    ok = ok && fprintf(file, "CONTEST: ARRL-FIELD-DAY\n") >= 0;
-    ok = ok && fprintf(file, "CALLSIGN: %s\n", mycall.c_str()) >= 0;
-    ok = ok && fprintf(file, "CATEGORY-OPERATOR: SINGLE-OP\n") >= 0;
-    ok = ok && fprintf(file, "CATEGORY-TRANSMITTER: ONE\n") >= 0;
-    ok = ok && fprintf(file, "CATEGORY-ASSISTED: NON-ASSISTED\n") >= 0;
-    ok = ok && fprintf(file, "CATEGORY-BAND: ALL\n") >= 0;
-    ok = ok && fprintf(file, "CATEGORY-MODE: MIXED\n") >= 0;
-    ok = ok && fprintf(file, "CATEGORY-POWER: LOW\n") >= 0;
-    ok = ok && fprintf(file, "CATEGORY-STATION: PORTABLE\n") >= 0;
-    ok = ok && fprintf(file, "LOCATION: %s\n", location.c_str()) >= 0;
-    ok = ok && fprintf(file, "OPERATORS: %s\n", mycall.c_str()) >= 0;
-    ok = ok && fprintf(file, "END-OF-LOG:\n") >= 0;
-    ok = ok && sync_file(file);
-    if (fclose(file) != 0) {
-        ok = false;
-    }
-    return ok;
-}
-
-bool cabrillo_truncate_end_marker(FILE* file) {
-    if (!file || fseek(file, 0, SEEK_END) != 0) {
-        return false;
-    }
-    const long file_end = ftell(file);
-    if (file_end <= 0) {
-        return false;
-    }
-
-    constexpr long kMaxTail = 256;
-    const long tail_start = file_end > kMaxTail ? file_end - kMaxTail : 0;
-    if (fseek(file, tail_start, SEEK_SET) != 0) {
-        return false;
-    }
-
-    std::string tail(static_cast<size_t>(file_end - tail_start), '\0');
-    tail.resize(fread(tail.data(), 1, tail.size(), file));
-    size_t line_end = tail.size();
-    while (line_end > 0 && (tail[line_end - 1] == '\n' || tail[line_end - 1] == '\r')) {
-        --line_end;
-    }
-    if (line_end == 0) {
-        return false;
-    }
-    size_t line_start = tail.rfind('\n', line_end - 1);
-    line_start = line_start == std::string::npos ? 0 : line_start + 1;
-    if (tail.substr(line_start, line_end - line_start) != "END-OF-LOG:") {
-        return false;
-    }
-
-    const int descriptor = fileno(file);
-    const long truncate_at = tail_start + static_cast<long>(line_start);
-    return descriptor >= 0 && ftruncate(descriptor, truncate_at) == 0 &&
-           fseek(file, 0, SEEK_END) == 0;
-}
-
 void storage_event_callback(tinyusb_msc_storage_handle_t,
                             tinyusb_msc_event_t* event,
                             void*) {
@@ -550,23 +427,6 @@ void storage_event_callback(tinyusb_msc_storage_handle_t,
             break;
     }
     ESP_LOGI(TAG, "MSC storage event=%d mount=%d", event->id, event->mount_point);
-}
-
-esp_err_t set_storage_mount_point_locked(tinyusb_msc_mount_point_t mount_point) {
-    s_mount_transition_result = MountTransitionResult::NONE;
-    s_mount_transition_point = mount_point;
-
-    const esp_err_t err = tinyusb_msc_set_storage_mount_point(s_msc_storage, mount_point);
-    if (err != ESP_OK) {
-        return err;
-    }
-    if (s_mount_transition_result != MountTransitionResult::COMPLETE ||
-        s_mount_transition_point != mount_point) {
-        ESP_LOGE(TAG, "FATFS ownership transition to mount=%d was not confirmed",
-                 mount_point);
-        return ESP_FAIL;
-    }
-    return ESP_OK;
 }
 
 }  // namespace
@@ -639,101 +499,9 @@ esp_err_t storage_service_init() {
     return ESP_OK;
 }
 
-StorageOwner storage_service_owner() {
-    StorageGuard guard;
-    return guard.held() ? s_owner : StorageOwner::UNAVAILABLE;
-}
-
 bool storage_service_firmware_available() {
     StorageGuard guard;
     return guard.held() && firmware_owns_storage_locked();
-}
-
-bool storage_service_usb_drive_enabled() {
-    StorageGuard guard;
-    return guard.held() && s_owner == StorageOwner::USB_HOST;
-}
-
-size_t storage_service_open_stream_count() {
-    StorageGuard guard;
-    return guard.held() ? s_open_streams : 0;
-}
-
-esp_err_t storage_service_set_usb_drive_enabled(bool enabled) {
-    StorageGuard guard;
-    if (!guard.held() || !s_msc_storage) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (enabled) {
-        if (s_owner == StorageOwner::USB_HOST) {
-            return ESP_OK;
-        }
-        if (s_owner != StorageOwner::FIRMWARE) {
-            return ESP_ERR_INVALID_STATE;
-        }
-        if (s_open_streams != 0) {
-            ESP_LOGW(TAG, "USB Drive blocked by %u open storage stream(s)",
-                     static_cast<unsigned>(s_open_streams));
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        s_owner = StorageOwner::TRANSITION;
-        esp_err_t err = set_storage_mount_point_locked(TINYUSB_MSC_STORAGE_MOUNT_USB);
-        if (err != ESP_OK) {
-            s_owner = s_mount_transition_result == MountTransitionResult::NONE
-                          ? StorageOwner::FIRMWARE
-                          : StorageOwner::UNAVAILABLE;
-            return err;
-        }
-
-        const tinyusb_config_t tinyusb_config = TINYUSB_DEFAULT_CONFIG();
-        err = tinyusb_driver_install(&tinyusb_config);
-        if (err != ESP_OK) {
-            const esp_err_t rollback =
-                set_storage_mount_point_locked(TINYUSB_MSC_STORAGE_MOUNT_APP);
-            s_owner = rollback == ESP_OK ? StorageOwner::FIRMWARE : StorageOwner::UNAVAILABLE;
-            return err;
-        }
-
-        s_tinyusb_installed = true;
-        s_owner = StorageOwner::USB_HOST;
-        ESP_LOGI(TAG, "USB Drive ON: PC owns FATFS");
-        return ESP_OK;
-    }
-
-    if (s_owner == StorageOwner::FIRMWARE) {
-        return ESP_OK;
-    }
-    if (s_owner != StorageOwner::USB_HOST || !s_tinyusb_installed) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    s_owner = StorageOwner::TRANSITION;
-    esp_err_t err = tinyusb_driver_uninstall();
-    if (err != ESP_OK) {
-        s_owner = StorageOwner::USB_HOST;
-        return err;
-    }
-    s_tinyusb_installed = false;
-
-    err = set_storage_mount_point_locked(TINYUSB_MSC_STORAGE_MOUNT_APP);
-    if (err != ESP_OK) {
-        s_owner = StorageOwner::UNAVAILABLE;
-        return err;
-    }
-
-    s_owner = StorageOwner::FIRMWARE;
-    ESP_LOGI(TAG, "USB Drive OFF: firmware owns FATFS");
-    return ESP_OK;
-}
-
-bool storage_file_exists(const std::string& name) {
-    StorageGuard guard;
-    std::string path;
-    struct stat info {};
-    return guard.held() && firmware_owns_storage_locked() && build_path(name, path) &&
-           stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode);
 }
 
 bool storage_file_remove(const std::string& name) {
@@ -746,33 +514,6 @@ bool storage_file_remove(const std::string& name) {
 bool storage_file_list(std::vector<std::string>& files) {
     StorageGuard guard;
     return guard.held() && list_files_locked(files);
-}
-
-bool storage_file_read_text(const std::string& name, std::string& content) {
-    StorageGuard guard;
-    content.clear();
-    std::string path;
-    if (!guard.held() || !firmware_owns_storage_locked() || !build_path(name, path)) {
-        return false;
-    }
-
-    FILE* file = fopen(path.c_str(), "rb");
-    if (!file) {
-        return false;
-    }
-    char buffer[512];
-    while (true) {
-        const size_t count = fread(buffer, 1, sizeof(buffer), file);
-        if (count > 0) {
-            content.append(buffer, count);
-        }
-        if (count < sizeof(buffer)) {
-            break;
-        }
-    }
-    const bool ok = ferror(file) == 0;
-    fclose(file);
-    return ok;
 }
 
 bool storage_file_write_atomic(const std::string& name, const std::string& content) {
@@ -808,46 +549,6 @@ bool storage_file_append(const std::string& name,
     if (ok && sync_to_flash) {
         ok = sync_file(file);
     }
-    if (fclose(file) != 0) {
-        ok = false;
-    }
-    return ok;
-}
-
-bool storage_file_append_cabrillo(const std::string& mycall,
-                                  const std::string& location,
-                                  const std::string& qso_line) {
-    StorageGuard guard;
-    std::string path;
-    if (!guard.held() || !firmware_owns_storage_locked() ||
-        !build_path("fieldday.txt", path) ||
-        !cabrillo_ensure_header_locked(path, mycall, location)) {
-        return false;
-    }
-
-    FILE* file = fopen(path.c_str(), "r+b");
-    if (!file) {
-        file = fopen(path.c_str(), "a+b");
-    }
-    if (!file) {
-        return false;
-    }
-
-    cabrillo_truncate_end_marker(file);
-    if (fseek(file, 0, SEEK_END) != 0) {
-        fclose(file);
-        return false;
-    }
-    const long end = ftell(file);
-    if (end > 0 && fseek(file, -1, SEEK_END) == 0) {
-        const int last = fgetc(file);
-        fseek(file, 0, SEEK_END);
-        if (last != '\n') {
-            fputc('\n', file);
-        }
-    }
-    bool ok = fprintf(file, "%s\nEND-OF-LOG:\n", qso_line.c_str()) >= 0;
-    ok = ok && sync_file(file);
     if (fclose(file) != 0) {
         ok = false;
     }
@@ -907,14 +608,6 @@ bool storage_stream_seek(StorageStream* stream, long offset, int whence) {
     StorageGuard guard;
     return guard.held() && firmware_owns_storage_locked() && stream && stream->file &&
            fseek(stream->file, offset, whence) == 0;
-}
-
-long storage_stream_tell(StorageStream* stream) {
-    StorageGuard guard;
-    if (!guard.held() || !firmware_owns_storage_locked() || !stream || !stream->file) {
-        return -1;
-    }
-    return ftell(stream->file);
 }
 
 long storage_stream_size(StorageStream* stream) {
@@ -997,44 +690,3 @@ bool storage_sync_station_from_sd() {
     return write_ok;
 }
 
-StorageCopyResult storage_copy_all_to_sd(const std::string& priority_file) {
-    StorageCopyResult result {};
-    StorageGuard guard;
-    if (!guard.held() || !firmware_owns_storage_locked()) {
-        result.err = ESP_ERR_INVALID_STATE;
-        result.missed_count = 1;
-        return result;
-    }
-
-    std::vector<std::string> files;
-    if (!list_files_locked(files)) {
-        result.err = ESP_FAIL;
-        result.missed_count = 1;
-        return result;
-    }
-    if (mount_sd_locked() != ESP_OK) {
-        result.err = ESP_FAIL;
-        result.missed_count = std::max(1, static_cast<int>(files.size()));
-        return result;
-    }
-
-    std::sort(files.begin(), files.end());
-    for (const std::string& name : files) {
-        std::string source;
-        if (!build_path(name, source)) {
-            ++result.missed_count;
-            continue;
-        }
-        const std::string destination = std::string(kSdBasePath) + "/" + name;
-        const int attempts = name == priority_file ? 6 : 5;
-        if (copy_file_retry_locked(source, destination, attempts) == ESP_OK) {
-            ++result.copied_count;
-        } else {
-            ++result.missed_count;
-        }
-    }
-
-    unmount_sd_locked();
-    result.err = result.missed_count == 0 ? ESP_OK : ESP_FAIL;
-    return result;
-}

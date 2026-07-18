@@ -34,9 +34,6 @@ void gps_start(int preload_baud);
 // Start GPS parser on the selected UART/pins.
 void gps_start(const gps_pins_t& pins);
 
-// Stop GPS parser and release the selected UART.
-void gps_stop();
-
 // Periodic housekeeping hook (lightweight; safe to call each loop).
 void gps_tick();
 

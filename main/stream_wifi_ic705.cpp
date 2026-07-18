@@ -25,6 +25,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "storage_service.h"
+#include "diag_log.h"
 
 #include <cstring>
 #include <cmath>
@@ -163,16 +164,24 @@ static void tx_writer_task(void* /*arg*/) {
                 // should show up here as either a large underrun count or a
                 // worstGap in the hundreds-of-ms-to-seconds range. Without a serial
                 // monitor this data was previously invisible on this board.
+                //
+                // heap8/largestDMA added after a session where fail jumped to 170
+                // (worst ever recorded) shortly before a WiFi disconnect logged at
+                // a notably eroded heap level -- this ties each transmission's
+                // failure count directly to the heap state AT THAT MOMENT, instead
+                // of only knowing heap at the eventual disconnect, minutes later.
                 {
                     int64_t up_ms = esp_timer_get_time() / 1000;
-                    char buf[176];
+                    char buf[220];
                     snprintf(buf, sizeof(buf),
                              "TXDONE up=%lld.%03llds ok=%u fail=%u rexmit=%u frames=%d "
-                             "underruns=%d worstGap=%lldus worstRender=%lldus\n",
+                             "underruns=%d worstGap=%lldus worstRender=%lldus heap8=%u largestDMA=%u\n",
                              (long long)(up_ms / 1000), (long long)(up_ms % 1000),
                              (unsigned)ok, (unsigned)fail, (unsigned)rexmit,
-                             frames, underruns, (long long)worst_gap_us, (long long)worst_render_us);
-                    storage_sd_log_append("IC705DBG.txt", buf);
+                             frames, underruns, (long long)worst_gap_us, (long long)worst_render_us,
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+                    storage_sd_log_append(kDiagLogFile, buf);
                 }
             }
             was_running = false;
@@ -272,7 +281,17 @@ static int ic705_read_ft8_samples(void* ctx, float* out, int max_samples) {
 
 static bool ic705_should_stop(void* ctx) {
     (void)ctx;
-    return s_stop_req || !ic705_net_audio_is_ready();
+    // ONLY a permanent stop ends the decode loop. A momentary audio-not-ready
+    // (e.g. during the session-liveness-watchdog reconnect in ic705_netctrl.cpp,
+    // which sets s_audio_ready false for the duration) must NOT kill this task --
+    // ic705_read_ft8_samples() already returns 0 gracefully when audio isn't
+    // ready (empty queue), so the pipeline just waits and resumes on its own
+    // once the reconnect brings audio back. Matches TD705's rx_should_stop().
+    // Before this fix: the watchdog reconnect would flip s_audio_ready false,
+    // this would immediately end the pipeline run and self-delete the RX task,
+    // and nothing would ever recreate it -- the watchdog's reconnect would
+    // succeed but decoding would stay dead until a manual restart regardless.
+    return s_stop_req;
 }
 
 static void ic705_on_block_processed(void* /*ctx*/) {
@@ -328,7 +347,6 @@ bool ic705_stream_start(uint32_t ic705_ip) {
     s_stop_req = false;
     s_tx_run   = false;
     s_tx_stop_perm = false;
-    ft8_audio_pipeline_clear_latest_waterfall_row();
     resample_init(&s_resample);
 
     // RX decode task FIRST — it's the priority (without it, no decodes).
@@ -387,8 +405,6 @@ void ic705_stream_stop(void) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    ft8_audio_pipeline_clear_latest_waterfall_row();
-
     dds_cpfsk_end();
     dds_set_freq_hz(0.0);
 
@@ -397,18 +413,8 @@ void ic705_stream_stop(void) {
     ESP_LOGI(TAG, "IC-705 stream stopped");
 }
 
-ic705_stream_state_t ic705_stream_get_state(void) { return s_state; }
-
 bool ic705_stream_is_streaming(void) {
     return s_state == IC705_STREAM_STREAMING;
-}
-
-const char* ic705_stream_get_status_string(void) { return s_status; }
-const char* ic705_stream_get_debug_line1(void)   { return s_dbg1;   }
-const char* ic705_stream_get_debug_line2(void)   { return s_dbg2;   }
-
-bool ic705_stream_get_latest_waterfall_row(uint8_t* out_row, int out_len) {
-    return ft8_audio_pipeline_get_latest_waterfall_row(out_row, out_len);
 }
 
 // ---------------------------------------------------------------------------

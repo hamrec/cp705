@@ -35,6 +35,13 @@ const char* ic705_net_status_string(void);
 // false (but CAT control still works) if it failed or hasn't come up yet.
 bool ic705_net_audio_is_ready(void);
 
+// Cumulative send ok/fail counts for the CTRL/SERIAL keepalive path
+// (pkt0-idle, pkt7-ping, reauth) since connect. If the radio ever drops the
+// session with no WIFI_EVENT_STA_DISCONNECTED logged (802.11 link stayed
+// up), these are the counters that would show why: the radio closing the
+// session on its own side because these specific packets stopped arriving.
+void ic705_net_get_keepalive_stats(uint32_t* ok, uint32_t* fail);
+
 // Queues up to AUDIO_PCM_MAX (512) bytes of raw 16-bit PCM for transmit on
 // the audio stream. Returns ESP_ERR_INVALID_STATE if audio isn't ready,
 // ESP_ERR_INVALID_SIZE if len exceeds the per-packet maximum.

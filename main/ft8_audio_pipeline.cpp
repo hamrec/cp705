@@ -10,8 +10,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
-#include "core_api_internal.h"
-#include "ui.h"
 
 extern "C" {
 #include "common/monitor.h"
@@ -33,71 +31,6 @@ int64_t rtc_now_ms();
 #define FT8_SAMPLE_RATE 6000
 #endif
 
-static uint8_t s_latest_waterfall_row[FT8_AUDIO_WATERFALL_ROW_WIDTH] = {0};
-static bool s_latest_waterfall_row_valid = false;
-static portMUX_TYPE s_latest_waterfall_row_lock = portMUX_INITIALIZER_UNLOCKED;
-
-static void push_waterfall_latest(const monitor_t& mon)
-{
-    if (mon.wf.num_blocks <= 0 || mon.wf.mag == nullptr) return;
-    const int block = mon.wf.num_blocks - 1;
-    const int num_bins = mon.wf.num_bins;
-    const int freq_osr = mon.wf.freq_osr;
-    const uint8_t* base = mon.wf.mag + block * mon.wf.block_stride;
-
-    static uint8_t collapsed[480];
-    memset(collapsed, 0, num_bins);
-    for (int b = 0; b < num_bins; ++b) {
-        uint8_t v = 0;
-        for (int fs = 0; fs < freq_osr; ++fs) {
-            uint8_t val = base[fs * num_bins + b];
-            if (val > v) v = val;
-        }
-        collapsed[b] = v;
-    }
-
-    static uint8_t scaled[FT8_AUDIO_WATERFALL_ROW_WIDTH];
-    for (int x = 0; x < FT8_AUDIO_WATERFALL_ROW_WIDTH; ++x) {
-        int start = (int)((int64_t)x * num_bins / FT8_AUDIO_WATERFALL_ROW_WIDTH);
-        int end = (int)((int64_t)(x + 1) * num_bins / FT8_AUDIO_WATERFALL_ROW_WIDTH);
-        if (end <= start) end = start + 1;
-        uint8_t maxv = 0;
-        for (int s = start; s < end && s < num_bins; ++s) {
-            if (collapsed[s] > maxv) maxv = collapsed[s];
-        }
-        scaled[x] = maxv;
-    }
-
-    ui_push_waterfall_row(scaled, FT8_AUDIO_WATERFALL_ROW_WIDTH);
-    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
-    memcpy(s_latest_waterfall_row, scaled, FT8_AUDIO_WATERFALL_ROW_WIDTH);
-    s_latest_waterfall_row_valid = true;
-    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
-
-    core_fire_waterfall_row(block, collapsed, num_bins,
-                            /*swr=*/1.5f, /*pwr=*/2.0f, /*ptt=*/false);
-}
-
-void ft8_audio_pipeline_clear_latest_waterfall_row(void)
-{
-    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
-    memset(s_latest_waterfall_row, 0, sizeof(s_latest_waterfall_row));
-    s_latest_waterfall_row_valid = false;
-    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
-}
-
-bool ft8_audio_pipeline_get_latest_waterfall_row(uint8_t* out_row, int out_len)
-{
-    if (!out_row || out_len < FT8_AUDIO_WATERFALL_ROW_WIDTH) return false;
-    bool valid = false;
-    taskENTER_CRITICAL(&s_latest_waterfall_row_lock);
-    valid = s_latest_waterfall_row_valid;
-    if (valid) {
-        memcpy(out_row, s_latest_waterfall_row, FT8_AUDIO_WATERFALL_ROW_WIDTH);
-    }
-    taskEXIT_CRITICAL(&s_latest_waterfall_row_lock);
-    return valid;
-}
 
 void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
 {
@@ -134,7 +67,6 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
 
     const int64_t slot_ms      = g_protocol->slot_time_ms;
     const int     target_blocks = g_protocol->total_symbols + 1;
-    const uint32_t sym_delay_ms = (uint32_t)(g_protocol->symbol_period * 1000.0f + 0.5f);
 
     int64_t now_ms = rtc_now_ms();
     int64_t rem = now_ms % slot_ms;
@@ -144,7 +76,6 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
     }
 
     int ft8_buffer_idx = 0;
-    TickType_t next_wake = xTaskGetTickCount();
     int slot_blocks = 0;
     int64_t slot_idx = rtc_now_ms() / slot_ms;
     int64_t slot_start_ms = slot_idx * slot_ms;
@@ -184,7 +115,6 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
 
                 if (mon.wf.num_blocks < target_blocks) {
                     monitor_process(&mon, ft8_buffer);
-                    push_waterfall_latest(mon);
                 }
 
                 if (cfg->on_block_processed) {
@@ -192,7 +122,21 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
                 }
 
                 ft8_buffer_idx = 0;
-                vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(sym_delay_ms));
+                // No explicit per-block pacing here (there used to be a
+                // vTaskDelayUntil to the symbol period). cfg->read() already
+                // blocks waiting for the next queued audio packet when none is
+                // ready, which paces this loop to real-time on its own -- the
+                // extra sleep was redundant with that, and while it slept, the
+                // network task kept pushing new packets into the (6-slot)
+                // audio queue with nobody draining it, dropping the rest.
+                // Traced 2026-07-18 to a steady ~40-49% RX audio packet drop
+                // rate, present from the first minute of any session: each
+                // block-processing pass has ~160ms (FT8 symbol period) between
+                // it and the next queue drain, while packets arrive every
+                // ~10ms -- ~16 packets could queue up in that gap against only
+                // 6 slots. Removing the redundant sleep lets this loop keep
+                // draining the queue near real-time instead of falling behind
+                // every single block.
 
                 slot_blocks++;
                 int64_t now_idx = rtc_now_ms() / slot_ms;
@@ -208,7 +152,6 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
                     slot_blocks = 0;
                     mon.wf.num_blocks = 0;
                     monitor_reset(&mon);
-                    next_wake = xTaskGetTickCount();
                 } else if (slot_blocks >= g_protocol->total_symbols &&
                            mon.wf.num_blocks >= g_protocol->total_symbols) {
                     ESP_LOGI(tag, "Triggering decode at slot %lld blocks=%d wf=%d",
@@ -251,7 +194,6 @@ void ft8_audio_pipeline_run(const ft8_audio_pipeline_config_t* cfg)
                     monitor_reset(&mon);
                     mon.wf.num_blocks = 0;
                     slot_blocks = 0;
-                    next_wake = xTaskGetTickCount();
                 }
             }
         }

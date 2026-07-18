@@ -24,10 +24,6 @@ void audio_source_stop(void);
 
 bool audio_source_is_streaming(void);
 bool audio_source_ic705_detected(void);   // replaces audio_source_qmx_detected
-const char* audio_source_get_status_string(void);
-const char* audio_source_get_debug_line1(void);
-const char* audio_source_get_debug_line2(void);
-bool audio_source_get_latest_waterfall_row(uint8_t* out_row, int out_len);
 
 #ifdef __cplusplus
 }

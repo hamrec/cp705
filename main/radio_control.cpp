@@ -15,10 +15,6 @@ void radio_control_set_backend(radio_control_backend_t /*backend*/) {
     ESP_LOGI(TAG, "Selected radio control backend=ic705");
 }
 
-radio_control_backend_t radio_control_get_backend(void) {
-    return RADIO_CONTROL_IC705;
-}
-
 const char* radio_control_backend_name(radio_control_backend_t /*backend*/) {
     return "ic705";
 }

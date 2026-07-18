@@ -25,10 +25,3 @@ void core_fire_qso_changed();
 // Called by any code that mutates station configuration.
 // Fires the registered core_on_config_changed callback (if any).
 void core_fire_config_changed();
-
-// Called by the DSP task once per symbol (~6.25 Hz) with a fresh waterfall row.
-// mag may be null during TX; num_bins is zero in that case.
-// Fires the registered core_on_waterfall_row callback (if any).
-void core_fire_waterfall_row(int sym,
-                             const uint8_t* mag, int num_bins,
-                             float swr, float pwr, bool ptt);

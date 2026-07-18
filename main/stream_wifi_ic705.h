@@ -36,8 +36,6 @@ extern "C" {
 // At 48kHz / 16-bit / mono, 1 ms = 96 bytes.  128 samples = 256 bytes ≈ 2.7 ms.
 #define IC705_RX_BUF_BYTES   1364
 
-#define IC705_WATERFALL_ROW_WIDTH FT8_AUDIO_WATERFALL_ROW_WIDTH
-
 typedef enum {
     IC705_STREAM_IDLE,
     IC705_STREAM_WAITING,    // WiFi manager not yet ready
@@ -57,13 +55,7 @@ bool ic705_stream_start(uint32_t ic705_ip);
 // Stop all streaming (RX + TX).
 void ic705_stream_stop(void);
 
-ic705_stream_state_t ic705_stream_get_state(void);
 bool ic705_stream_is_streaming(void);
-
-const char* ic705_stream_get_status_string(void);
-const char* ic705_stream_get_debug_line1(void);
-const char* ic705_stream_get_debug_line2(void);
-bool ic705_stream_get_latest_waterfall_row(uint8_t* out_row, int out_len);
 
 // ---------------------------------------------------------------------------
 // TX audio (mirrors stream_uac TX API)
