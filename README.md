@@ -99,12 +99,27 @@ full radio-side configuration.
   persisted across reboots.
 - **On-device network login editor** — WiFi SSID/password and IC-705 network
   user/password are editable under **IC-705/Network**.
-- **Editable CQ prompt** — pressing `C` opens the CQ message pre-filled with
-  `CQ <call> <grid>`, cursor placed right after `CQ ` so a prefix (e.g. `POTA`)
-  can be typed immediately; confirming sends it and automatically re-calls the
+- **Editable CQ prompt with activity markers (POTA/SOTA/QRP/…)** — pressing `C`
+  opens the CQ message pre-filled with `CQ <call> <grid>`, cursor placed right
+  after `CQ ` so an activity marker can be typed immediately. Type `POTA ` and
+  you send `CQ POTA KD3AN EM66`; the same works for `SOTA`, `QRP`, `DX`, `TEST`,
+  or a 3-digit contest number. Confirming sends it and automatically re-calls the
   same CQ every idle cycle (no separate Beacon toggle — calling CQ *is* the
   beacon) until you answer someone, press ESC, or start a fresh `C` for a new
   default.
+
+  - **How it's sent:** the message is packed by the standard FT8 encoder
+    (`ftx_message_encode`), so `CQ POTA <call> <grid>` goes out as a proper
+    *structured* FT8 CQ — the same format WSJT-X uses — and decodes cleanly as a
+    POTA CQ on the other end, not as free text.
+  - **Marker length limit (an FT8 protocol rule, not a CP705 one):** the marker
+    slot after `CQ` holds **1–4 characters**. POTA, SOTA, QRP, DX, TEST and 3-digit
+    contest numbers all fit. A longer term can't pack as a structured CQ and would
+    fall back to FT8's 13-character free-text limit, which `CQ <term> <call> <grid>`
+    won't fit into. CP705 does not transmit garbage in that case: the encoder
+    returns an error, TX is cleanly aborted, and an `Encode failed for TX` line is
+    logged. So a valid 1–4 char marker sends correctly; an over-long one simply
+    doesn't transmit.
 - **Persistent, recency-sorted decode list** — decoded lines no longer blank
   out every 15s cycle. Anything addressed to you stays pinned at the top no
   matter how old it is; everything else is sorted newest-heard-first, and a
@@ -367,7 +382,7 @@ hotkeys — they're actions inside the `M` menu (see the table below) and
 | Mode | Item | Notes |
 |---|---|---|
 | `R` (RX, idle) | `1..6` | Select a decoded line to reply to. The list persists across cycles instead of resetting every 15s: messages addressed to you are pinned at the top regardless of age, everything else is newest-heard-first, and a station repeating (or advancing to its next message) refreshes its existing line in place rather than adding a duplicate. |
-|  | `C` | Open the CQ prompt, pre-filled `CQ <call> <grid>`, cursor right after `CQ `. Enter sends it, `` ` `` cancels with no TX. |
+|  | `C` | Open the CQ prompt, pre-filled `CQ <call> <grid>`, cursor right after `CQ ` so you can type a 1–4 char activity marker (`POTA`, `SOTA`, `QRP`, `DX`, `TEST`, 3-digit contest #) to send e.g. `CQ POTA <call> <grid>`. Enter sends it, `` ` `` cancels with no TX. See the "Editable CQ prompt with activity markers" feature note for the marker-length rule. |
 |  | `▲` `▼` | Page up/down is available when line 1 or line 6 is cyan. |
 | `R` (RX, hero card) |  | Shows the worked station's callsign/grid, a 6-stage exchange tracker (CQ/GRID/RPT/R/RR73/73), the current TX line, frequency/SNR, and a running QSO count bottom-right. Appears automatically the moment a CQ or QSO is active. On a genuine sign-off, it goes fully green ("QSO COMPLETE — Logged") for a few seconds before auto-continuing; if an exchange stalls out and retries run out with no reply ever heard, it shows an amber "NO REPLY" instead (tracker frozen at whatever stage it actually reached) on the same auto-continue timing — either way you're never stuck waiting on ESC. |
 |  | `` ` `` | Bail out of the QSO and return to the decode list immediately, any time. |
