@@ -350,6 +350,80 @@ Open issues, all real and all chased hard without a confirmed root cause yet:
 
 > This manual is inherited from Mini-FT8 and describes the shared on-device UI.
 
+## Printable Pocket Card
+
+A two-panel cheat sheet to keep with the device. **Print this section** (a
+monospace/fixed-width font prints the borders cleanly), cut out both panels, and
+fold or tape them back-to-back — each panel is sized to tuck into a badge holder
+or sit next to the Cardputer. Full details for everything on it are in the
+sections below.
+
+```text
++------------------------------------------------+
+|        CP705  -  POCKET OPERATING CARD         |
++------------------------------------------------+
+|                                                |
+| GET ON THE AIR                                 |
+|   Radio: AP mode, WLAN + DHCP Server = ON      |
+|   CP705 auto-joins the radio's WiFi            |
+|   Press  S 1   to connect + sync               |
+|   Ready when the radio shows its WLAN icon     |
+|                                                |
+| KEYS                                           |
+|   R   decode list / live QSO card              |
+|   C   call CQ (opens editable text)            |
+|   S   STATUS: connect, tune, gain, time        |
+|   M   MENU: settings categories                |
+|   `   ESC - bail QSO / cancel edit             |
+|   1-6 pick the visible row                     |
+|   Up/Dn page    Lt/Rt move in date-time        |
+|                                                |
+| WORK A STATION                                 |
+|   Answer:  in R, press its line #  1-6         |
+|   Call CQ: C, type a marker, Enter             |
+|     e.g.  CQ POTA <call> <grid>                |
+|     marker = 1-4 ch: POTA SOTA QRP DX          |
+|   Drop a QSO:  `  (backtick)                   |
+|                                                |
+| STATUS (S) KEYS                                |
+|   1 connect/sync     2 next band               |
+|   3 tune ~5s         4 date    5 time          |
+|   6 disconnect      +/- TX drive               |
++------------------------------------------------+
+
++------------------------------------------------+
+|         CP705  -  RADIO SETUP & FIXES          |
++------------------------------------------------+
+|                                                |
+| IC-705 SETUP  (once)                           |
+|   WiFi mode: Access Point                      |
+|   WLAN + DHCP Server = ON                      |
+|   Network Control = ON                         |
+|   Network User1 = Administrator                |
+|   Operating mode: USB-D (data)                 |
+|   MOD Input:  DATA MOD = WLAN                  |
+|   IP 192.168.59.1     CI-V 0xA4                |
+|   UDP ports 50001 / 50002 / 50003              |
+|                                                |
+| TIME  (required for decodes)                   |
+|   Connect a GPS or DS3231 RTC                  |
+|   S 5 shows source:  G=GPS   R=RTC             |
+|                                                |
+| LOGGING                                        |
+|   Auto-saved to NVS (survives power-off)       |
+|   Export ADIF:   M > Logging > 1               |
+|                                                |
+| QUICK FIXES                                    |
+|   TX but no RF -> DATA MOD=WLAN, USB-D         |
+|   No decodes   -> fix UTC time (G/R)           |
+|   No CAT/audio -> Network Control ON;          |
+|                   re-resolve  M > Net > 6      |
+|   TX drops out -> separate antenna and         |
+|                   USB cable from device        |
+|   Cold tune no RF -> switch band & back        |
++------------------------------------------------+
+```
+
 ## Quick Mode Map
 
 | Key | Mode | Purpose |
