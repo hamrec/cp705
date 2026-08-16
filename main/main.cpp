@@ -601,14 +601,29 @@ static void apply_brightness() {
   M5.Display.setBrightness((uint8_t)(255 * pct / 10));
 }
 static std::string g_free_text = "TNX 73";
-// POTA park reference for the CURRENT activation session (e.g. "US-1234"). When
-// non-empty, each logged QSO gets MY_SIG=POTA / MY_SIG_INFO=<ref> in its ADIF
-// record. DELIBERATELY session-scoped: RAM only, never written to Station.txt /
-// NVS, defaults empty at boot -- so it auto-clears every power cycle (one park
-// per outing) and can never silently tag a later non-POTA session's QSOs. Set
-// on-device via the Logging category ("POTA" row). All logged QSOs in an
-// activation share the same ref, so this is NOT cleared per-log-write.
-static std::string g_pota_ref = "";
+// Activation reference + program for the CURRENT session (POTA park like
+// "US-1234", or SOTA summit like "W7A/MN-001"). When a program is selected and
+// the ref is non-empty, each logged QSO gets the program's ADIF field(s)
+// (POTA -> MY_SIG/MY_SIG_INFO; SOTA -> MY_SOTA_REF). DELIBERATELY session-scoped:
+// RAM only, never written to Station.txt / NVS, defaults empty/POTA at boot --
+// so it auto-clears every power cycle (one activation per outing) and can never
+// silently tag a later casual session's QSOs. Set on-device via the Logging
+// category. All logged QSOs in an activation share the same ref, so this is NOT
+// cleared per-log-write. Program defaults to POTA; the ref being empty is the
+// real "off" (nothing emitted) regardless of program.
+static std::string g_activation_ref = "";
+static SigProgram  g_activation_program = SigProgram::POTA;
+// QSOs logged toward the CURRENT activation (since the ref was last set). Same
+// cross-core publish pattern as g_adif_sd_seq: written on core1 in the ADIF
+// callback, read on core0 in the menu draw. Reset when the ref changes (a new
+// ref = a new activation) and at boot. Lets an activator see when they've hit
+// the validity threshold (POTA 10, SOTA 4).
+static volatile uint32_t g_activation_qso_count = 0;
+
+// QSO count needed to validate an activation, per program.
+static int activation_threshold() {
+  return g_activation_program == SigProgram::SOTA ? 4 : 10;
+}
 std::string g_call = "";   // visible to core_api.cpp; set via Station category / Station.txt
 std::string g_grid = "";    // visible to core_api.cpp; set via Station category / Station.txt
 static std::string g_grid_saved_manual = "";
@@ -731,7 +746,8 @@ static int64_t s_last_tx_slot_idx = -1000;  // Track last TX slot for retry sche
 static void enqueue_running_cq();
 static void qso_done_tick();
 static void clear_decode_list();
-static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd);
+static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd,
+                           int64_t start_utc_ms);
 // Count of QSO records logged this session (shown in the QSO view). Incremented
 // by log_adif_entry(), which may run on the core1 decode task — plain int only.
 static volatile uint32_t g_adif_sd_seq  = 0;
@@ -765,21 +781,32 @@ static bool nvs_load_station(std::string& out);            // defined below
 // hand it to the qso_log module (ADIF formatting + durable NVS + SD/flash live
 // there now). May run on the core1 decode task — record assembly only touches
 // globals that are set once at startup / on band change.
-static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd) {
+static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid, int rst_sent, int rst_rcvd,
+                           int64_t start_utc_ms) {
   QsoLogRecord r;
   r.dxcall   = dxcall;
   r.dxgrid   = dxgrid;
   r.rst_sent = rst_sent;
   r.rst_rcvd = rst_rcvd;
   r.freq_mhz = 0.001 * (double)g_bands[g_band_sel].freq;
+  r.band     = g_bands[g_band_sel].name;   // ADIF-canonical, e.g. "20m"
   r.mode     = g_protocol->name;
   r.mycall   = g_call;
   r.mygrid   = grid_ft8_4(g_grid);
   r.comment  = "CP705 IC-705";
-  r.my_sig_info = g_pota_ref;   // "" when not activating -> no POTA fields logged
-  r.utc_ms   = rtc_now_ms();
+  r.sig_program = g_activation_program;  // POTA/SOTA
+  r.sig_ref     = g_activation_ref;       // "" when not activating -> no fields
+  // ADIF TIME_ON/QSO_DATE = QSO START time (context creation), per ADIF
+  // semantics and to match WSJT-X / POTA start-time tallying. Fall back to now
+  // if the start stamp is missing (clock not ready at creation).
+  r.utc_ms   = (start_utc_ms != 0) ? start_utc_ms : rtc_now_ms();
   qso_log_write(r);
   g_adif_sd_seq = g_adif_sd_seq + 1;   // QSO count for the on-screen status
+  // Count toward the current activation only when armed (program set + ref
+  // present) -- these are the QSOs that carried activation fields.
+  if (g_activation_program != SigProgram::None && !g_activation_ref.empty()) {
+    g_activation_qso_count = g_activation_qso_count + 1;
+  }
   return true;       // NVS write makes the record durable; never force a retry
 }
 
@@ -3178,9 +3205,30 @@ static void draw_menu_view() {
       lines.push_back("Clear QSO Log: " + std::to_string((unsigned)g_adif_sd_seq));
     }
     lines.push_back("Performance");
-    // POTA park ref for this session (RAM only, clears on reboot). Shows the
-    // armed ref so you can see at a glance whether QSOs are being tagged.
-    lines.push_back(std::string("POTA: ") + (g_pota_ref.empty() ? "(off)" : g_pota_ref));
+    // Activation program toggle (POTA/SOTA) + its reference. Both are
+    // session-scoped (RAM only, clear on reboot). The program picks which ADIF
+    // fields a QSO gets; the ref being empty is the real "off". When armed,
+    // append the activation progress N/threshold (POTA 10, SOTA 4) with an "OK"
+    // once the validity count is reached.
+    {
+      std::string act = std::string("Activation: ") +
+                        (g_activation_program == SigProgram::SOTA ? "SOTA" : "POTA");
+      if (!g_activation_ref.empty()) {
+        unsigned n = g_activation_qso_count;
+        int thr = activation_threshold();
+        act += " " + std::to_string(n) + "/" + std::to_string(thr);
+        if ((int)n >= thr) act += " OK";
+      }
+      lines.push_back(act);
+    }
+    // While the ref row is being edited, show the live edit buffer so keystrokes
+    // echo (same pattern as Call/Grid/Fixed above); otherwise show the armed
+    // ref, or "(off)" when unset, as the at-a-glance activation indicator.
+    if (menu_edit_idx == kCatLogging * MENU_CAT_BASE + 4) {
+      lines.push_back(std::string("Ref: ") + menu_edit_buf);
+    } else {
+      lines.push_back(std::string("Ref: ") + (g_activation_ref.empty() ? "(off)" : g_activation_ref));
+    }
   } else if (menu_category == kCatSystem) {
     lines.push_back(menu_sleep_batt_line());
     lines.push_back("Sleep Now");
@@ -4468,6 +4516,9 @@ static void app_task_core0(void* /*param*/) {
   core_on_config_changed([]{ g_rx_dirty = true; });
   
 autoseq_set_adif_callback(log_adif_entry);
+  // Give autoseq a UTC clock so it can stamp each QSO's start time at context
+  // creation (logged as ADIF TIME_ON/QSO_DATE).
+  autoseq_set_now_callback([]() -> int64_t { return rtc_now_ms(); });
 
 
   ui_mode = UIMode::RX;
@@ -5278,11 +5329,17 @@ autoseq_set_adif_callback(log_adif_entry);
                   if (end != menu_edit_buf.c_str() && v >= 0 && v <= 0xFF) {
                     g_ic705_civ_addr = (int)v;
                   }
-                } else if (menu_edit_idx == kCatLogging * MENU_CAT_BASE + 3) {
-                  // POTA park ref: session-scoped, so DON'T persist it (leave it
-                  // out of save_station_data on purpose -- it must clear on
+                } else if (menu_edit_idx == kCatLogging * MENU_CAT_BASE + 4) {
+                  // Activation ref: session-scoped, so DON'T persist it (leave
+                  // it out of save_station_data on purpose -- it must clear on
                   // reboot). Store as-typed (already uppercased on input).
-                  g_pota_ref = menu_edit_buf;
+                  // Changing the ref means a new activation -> reset its QSO
+                  // counter. Re-confirming the SAME ref (e.g. just checking it)
+                  // does not, so a mid-activation glance can't wipe the count.
+                  if (menu_edit_buf != g_activation_ref) {
+                    g_activation_qso_count = 0;
+                  }
+                  g_activation_ref = menu_edit_buf;
                   should_save = false;
                 }
                 if (should_save) {
@@ -5331,13 +5388,14 @@ autoseq_set_adif_callback(log_adif_entry);
                   if (menu_edit_buf.size() >= 10) break;
                 }
                 // Force uppercase only where it's correct: callsign, grid, the
-                // CI-V hex address, and the POTA park ref (refs are uppercase,
-                // e.g. US-1234). Credentials (WiFi SSID/pass, net user/pass) are
-                // case-sensitive and must NOT be uppercased.
+                // CI-V hex address, and the activation ref (POTA/SOTA refs are
+                // uppercase, e.g. US-1234, W7A/MN-001). Credentials (WiFi
+                // SSID/pass, net user/pass) are case-sensitive and must NOT be
+                // uppercased.
                 if (menu_edit_idx == kCatStation * MENU_CAT_BASE + 0 ||
                     menu_edit_idx == kCatStation * MENU_CAT_BASE + 1 ||
                     menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 4 ||
-                    menu_edit_idx == kCatLogging * MENU_CAT_BASE + 3) {
+                    menu_edit_idx == kCatLogging * MENU_CAT_BASE + 4) {
                   ch = toupper((unsigned char)ch);
                 }
                 menu_edit_buf.push_back(ch);
@@ -5465,10 +5523,17 @@ autoseq_set_adif_callback(log_adif_entry);
               } else if (c == '3') {
                 enter_mode(UIMode::PERF);
               } else if (c == '4') {
-                // Edit POTA park ref for this session (in-place editor). Blank
-                // it to turn POTA logging off. Not persisted -- clears on reboot.
-                menu_edit_idx = kCatLogging * MENU_CAT_BASE + 3;
-                menu_edit_buf = g_pota_ref;
+                // Toggle activation program POTA <-> SOTA (picks which ADIF
+                // fields a logged QSO gets). Session-scoped; not persisted.
+                g_activation_program = (g_activation_program == SigProgram::POTA)
+                                           ? SigProgram::SOTA : SigProgram::POTA;
+                draw_menu_view();
+              } else if (c == '5') {
+                // Edit activation ref for this session (in-place editor). Blank
+                // it to turn activation logging off. Not persisted -- clears on
+                // reboot.
+                menu_edit_idx = kCatLogging * MENU_CAT_BASE + 4;
+                menu_edit_buf = g_activation_ref;
                 draw_menu_view();
               }
             } else if (menu_category == kCatSystem) {

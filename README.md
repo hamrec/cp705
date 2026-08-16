@@ -141,14 +141,18 @@ full radio-side configuration.
   into logging software (see **Logging and Download** below).
 - **Clear QSO log** (Logging category → `2`) — a two-press-confirm action to
   wipe the NVS log and start fresh, e.g. between POTA activations.
-- **POTA park logging** (Logging category → `4`) — enter the park reference
-  you're activating (e.g. `US-1234`) and every QSO logged from then on gets
-  `MY_SIG:POTA` / `MY_SIG_INFO:<ref>` written into its ADIF record, so the export
-  imports straight into the POTA system. The row shows the armed ref
-  (`POTA: US-1234`) or `POTA: (off)`. The ref is **session-scoped**: it lives in
-  RAM only, is never saved to `Station.txt`/NVS, and **clears on reboot** — one
-  park per outing, so it can't silently tag a later non-POTA session. Blank the
-  field to turn it off mid-session.
+- **POTA / SOTA activation logging** (Logging category → `4` toggle, `5` ref) —
+  pick the program (POTA or SOTA) and enter your reference (`US-1234` for a park,
+  `W7A/MN-001` for a summit); every QSO logged from then on gets the program's
+  ADIF fields — `MY_SIG:POTA` + `MY_SIG_INFO:<ref>` for POTA, or `MY_SOTA_REF:<ref>`
+  for SOTA — so the export imports straight into the POTA/SOTA site. The
+  Activation row also shows a live progress counter toward the validity
+  threshold (`POTA 7/10`, `SOTA 3/4`, then `… OK`). The ref is **session-scoped**:
+  RAM only, never saved to `Station.txt`/NVS, **clears on reboot** — one
+  activation per outing, so it can't silently tag a later casual session. Blank
+  the ref to turn it off. Records also carry a `BAND` field (e.g. `20m`) and a
+  QSO-**start** `TIME_ON`, both of which the POTA/SOTA specs expect. See
+  **POTA / SOTA Activations** below for the full walkthrough.
 - **Streamlined to the IC-705 target** — the entire KH1 radio backend was
   removed to keep the build focused on the wireless IC-705 use case, and
   several settings inherited from Mini-FT8 (ignore list, QSO comment template,
@@ -417,11 +421,13 @@ sections below.
 |   Connect a GPS or DS3231 RTC                  |
 |   S 5 shows source:  G=GPS   R=RTC             |
 |                                                |
-| LOGGING                                        |
+| LOGGING / POTA / SOTA                          |
 |   Auto-saved to NVS (survives power-off)       |
-|   Export ADIF:   M > Logging > 1               |
-|   POTA park:     M > Logging > 4  (reboot      |
-|                  clears it)                    |
+|   Export ADIF:  M > Logging > 1                |
+|   Program POTA/SOTA:  M > Logging > 4          |
+|   Ref (US-1234 / W7A/MN-001): >5               |
+|   Counter shows N/10 POTA, N/4 SOTA            |
+|   (activation clears on reboot)                |
 |                                                |
 | QUICK FIXES                                    |
 |   TX but no RF -> DATA MOD=WLAN, USB-D         |
@@ -495,12 +501,76 @@ hotkeys — they're actions inside the `M` menu (see the table below) and
 | `M` → **Logging** | `1` | Export Log to SD. Writes the NVS ADIF log to a unique file, then reads it back and byte-verifies it. Feedback: `Verified N QSOs` / `SD write failed` / `Verify FAILED` / `No log yet`. |
 |  | `2` | Clear QSO Log: press once to arm (`Press 2 again: confirm`), press `2` again within 3 s to wipe the NVS log and reset the QSO count. Any other key or letting it lapse cancels with no change. Export first if you want a copy — this never touches the SD card. The row shows the running count (`Clear QSO Log: N`) when not armed. |
 |  | `3` | Performance Monitor — CPU/heap diagnostics. `` ` `` returns to this category. |
-|  | `4` | POTA Park (in place). Type the park ref you're activating (e.g. `US-1234`), Enter to arm — every QSO logged after that carries `MY_SIG:POTA` / `MY_SIG_INFO:<ref>` in its ADIF record. Blank it and Enter to turn off. Uppercased on input. The row shows `POTA: <ref>` when armed or `POTA: (off)`. Session-scoped — not saved, clears on reboot. |
+|  | `4` | Activation program — toggles `POTA ⇄ SOTA` (which ADIF fields a logged QSO gets). When a ref is set, the row also shows progress toward the validity threshold: `Activation: POTA 7/10` (POTA needs 10, SOTA needs 4), then `… OK` once reached. |
+|  | `5` | Activation Ref (in place). Type the reference you're activating — `US-1234` (POTA park) or `W7A/MN-001` (SOTA summit) — Enter to arm. Every QSO logged after that carries the program's ADIF fields (`MY_SIG`/`MY_SIG_INFO` for POTA, `MY_SOTA_REF` for SOTA). Blank it and Enter to turn off. Uppercased on input. Row shows `Ref: <ref>` when armed or `Ref: (off)`. Session-scoped — not saved, clears on reboot. Changing to a new ref resets the progress counter. |
 | `M` → **System** | (display) | Sleep/Batt %. |
 |  | `2` | Enter deep sleep now. |
 |  | `3` | GPS Status — live telemetry: 3D fix, satellites, UTC time, grid square, and last synchronization age (LoRa-1262 cap GNSS is the only source). `` ` `` returns to this category. |
 |  | `4` | Re-resolve / reconnect. Re-points CP705 at the radio's IP even if WiFi is already up (STATUS `2` skips this when already connected) — the row shows live WiFi status. |
 |  | `5` | Display brightness: cycles 1-10 (10%-100%), wraps back to 1 after 10. Persists across reboots. |
+
+## POTA / SOTA Activations
+
+CP705 can tag your logged QSOs for a **Parks on the Air (POTA)** or **Summits on
+the Air (SOTA)** activation, so the exported `.adi` imports straight into the
+POTA or SOTA database with no hand-editing.
+
+### Configure it (Logging category)
+
+Press `M` → `4` (**Logging**), then:
+
+1. **`4` — Activation program.** Toggles between `POTA` and `SOTA`. This chooses
+   *which* ADIF fields your QSOs get (they differ per program — see below).
+2. **`5` — Activation Ref.** Type the reference you are activating and press Enter
+   to arm it:
+   - **POTA** park reference, e.g. `US-1234` (older logs use `K-1234`).
+   - **SOTA** summit reference, e.g. `W7A/MN-001`.
+   - Input is uppercased automatically. **Blank the field and Enter to turn it
+     off.**
+
+The Activation row shows the live state at a glance: `Activation: POTA 7/10` (or
+`Activation: SOTA 3/4`), with the count climbing as you log QSOs and an `OK`
+appended once you reach the validity threshold — **10** QSOs for POTA, **4** for
+SOTA. The Ref row shows `Ref: US-1234` when armed or `Ref: (off)`.
+
+### What CP705 writes to the ADIF
+
+Each QSO logged while an activation is armed carries the correct program fields:
+
+| Program | ADIF fields added to every QSO |
+|---|---|
+| **POTA** | `<MY_SIG>POTA` and `<MY_SIG_INFO>` = your park ref |
+| **SOTA** | `<MY_SOTA_REF>` = your summit ref (SOTA uses its **own** field, *not* `MY_SIG`) |
+
+Every record — activation or not — also includes `BAND` (e.g. `20m`) and a
+`TIME_ON` stamped at the QSO **start** (per ADIF semantics and how POTA tallies),
+alongside the usual `CALL` / `STATION_CALLSIGN` / `QSO_DATE` / `MODE` / grids /
+reports. That's the complete required field set for a solo activator upload.
+
+### Field workflow
+
+1. Arm the program + ref before you start calling.
+2. Operate — watch the counter tick toward `10`/`4` so you know when the
+   activation is valid.
+3. When done, export the log to SD (**Logging → `1`**, see **Logging and
+   Download** below) and upload the `.adi` to the POTA/SOTA site from a computer.
+4. For a **second park/summit in the same outing**: export first, then **Clear
+   QSO Log** (`2`), change the **Ref** (`5`) to the new reference — that resets
+   the progress counter for the new activation — and carry on.
+
+### Notes and limits
+
+- **Session-scoped, reboot-clears.** The program stays where you left it, but the
+  ref (and the counter) live in RAM only — never saved to `Station.txt`/NVS — and
+  **clear on power-cycle**. This is deliberate: one activation per outing, so a
+  stale reference can never silently tag a later casual session's QSOs.
+- **Calling `CQ POTA` is separate.** Pressing `C` lets you send a `CQ POTA …` /
+  `CQ SOTA …` message (see the CQ prompt feature note); that shapes your
+  *transmission*. The activation Ref shapes your *log*. Set both when activating.
+- **Park-to-Park / Summit-to-Summit is not supported.** Logging the *other*
+  station's reference (`SIG`/`SIG_INFO`, `SOTA_REF`) would require typing it per
+  QSO, because an FT8 message doesn't carry the other station's park/summit — the
+  reference simply isn't in the mode. This is an FT8 limitation, not a CP705 one.
 
 ## Logging and Download
 

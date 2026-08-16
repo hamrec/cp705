@@ -87,6 +87,15 @@ struct QsoContext {
     // is held in the s_pending_ft_text singleton (only one FT pending at a
     // time, so one sidecar suffices). No per-ctx text field is needed.
     bool is_freetext = false;
+
+    // UTC ms when this context was created (via append_ctx) -- the QSO's START
+    // time. Stamped once at birth and preserved for the whole lifecycle
+    // (retries reuse the context, parking/late-RR73 reactivation reuses it, and
+    // a NEW context resets this to 0 then re-stamps -- so it can never inherit a
+    // stale value). Logged as ADIF TIME_ON/QSO_DATE (ADIF semantics = QSO start,
+    // matching WSJT-X). 0 = clock wasn't ready at creation; the logger falls
+    // back to "now" in that case. Requires autoseq_set_now_callback().
+    int64_t start_utc_ms = 0;
 };
 
 // TX entry for scheduling
@@ -99,10 +108,15 @@ struct AutoseqTxEntry {
     bool is_signoff = false; // True for TX4/TX5 (priority scheduling)
 };
 
-// ADIF logging callback type
+// ADIF logging callback type. start_utc_ms is the QSO's start time (context
+// creation) for ADIF TIME_ON/QSO_DATE; 0 means "unknown, use now".
 using AdifLogCallback = std::function<bool(const std::string& dxcall,
                                             const std::string& dxgrid,
-                                            int rst_sent, int rst_rcvd)>;
+                                            int rst_sent, int rst_rcvd,
+                                            int64_t start_utc_ms)>;
+
+// UTC-clock source for stamping QSO start times. Returns Unix ms UTC.
+using NowMsCallback = std::function<int64_t()>;
 
 // ============== Public API ==============
 
@@ -157,6 +171,11 @@ bool autoseq_get_active_context(int idx, QsoContext* out);
 
 // Set the ADIF logging callback
 void autoseq_set_adif_callback(AdifLogCallback cb);
+
+// Set the UTC-clock source used to stamp QSO start times at context creation.
+// Register once at startup; without it, start_utc_ms stays 0 and the logger
+// falls back to "now" (pre-change behavior).
+void autoseq_set_now_callback(NowMsCallback cb);
 
 // Configuration setters (called when station data changes)
 void autoseq_set_station(const std::string& call, const std::string& grid);

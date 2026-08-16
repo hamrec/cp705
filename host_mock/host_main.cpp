@@ -24,9 +24,10 @@ static BeaconMode g_beacon = BeaconMode::OFF;
 
 // ---------- ADIF callback ----------
 static bool adif_callback(const std::string& dxcall, const std::string& dxgrid,
-                           int rst_sent, int rst_rcvd) {
-    printf(">>> ADIF log: %s %s rst_sent=%+d rst_rcvd=%+d\n",
-           dxcall.c_str(), dxgrid.c_str(), rst_sent, rst_rcvd);
+                           int rst_sent, int rst_rcvd, int64_t start_utc_ms) {
+    printf(">>> ADIF log: %s %s rst_sent=%+d rst_rcvd=%+d start_ms=%lld\n",
+           dxcall.c_str(), dxgrid.c_str(), rst_sent, rst_rcvd,
+           (long long)start_utc_ms);
     return true;
 }
 

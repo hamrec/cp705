@@ -91,6 +91,7 @@ static std::string s_cq_freetext;
 
 // ADIF callback
 static AdifLogCallback s_adif_callback;
+static NowMsCallback s_now_cb;   // UTC-ms clock for stamping QSO start times
 
 // TX scheduling state
 static bool s_pending_valid = false;
@@ -517,6 +518,11 @@ void autoseq_set_adif_callback(AdifLogCallback cb) {
     s_adif_callback = cb;
 }
 
+void autoseq_set_now_callback(NowMsCallback cb) {
+    AutoseqLockGuard guard;
+    s_now_cb = cb;
+}
+
 void autoseq_set_station(const std::string& call, const std::string& grid) {
     AutoseqLockGuard guard;
     s_my_call = call;
@@ -792,7 +798,8 @@ static void log_qso_if_needed(QsoContext* ctx) {
     if (ctx->logged) return;
     if (!s_adif_callback) return;
 
-    if (!s_adif_callback(ctx->dxcall, ctx->dxgrid, ctx->snr_tx, ctx->snr_rx)) {
+    if (!s_adif_callback(ctx->dxcall, ctx->dxgrid, ctx->snr_tx, ctx->snr_rx,
+                         ctx->start_utc_ms)) {
         ESP_LOGW(TAG, "ADIF log failed for %s; will retry", ctx->dxcall.c_str());
         return;
     }
@@ -1151,7 +1158,12 @@ static QsoContext* append_ctx() {
     if (s_inactive_start <= s_active_count) return nullptr;  // No free space
 
     QsoContext* ctx = &s_queue[s_active_count++];
-    *ctx = QsoContext{};  // Reset to defaults
+    *ctx = QsoContext{};  // Reset to defaults (also zeroes start_utc_ms)
+    // Stamp the QSO start time at context birth. The reset above cleared any
+    // stale value from the previous occupant of this s_queue slot, so this is
+    // always the current context's own creation time. Left 0 if no clock source
+    // is registered (logger falls back to "now").
+    if (s_now_cb) ctx->start_utc_ms = s_now_cb();
     return ctx;
 }
 

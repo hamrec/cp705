@@ -18,6 +18,12 @@
 #include <cstdint>
 #include <string>
 
+// Activation program tag for a QSO. Each program uses DIFFERENT ADIF fields:
+//   POTA -> MY_SIG=POTA + MY_SIG_INFO=<ref>   (e.g. US-1234)
+//   SOTA -> MY_SOTA_REF=<ref>                 (e.g. W7A/MN-001; NOT MY_SIG)
+// None (or an empty ref) emits no activation fields.
+enum class SigProgram { None, POTA, SOTA };
+
 // One completed QSO, assembled by main and handed to the logger.
 struct QsoLogRecord {
   std::string dxcall;    // worked station's callsign
@@ -25,12 +31,14 @@ struct QsoLogRecord {
   int         rst_sent;  // dB report we sent (-99 = omit the field)
   int         rst_rcvd;  // dB report we received (-99 = omit the field)
   double      freq_mhz;  // dial frequency in MHz
+  std::string band;      // ADIF band, e.g. "20m" (POTA requires BAND with unit)
   std::string mode;      // e.g. "FT8"
   std::string mycall;    // our callsign
   std::string mygrid;    // our grid (4-char)
   std::string comment;   // already macro-expanded
-  std::string my_sig_info; // POTA park ref for THIS activation (e.g. "US-1234");
-                           // empty = not activating, emit no MY_SIG/MY_SIG_INFO.
+  SigProgram  sig_program = SigProgram::None; // POTA/SOTA/none for this QSO
+  std::string sig_ref;   // activation reference (POTA park or SOTA summit);
+                         // empty OR program==None => no activation fields logged
   int64_t     utc_ms;    // QSO time, Unix ms UTC
 };
 
