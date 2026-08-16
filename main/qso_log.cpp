@@ -5,20 +5,10 @@
 #include <cstdio>
 #include <cstring>
 
-#include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
 #include "storage_service.h"
-
-// Best-effort internal-flash append, defined in main.cpp (no-op on this board,
-// which has no FATFS partition, but kept so behavior is identical to before).
-bool storage_append_text_locked_path(const std::string& path,
-                                     const std::string& line,
-                                     const std::string& header_if_new,
-                                     bool sync_to_flash);
-
-static const char* TAG = "QSOLOG";
 
 // NVS namespace shared with the rest of CP705 (config lives here too).
 static const char* kNvsNamespace = "cp705";
@@ -86,8 +76,6 @@ bool qso_log_write(const QsoLogRecord& r) {
   civil_from_ms(r.utc_ms, &year, &month, &day, &hour, &min, &sec);
   char date[16];
   snprintf(date, sizeof(date), "%04d%02d%02d", year % 10000, month % 100, day % 100);
-  char path[64];
-  snprintf(path, sizeof(path), "%s.adi", date);  // ADIF file on the SD card
 
   char time_on[16];
   snprintf(time_on, sizeof(time_on), "%02d%02d%02d", hour % 100, min % 100, sec % 100);
@@ -141,16 +129,13 @@ bool qso_log_write(const QsoLogRecord& r) {
            rst_sent_buf, rst_rcvd_buf, act_buf,
            r.comment.size(), r.comment.c_str());
 
-  // (1) PRIMARY: NVS — always available on this board (SD writes fail at the
-  // driver level and there's no FATFS partition). The day's ADIF log is kept as
-  // a bounded blob; this is the copy that reliably survives.
+  // Durable store: NVS only. Every QSO lives in the bounded NVS blob, which is
+  // the reliable copy on this board (SD writes are flaky and there's no FATFS
+  // partition). We deliberately do NOT write the SD card per-QSO anymore -- that
+  // produced a second, cryptically-named, unverified file that confused more
+  // than it helped. The SD copy is written once, verified, by qso_log_export_to_sd()
+  // as a single YYYYMMDD.adi when the operator presses Export.
   nvs_append_adif(line, kAdifHeader);
-  // (2) SECONDARY (best-effort): the SD card as YYYYMMDD.adi — when SD writes
-  // succeed, this is the importable file the operator pulls after an activation.
-  bool sd_ok = storage_sd_append_with_header(path, line, kAdifHeader);
-  if (!sd_ok) ESP_LOGW(TAG, "ADIF SD write failed (%s): code=%d", path, g_storage_sd_log_last_code);
-  // (3) Internal flash, best-effort (only if a FATFS partition is present).
-  (void)storage_append_text_locked_path(path, line, kAdifHeader, true);
   return true;       // NVS write makes the record durable; never force a retry
 }
 
@@ -180,11 +165,13 @@ std::string qso_log_export_to_sd(int64_t utc_ms) {
 
   int Y, M, D, h, mi, s;
   civil_from_ms(utc_ms, &Y, &M, &D, &h, &mi, &s);
-  // FATFS long-filename support is disabled (CONFIG_FATFS_LFN_NONE), so the file
-  // name MUST fit classic 8.3 or fopen() fails with EINVAL. MMDDHHMM.adi is 8.3,
-  // preserves the date+time, and stays unique per minute — enough for exports.
+  // ONE file per day, named by date: YYYYMMDD.adi. FATFS long filenames are
+  // disabled (CONFIG_FATFS_LFN_NONE) so the name must fit classic 8.3 -- 8 chars
+  // is exactly the date, leaving no room for a time stamp, so a second export
+  // the same day overwrites (re-writes the full verified log, which is what you
+  // want). This is the only SD file CP705 produces.
   char path[16];
-  snprintf(path, sizeof(path), "%02d%02d%02d%02d.adi", M, D, h, mi);
+  snprintf(path, sizeof(path), "%04d%02d%02d.adi", Y, M, D);
 
   if (!storage_sd_write_file(path, log)) return "SD write failed";
 

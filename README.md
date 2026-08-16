@@ -137,8 +137,9 @@ full radio-side configuration.
   to CQ or the decode list after a few seconds, and `` ` `` bails out of the
   QSO at will at any time.
 - **End+Export Log SD** (Logging category → `1`) — writes the accumulated NVS
-  ADIF log to the card as a verified, uniquely-named `.adi` file for import
-  into logging software (see **Logging and Download** below).
+  ADIF log to the card as a single verified, date-named `YYYYMMDD.adi` file for
+  import into logging software (see **Logging and Download** below). This is the
+  only file CP705 puts on the card — QSOs are not written to SD as they happen.
 - **Clear QSO log** (Logging category → `2`) — a two-press-confirm action to
   wipe the NVS log and start fresh, e.g. between POTA activations.
 - **POTA / SOTA activation logging** (Logging category → `4` toggle, `5` ref) —
@@ -262,8 +263,8 @@ network login once. You can also pre-load `Station.txt` from the SD card.
    UTC — see **GPS Connections** / **DS3231 RTC Connections** below. Accurate
    time is required for reliable decodes and properly-timed transmit.
 5. Logging is automatic: each completed QSO is appended to the ADIF log in **NVS**
-   (survives power-off) and best-effort to the SD card. To get an importable
-   `.adi`, export to the card from the **Logging** category, item `1`
+   (survives power-off). To get an importable `.adi`, export to the card from the
+   **Logging** category, item `1` — this writes one date-named `YYYYMMDD.adi`
    (see **Logging and Download**). The Logging category's Clear-Log row also
    shows a running QSO count (`Clear QSO Log: N`).
 
@@ -576,22 +577,23 @@ reports. That's the complete required field set for a solo activator upload.
 
 - **Where the log lives:** every completed QSO is appended to an ADIF log held in
   **NVS** (non-volatile flash), so it survives power-off, reflashing, and even a
-  full firmware reinstall. It is also written best-effort to the SD card as
-  `YYYYMMDD.adi`. Station settings persist in NVS the same way.
-- **Why NVS:** on this board there is no internal FATFS partition, so NVS is the
-  primary, always-available store; the SD card is a convenience copy for pulling
-  your log off the device.
-- **Getting the log off the device:**
+  full firmware reinstall. NVS is the single source of truth — QSOs are **not**
+  written to the SD card as they happen. Station settings persist in NVS too.
+- **Why NVS:** on this board there is no internal FATFS partition and SD writes
+  are flaky, so NVS is the primary, always-available store. The SD card only ever
+  gets **one** file, written once when you Export (below).
+- **Getting the log off the device (one file, named by date):**
   1. Insert a FAT/FAT32-formatted SD card.
   2. Press `M` for the settings menu, then `4` for **Logging**, then `1`
      (**End+Export Log SD**). This is a **one-way, end-of-session action**: it
      stops RX/TX, releases the IC-705 connection, and drops WiFi before
      writing the card (press `S → 1` to reconnect afterward, or reboot). The full
-     NVS log is written to a unique `MMDDHHMM.adi` file, then read back and
+     NVS log is written to a single **`YYYYMMDD.adi`** file (named by date — one
+     per day; exporting again the same day overwrites it), then read back and
      byte-verified.
-  3. On `Verified N QSOs`, pull the card and import the `.adi` into your logging
-     software. Your log stays safe in NVS regardless of the SD result, so a
-     failed export never loses a QSO — just retry the export.
+  3. On `Verified N QSOs`, pull the card and import that one `.adi` into your
+     logging software. Your log stays safe in NVS regardless of the SD result, so
+     a failed export never loses a QSO — just retry the export.
 - **Starting a fresh log (e.g. between POTA activations):** export first (above)
   to save a copy, then in the same **Logging** category press `2`
   (**Clear QSO Log**). The row re-labels itself `Press 2 again: confirm`;
