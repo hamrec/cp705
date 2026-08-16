@@ -29,6 +29,8 @@ struct QsoLogRecord {
   std::string mycall;    // our callsign
   std::string mygrid;    // our grid (4-char)
   std::string comment;   // already macro-expanded
+  std::string my_sig_info; // POTA park ref for THIS activation (e.g. "US-1234");
+                           // empty = not activating, emit no MY_SIG/MY_SIG_INFO.
   int64_t     utc_ms;    // QSO time, Unix ms UTC
 };
 

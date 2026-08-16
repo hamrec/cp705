@@ -106,9 +106,17 @@ bool qso_log_write(const QsoLogRecord& r) {
     snprintf(rst_rcvd_buf, sizeof(rst_rcvd_buf), "<rst_rcvd:%d>%d ",
              (int)snprintf(nullptr, 0, "%d", r.rst_rcvd), r.rst_rcvd);
   }
+  // POTA activation fields — only when a park ref is set for this session.
+  // Activator convention: MY_SIG=POTA, MY_SIG_INFO=<park ref>. Empty ref emits
+  // nothing, so a normal (non-POTA) log is byte-identical to before.
+  char pota_buf[64] = "";
+  if (!r.my_sig_info.empty()) {
+    snprintf(pota_buf, sizeof(pota_buf), "<my_sig:4>POTA <my_sig_info:%zu>%s ",
+             r.my_sig_info.size(), r.my_sig_info.c_str());
+  }
   char line[512];
   snprintf(line, sizeof(line),
-           "<call:%zu>%s <gridsquare:%zu>%s <mode:%zu>%s<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s %s%s<comment:%zu>%s <eor>\n",
+           "<call:%zu>%s <gridsquare:%zu>%s <mode:%zu>%s<qso_date:8>%s <time_on:6>%s <freq:%zu>%s <station_callsign:%zu>%s <my_gridsquare:%zu>%s %s%s%s<comment:%zu>%s <eor>\n",
            r.dxcall.size(), r.dxcall.c_str(),
            r.dxgrid.size(), r.dxgrid.c_str(),
            r.mode.size(), r.mode.c_str(),
@@ -116,7 +124,7 @@ bool qso_log_write(const QsoLogRecord& r) {
            strlen(freq_str), freq_str,
            r.mycall.size(), r.mycall.c_str(),
            r.mygrid.size(), r.mygrid.c_str(),
-           rst_sent_buf, rst_rcvd_buf,
+           rst_sent_buf, rst_rcvd_buf, pota_buf,
            r.comment.size(), r.comment.c_str());
 
   // (1) PRIMARY: NVS — always available on this board (SD writes fail at the

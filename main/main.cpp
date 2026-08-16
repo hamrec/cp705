@@ -601,6 +601,14 @@ static void apply_brightness() {
   M5.Display.setBrightness((uint8_t)(255 * pct / 10));
 }
 static std::string g_free_text = "TNX 73";
+// POTA park reference for the CURRENT activation session (e.g. "US-1234"). When
+// non-empty, each logged QSO gets MY_SIG=POTA / MY_SIG_INFO=<ref> in its ADIF
+// record. DELIBERATELY session-scoped: RAM only, never written to Station.txt /
+// NVS, defaults empty at boot -- so it auto-clears every power cycle (one park
+// per outing) and can never silently tag a later non-POTA session's QSOs. Set
+// on-device via the Logging category ("POTA" row). All logged QSOs in an
+// activation share the same ref, so this is NOT cleared per-log-write.
+static std::string g_pota_ref = "";
 std::string g_call = "";   // visible to core_api.cpp; set via Station category / Station.txt
 std::string g_grid = "";    // visible to core_api.cpp; set via Station category / Station.txt
 static std::string g_grid_saved_manual = "";
@@ -768,6 +776,7 @@ static bool log_adif_entry(const std::string& dxcall, const std::string& dxgrid,
   r.mycall   = g_call;
   r.mygrid   = grid_ft8_4(g_grid);
   r.comment  = "CP705 IC-705";
+  r.my_sig_info = g_pota_ref;   // "" when not activating -> no POTA fields logged
   r.utc_ms   = rtc_now_ms();
   qso_log_write(r);
   g_adif_sd_seq = g_adif_sd_seq + 1;   // QSO count for the on-screen status
@@ -3169,6 +3178,9 @@ static void draw_menu_view() {
       lines.push_back("Clear QSO Log: " + std::to_string((unsigned)g_adif_sd_seq));
     }
     lines.push_back("Performance");
+    // POTA park ref for this session (RAM only, clears on reboot). Shows the
+    // armed ref so you can see at a glance whether QSOs are being tagged.
+    lines.push_back(std::string("POTA: ") + (g_pota_ref.empty() ? "(off)" : g_pota_ref));
   } else if (menu_category == kCatSystem) {
     lines.push_back(menu_sleep_batt_line());
     lines.push_back("Sleep Now");
@@ -5266,6 +5278,12 @@ autoseq_set_adif_callback(log_adif_entry);
                   if (end != menu_edit_buf.c_str() && v >= 0 && v <= 0xFF) {
                     g_ic705_civ_addr = (int)v;
                   }
+                } else if (menu_edit_idx == kCatLogging * MENU_CAT_BASE + 3) {
+                  // POTA park ref: session-scoped, so DON'T persist it (leave it
+                  // out of save_station_data on purpose -- it must clear on
+                  // reboot). Store as-typed (already uppercased on input).
+                  g_pota_ref = menu_edit_buf;
+                  should_save = false;
                 }
                 if (should_save) {
                   save_station_data();
@@ -5312,12 +5330,14 @@ autoseq_set_adif_callback(log_adif_entry);
                   if (ch < '0' || ch > '9') break;
                   if (menu_edit_buf.size() >= 10) break;
                 }
-                // Force uppercase only where it's correct: callsign, grid, and
-                // the CI-V hex address. Credentials (WiFi SSID/pass, net
-                // user/pass) are case-sensitive and must NOT be uppercased.
+                // Force uppercase only where it's correct: callsign, grid, the
+                // CI-V hex address, and the POTA park ref (refs are uppercase,
+                // e.g. US-1234). Credentials (WiFi SSID/pass, net user/pass) are
+                // case-sensitive and must NOT be uppercased.
                 if (menu_edit_idx == kCatStation * MENU_CAT_BASE + 0 ||
                     menu_edit_idx == kCatStation * MENU_CAT_BASE + 1 ||
-                    menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 4) {
+                    menu_edit_idx == kCatNetwork * MENU_CAT_BASE + 4 ||
+                    menu_edit_idx == kCatLogging * MENU_CAT_BASE + 3) {
                   ch = toupper((unsigned char)ch);
                 }
                 menu_edit_buf.push_back(ch);
@@ -5444,6 +5464,12 @@ autoseq_set_adif_callback(log_adif_entry);
                 draw_menu_view();
               } else if (c == '3') {
                 enter_mode(UIMode::PERF);
+              } else if (c == '4') {
+                // Edit POTA park ref for this session (in-place editor). Blank
+                // it to turn POTA logging off. Not persisted -- clears on reboot.
+                menu_edit_idx = kCatLogging * MENU_CAT_BASE + 3;
+                menu_edit_buf = g_pota_ref;
+                draw_menu_view();
               }
             } else if (menu_category == kCatSystem) {
               if (c == '2') {

@@ -141,6 +141,14 @@ full radio-side configuration.
   into logging software (see **Logging and Download** below).
 - **Clear QSO log** (Logging category → `2`) — a two-press-confirm action to
   wipe the NVS log and start fresh, e.g. between POTA activations.
+- **POTA park logging** (Logging category → `4`) — enter the park reference
+  you're activating (e.g. `US-1234`) and every QSO logged from then on gets
+  `MY_SIG:POTA` / `MY_SIG_INFO:<ref>` written into its ADIF record, so the export
+  imports straight into the POTA system. The row shows the armed ref
+  (`POTA: US-1234`) or `POTA: (off)`. The ref is **session-scoped**: it lives in
+  RAM only, is never saved to `Station.txt`/NVS, and **clears on reboot** — one
+  park per outing, so it can't silently tag a later non-POTA session. Blank the
+  field to turn it off mid-session.
 - **Streamlined to the IC-705 target** — the entire KH1 radio backend was
   removed to keep the build focused on the wireless IC-705 use case, and
   several settings inherited from Mini-FT8 (ignore list, QSO comment template,
@@ -412,6 +420,8 @@ sections below.
 | LOGGING                                        |
 |   Auto-saved to NVS (survives power-off)       |
 |   Export ADIF:   M > Logging > 1               |
+|   POTA park:     M > Logging > 4  (reboot      |
+|                  clears it)                    |
 |                                                |
 | QUICK FIXES                                    |
 |   TX but no RF -> DATA MOD=WLAN, USB-D         |
@@ -485,6 +495,7 @@ hotkeys — they're actions inside the `M` menu (see the table below) and
 | `M` → **Logging** | `1` | Export Log to SD. Writes the NVS ADIF log to a unique file, then reads it back and byte-verifies it. Feedback: `Verified N QSOs` / `SD write failed` / `Verify FAILED` / `No log yet`. |
 |  | `2` | Clear QSO Log: press once to arm (`Press 2 again: confirm`), press `2` again within 3 s to wipe the NVS log and reset the QSO count. Any other key or letting it lapse cancels with no change. Export first if you want a copy — this never touches the SD card. The row shows the running count (`Clear QSO Log: N`) when not armed. |
 |  | `3` | Performance Monitor — CPU/heap diagnostics. `` ` `` returns to this category. |
+|  | `4` | POTA Park (in place). Type the park ref you're activating (e.g. `US-1234`), Enter to arm — every QSO logged after that carries `MY_SIG:POTA` / `MY_SIG_INFO:<ref>` in its ADIF record. Blank it and Enter to turn off. Uppercased on input. The row shows `POTA: <ref>` when armed or `POTA: (off)`. Session-scoped — not saved, clears on reboot. |
 | `M` → **System** | (display) | Sleep/Batt %. |
 |  | `2` | Enter deep sleep now. |
 |  | `3` | GPS Status — live telemetry: 3D fix, satellites, UTC time, grid square, and last synchronization age (LoRa-1262 cap GNSS is the only source). `` ` `` returns to this category. |
